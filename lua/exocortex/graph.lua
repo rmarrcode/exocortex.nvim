@@ -1,0 +1,946 @@
+-- Horizontal DAG view: one card per prompt/response node, rendered into a
+-- scratch buffer. Time flows left to right, branches stack into lanes.
+-- Pan with normal motions; h/j/k/l snap between cards. The selected card is
+-- drawn with a double-line border and a highlight overlay.
+
+local state = require("exocortex.state")
+
+local M = {}
+
+local CARD_W = 36
+local CARD_H = 4
+local HGAP = 6
+local VGAP = 1
+local SESSION_SIDEBAR_W = 24
+
+local SPINNER = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧" }
+
+M.buf = nil
+M.session_buf = nil
+M.graph_win = nil
+M.session_win = nil
+M.selected = nil
+M.layout = {} -- id -> { row, col, depth, lane } (1-based grid cells)
+
+local ns = vim.api.nvim_create_namespace("exocortex_graph")
+local session_ns = vim.api.nvim_create_namespace("exocortex_sessions")
+local byte_index = {} -- per row: cell -> 0-based byte offset
+local spin_frame = 1
+local spin_timer = nil
+
+-- ---------------------------------------------------------------------------
+-- Layout: column = depth, lane assignment by DFS. The first child inherits
+-- its parent's lane; every other child gets a fresh lane below everything
+-- allocated so far, which keeps edges inside a single gap band.
+-- ---------------------------------------------------------------------------
+
+local function find_named_buf(name)
+  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_buf_get_name(buf) == name then
+      return buf
+    end
+  end
+
+  return nil
+end
+
+local function compute_layout()
+  local placed = {}
+  local next_lane = -1
+
+  local function visit(node, depth, lane)
+    placed[node.id] = { depth = depth, lane = lane }
+
+    for i, kid in ipairs(state.children(node.id)) do
+      local kid_lane = lane
+
+      if i > 1 then
+        next_lane = next_lane + 1
+        kid_lane = next_lane
+      end
+
+      visit(kid, depth + 1, kid_lane)
+    end
+  end
+
+  for _, root in ipairs(state.roots()) do
+    next_lane = next_lane + 1
+    visit(root, 0, next_lane)
+  end
+
+  return placed
+end
+
+-- ---------------------------------------------------------------------------
+-- Grid drawing
+-- ---------------------------------------------------------------------------
+
+local function blank_grid(rows, cols)
+  local grid = {}
+
+  for r = 1, rows do
+    local line = {}
+
+    for c = 1, cols do
+      line[c] = " "
+    end
+
+    grid[r] = line
+  end
+
+  return grid
+end
+
+local function put(grid, row, col, text)
+  local line = grid[row]
+
+  if not line then
+    return
+  end
+
+  local i = 0
+
+  for _, ch in ipairs(vim.fn.split(text, "\\zs")) do
+    local c = col + i
+
+    if c >= 1 and c <= #line then
+      line[c] = ch
+    end
+
+    i = i + 1
+  end
+end
+
+-- Merge junction characters so sibling edges form ┬/├ joints.
+local function put_join(grid, row, col, ch)
+  local line = grid[row]
+
+  if not line or col < 1 or col > #line then
+    return
+  end
+
+  local existing = line[col]
+
+  if ch == "╮" and existing == "─" then
+    ch = "┬"
+  elseif ch == "╰" and (existing == "│" or existing == "╰") then
+    ch = "├"
+  elseif ch == "│" and (existing == "╰" or existing == "├") then
+    ch = "├"
+  end
+
+  line[col] = ch
+end
+
+local function fit(text, width)
+  text = (text or ""):gsub("%s+", " ")
+  local w = vim.fn.strdisplaywidth(text)
+
+  if w <= width then
+    return text .. string.rep(" ", width - w)
+  end
+
+  local out = {}
+  local used = 0
+
+  for _, ch in ipairs(vim.fn.split(text, "\\zs")) do
+    local cw = vim.fn.strdisplaywidth(ch)
+
+    if used + cw > width - 1 then
+      break
+    end
+
+    table.insert(out, ch)
+    used = used + cw
+  end
+
+  return table.concat(out) .. "…" .. string.rep(" ", width - used - 1)
+end
+
+local function status_line(node)
+  if node.status == "running" then
+    return SPINNER[spin_frame] .. " running…", node.stat or ""
+  elseif node.status == "error" then
+    return "✗ error", node.stat or ""
+  end
+
+  return "✓ done", node.stat or ""
+end
+
+local function draw_card(grid, node, rect, selected)
+  local icon, detail = status_line(node)
+  local tl, tr, bl, br, hz, vt = "╭", "╮", "╰", "╯", "─", "│"
+
+  if selected then
+    tl, tr, bl, br, hz, vt = "╔", "╗", "╚", "╝", "═", "║"
+  end
+
+  put(grid, rect.row, rect.col, tl .. hz .. " " .. fit(node.prompt, CARD_W - 6) .. " " .. hz .. tr)
+  put(grid, rect.row + 1, rect.col, vt .. " " .. fit((node.agent or "?") .. " · " .. icon, CARD_W - 4) .. " " .. vt)
+  put(grid, rect.row + 2, rect.col, vt .. " " .. fit(detail, CARD_W - 4) .. " " .. vt)
+  put(grid, rect.row + 3, rect.col, bl .. string.rep(hz, CARD_W - 2) .. br)
+end
+
+local function draw_edge(grid, parent_rect, child_rect)
+  local from_row = parent_rect.row + 1
+  local to_row = child_rect.row + 1
+  local from_col = parent_rect.col + CARD_W
+  local to_col = child_rect.col - 1
+
+  if from_row == to_row then
+    for c = from_col, to_col - 1 do
+      put(grid, from_row, c, "─")
+    end
+
+    put(grid, from_row, to_col, "▶")
+    return
+  end
+
+  local trunk = from_col + 2
+
+  for c = from_col, trunk - 1 do
+    put(grid, from_row, c, "─")
+  end
+
+  put_join(grid, from_row, trunk, "╮")
+
+  for r = from_row + 1, to_row - 1 do
+    put_join(grid, r, trunk, "│")
+  end
+
+  put_join(grid, to_row, trunk, "╰")
+
+  for c = trunk + 1, to_col - 1 do
+    put(grid, to_row, c, "─")
+  end
+
+  put(grid, to_row, to_col, "▶")
+end
+
+local function serialize(grid)
+  local lines = {}
+  byte_index = {}
+
+  for r, row in ipairs(grid) do
+    local bidx = { [1] = 0 }
+    local bytes = 0
+
+    for c, ch in ipairs(row) do
+      bytes = bytes + #ch
+      bidx[c + 1] = bytes
+    end
+
+    lines[r] = table.concat(row)
+    byte_index[r] = bidx
+  end
+
+  return lines
+end
+
+-- ---------------------------------------------------------------------------
+-- Render
+-- ---------------------------------------------------------------------------
+
+local function card_extmarks(id, rect)
+  local node = state.nodes[id]
+  local base = node.status == "running" and "ExocortexRunning"
+    or node.status == "error" and "ExocortexError"
+    or "ExocortexCard"
+
+  for r = rect.row, rect.row + CARD_H - 1 do
+    local bidx = byte_index[r]
+
+    if bidx and bidx[rect.col] and bidx[rect.col + CARD_W] then
+      vim.api.nvim_buf_set_extmark(M.buf, ns, r - 1, bidx[rect.col], {
+        end_col = bidx[rect.col + CARD_W],
+        hl_group = base,
+        priority = 100,
+      })
+    end
+  end
+
+  -- bright bold title over the prompt text on the top border
+  local top = byte_index[rect.row]
+
+  if top and top[rect.col + 3] and top[rect.col + CARD_W - 3] then
+    vim.api.nvim_buf_set_extmark(M.buf, ns, rect.row - 1, top[rect.col + 3], {
+      end_col = top[rect.col + CARD_W - 3],
+      hl_group = "ExocortexTitle",
+      priority = 105,
+    })
+  end
+
+  if id == M.selected then
+    for r = rect.row, rect.row + CARD_H - 1 do
+      local bidx = byte_index[r]
+
+      if bidx and bidx[rect.col] and bidx[rect.col + CARD_W] then
+        vim.api.nvim_buf_set_extmark(M.buf, ns, r - 1, bidx[rect.col], {
+          end_col = bidx[rect.col + CARD_W],
+          hl_group = "ExocortexSelected",
+          priority = 110,
+        })
+      end
+    end
+  end
+end
+
+function M.render()
+  if not (M.buf and vim.api.nvim_buf_is_valid(M.buf)) then
+    return
+  end
+
+  local placed = compute_layout()
+  local max_depth, max_lane = 0, 0
+
+  for _, p in pairs(placed) do
+    max_depth = math.max(max_depth, p.depth)
+    max_lane = math.max(max_lane, p.lane)
+  end
+
+  M.layout = {}
+
+  for id, p in pairs(placed) do
+    M.layout[id] = {
+      row = p.lane * (CARD_H + VGAP) + 1,
+      col = p.depth * (CARD_W + HGAP) + 1,
+      depth = p.depth,
+      lane = p.lane,
+    }
+  end
+
+  local lines
+
+  if state.is_empty() then
+    lines = { "", "  no nodes yet — press p to send the first prompt, g? for help", "" }
+    byte_index = {}
+  else
+    local grid = blank_grid((max_lane + 1) * (CARD_H + VGAP), (max_depth + 1) * (CARD_W + HGAP))
+
+    for id, rect in pairs(M.layout) do
+      local node = state.nodes[id]
+
+      if node and node.parent and M.layout[node.parent] then
+        draw_edge(grid, M.layout[node.parent], rect)
+      end
+    end
+
+    for id, rect in pairs(M.layout) do
+      draw_card(grid, state.nodes[id], rect, id == M.selected)
+    end
+
+    lines = serialize(grid)
+  end
+
+  vim.bo[M.buf].modifiable = true
+  vim.api.nvim_buf_set_lines(M.buf, 0, -1, false, lines)
+  vim.bo[M.buf].modifiable = false
+
+  vim.api.nvim_buf_clear_namespace(M.buf, ns, 0, -1)
+
+  if not state.is_empty() then
+    for id, rect in pairs(M.layout) do
+      card_extmarks(id, rect)
+    end
+  end
+end
+
+-- ---------------------------------------------------------------------------
+-- Selection and navigation
+-- ---------------------------------------------------------------------------
+
+local function graph_win()
+  if M.graph_win and vim.api.nvim_win_is_valid(M.graph_win) then
+    return M.graph_win
+  end
+
+  local win = vim.fn.bufwinid(M.buf)
+  if win ~= -1 then
+    M.graph_win = win
+    return win
+  end
+end
+
+local function cursor_to(id)
+  local rect = M.layout[id]
+  local win = graph_win()
+
+  if not (rect and win) then
+    return
+  end
+
+  local bidx = byte_index[rect.row + 1]
+
+  if bidx and bidx[rect.col + 2] then
+    vim.api.nvim_win_set_cursor(win, { rect.row + 1, bidx[rect.col + 2] })
+  end
+end
+
+function M.select(id)
+  M.selected = id
+  M.render()
+
+  if id then
+    cursor_to(id)
+  end
+end
+
+function M.move(dir)
+  local cur = M.selected and M.layout[M.selected]
+
+  if not cur then
+    local roots = state.roots()
+
+    if roots[1] then
+      M.select(roots[1].id)
+    end
+
+    return
+  end
+
+  if dir == "left" then
+    local node = state.nodes[M.selected]
+
+    if node and node.parent then
+      M.select(node.parent)
+    end
+
+    return
+  end
+
+  if dir == "right" then
+    local best, best_dist
+
+    for _, kid in ipairs(state.children(M.selected)) do
+      local rect = M.layout[kid.id]
+      local dist = rect and math.abs(rect.lane - cur.lane) or math.huge
+
+      if not best or dist < best_dist then
+        best, best_dist = kid, dist
+      end
+    end
+
+    if best then
+      M.select(best.id)
+    end
+
+    return
+  end
+
+  -- up/down: nearest lane in that direction, tie-break on depth distance
+  local want_below = dir == "down"
+  local best_id, best_key
+
+  for id, rect in pairs(M.layout) do
+    local dl = rect.lane - cur.lane
+
+    if (want_below and dl > 0) or (not want_below and dl < 0) then
+      local key = math.abs(dl) * 1000 + math.abs(rect.depth - cur.depth)
+
+      if not best_key or key < best_key then
+        best_id, best_key = id, key
+      end
+    end
+  end
+
+  if best_id then
+    M.select(best_id)
+  end
+end
+
+function M.node_at_cursor()
+  local win = graph_win()
+
+  if not win then
+    return nil
+  end
+
+  local pos = vim.api.nvim_win_get_cursor(win)
+  local bidx = byte_index[pos[1]]
+
+  if not bidx then
+    return nil
+  end
+
+  local cell
+
+  for c = 1, #bidx - 1 do
+    if pos[2] >= bidx[c] and pos[2] < bidx[c + 1] then
+      cell = c
+      break
+    end
+  end
+
+  if not cell then
+    return nil
+  end
+
+  for id, rect in pairs(M.layout) do
+    if pos[1] >= rect.row and pos[1] < rect.row + CARD_H and cell >= rect.col and cell < rect.col + CARD_W then
+      return id
+    end
+  end
+end
+
+-- Screen-space rect of a card (for the float grow transition).
+function M.screen_rect(id)
+  local rect = M.layout[id]
+  local win = graph_win()
+
+  if not (rect and win) then
+    return nil
+  end
+
+  local bidx = byte_index[rect.row]
+  local byte_col = (bidx and bidx[rect.col] or 0) + 1
+  local pos = vim.fn.screenpos(win, rect.row, byte_col)
+
+  if pos.row == 0 then
+    return nil
+  end
+
+  return { row = pos.row - 1, col = pos.col - 1, width = CARD_W, height = CARD_H }
+end
+
+local function any_running()
+  for _, node in pairs(state.nodes) do
+    if node.status == "running" then
+      return true
+    end
+  end
+
+  return false
+end
+
+local function session_winbar()
+  local agent = state.session_agent() or "—"
+  return "  [" .. agent .. "]  %=  ↵ view  r read  p prompt  d diff  a agent  Ctrl+T new session  PgDn/PgUp switch  g? help  q quit  "
+end
+
+local function current_session_index()
+  local sessions = state.list_sessions()
+
+  for i, sid in ipairs(sessions) do
+    if sid == state.current_session then
+      return i, sessions
+    end
+  end
+
+  return 1, sessions
+end
+
+local function session_label(session_id, info, active)
+  local seq = info.seq and tostring(info.seq) or session_id:sub(-4)
+  local name = info.name or ("Session " .. seq)
+  local agent = info.agent or "choose model"
+  local prefix = active and "● " or "○ "
+  return string.format("%s%s", prefix, vim.fn.strcharpart(name .. " [" .. agent .. "]", 0, SESSION_SIDEBAR_W - 4))
+end
+
+local function render_sessions()
+  if not (M.session_buf and vim.api.nvim_buf_is_valid(M.session_buf)) then
+    return
+  end
+
+  local index, sessions = current_session_index()
+  local lines = { " Sessions", "" }
+
+  for i, sid in ipairs(sessions) do
+    local info = state.sessions[sid] or {}
+    lines[#lines + 1] = session_label(sid, info, i == index)
+  end
+
+  lines[#lines + 1] = ""
+  lines[#lines + 1] = " Ctrl+T new"
+  lines[#lines + 1] = " PgUp/PgDn switch"
+
+  vim.bo[M.session_buf].modifiable = true
+  vim.api.nvim_buf_set_lines(M.session_buf, 0, -1, false, lines)
+  vim.bo[M.session_buf].modifiable = false
+  vim.api.nvim_buf_clear_namespace(M.session_buf, session_ns, 0, -1)
+
+  for i = 1, #sessions do
+    local line = i + 1
+    vim.api.nvim_buf_set_extmark(M.session_buf, session_ns, line, 0, {
+      line_hl_group = i == index and "ExocortexSessionActive" or "ExocortexSession",
+    })
+  end
+
+  if M.session_win and vim.api.nvim_win_is_valid(M.session_win) then
+    local target = math.min(index + 2, #lines)
+    pcall(vim.api.nvim_win_set_cursor, M.session_win, { target, 0 })
+  end
+end
+
+local function ensure_session_sidebar()
+  if not (M.buf and vim.api.nvim_buf_is_valid(M.buf)) then
+    return
+  end
+
+  local graph = graph_win()
+  if not graph then
+    return
+  end
+
+  if not (M.session_buf and vim.api.nvim_buf_is_valid(M.session_buf)) then
+    M.session_buf = find_named_buf("exocortex://sessions") or vim.api.nvim_create_buf(false, true)
+    if vim.api.nvim_buf_get_name(M.session_buf) == "" then
+      vim.api.nvim_buf_set_name(M.session_buf, "exocortex://sessions")
+    end
+    vim.bo[M.session_buf].swapfile = false
+    vim.bo[M.session_buf].bufhidden = "wipe"
+    vim.bo[M.session_buf].filetype = "exocortex-sessions"
+  end
+
+  if not (M.session_win and vim.api.nvim_win_is_valid(M.session_win)) then
+    vim.api.nvim_set_current_win(graph)
+    vim.cmd("leftabove vsplit")
+    M.session_win = vim.api.nvim_get_current_win()
+  end
+
+  vim.api.nvim_win_set_buf(M.session_win, M.session_buf)
+  vim.api.nvim_win_set_width(M.session_win, SESSION_SIDEBAR_W)
+  vim.wo[M.session_win].wrap = false
+  vim.wo[M.session_win].number = false
+  vim.wo[M.session_win].relativenumber = false
+  vim.wo[M.session_win].signcolumn = "no"
+  vim.wo[M.session_win].cursorline = true
+  vim.wo[M.session_win].winfixwidth = true
+  vim.wo[M.session_win].winbar = "  sessions "
+
+  render_sessions()
+  vim.api.nvim_set_current_win(graph)
+end
+
+function M.session_changed(what)
+  M.selected = nil
+  M.render()
+  render_sessions()
+
+  local win = graph_win()
+  if win then
+    vim.wo[win].winbar = session_winbar()
+  end
+
+  local last = state.order[#state.order]
+  if last then M.select(last) end
+
+  vim.notify("exocortex: " .. what .. " " .. state.current_session, vim.log.levels.INFO)
+end
+
+local function cycle_session(step)
+  if any_running() then
+    vim.notify("exocortex: wait for running nodes before switching sessions", vim.log.levels.WARN)
+    return
+  end
+
+  local sessions = state.list_sessions()
+
+  if #sessions < 2 then
+    vim.notify("exocortex: no other sessions (" .. (state.current_session or "?") .. ")", vim.log.levels.INFO)
+    return
+  end
+
+  local current_idx = 1
+
+  for i, sid in ipairs(sessions) do
+    if sid == state.current_session then
+      current_idx = i
+      break
+    end
+  end
+
+  state.switch_session(sessions[(current_idx - 1 + step) % #sessions + 1])
+  M.session_changed("switched to session")
+end
+
+function M.next_session()
+  cycle_session(1)
+end
+
+function M.prev_session()
+  cycle_session(-1)
+end
+
+function M.create_new_session()
+  if any_running() then
+    vim.notify("exocortex: wait for running nodes before switching sessions", vim.log.levels.WARN)
+    return
+  end
+
+  require("exocortex").new_session()
+end
+
+-- ---------------------------------------------------------------------------
+-- Spinner: re-render while any node is running
+-- ---------------------------------------------------------------------------
+
+function M.start_spinner()
+  if spin_timer then
+    return
+  end
+
+  spin_timer = vim.uv.new_timer()
+  spin_timer:start(0, 120, vim.schedule_wrap(function()
+    local running = false
+
+    for _, node in pairs(state.nodes) do
+      if node.status == "running" then
+        running = true
+        break
+      end
+    end
+
+    if not running or not (M.buf and vim.api.nvim_buf_is_valid(M.buf)) then
+      local t = spin_timer
+      spin_timer = nil
+      if t then
+        t:stop()
+        t:close()
+      end
+      M.render()
+      render_sessions()
+      return
+    end
+
+    spin_frame = spin_frame % #SPINNER + 1
+    M.render()
+  end))
+end
+
+-- ---------------------------------------------------------------------------
+-- Window / keymaps
+-- ---------------------------------------------------------------------------
+
+local function close_graph_tab()
+  if not pcall(vim.cmd.tabclose) then
+    vim.cmd("enew")
+  end
+end
+
+local function show_help()
+  local lines = {
+    "  exocortex — talk to coding agents in a DAG",
+    "",
+    "  ── graph navigation ──────────────────────────────────────────────",
+    "  h / l          parent / child node",
+    "  j / k          node below / above",
+    "  <CR>           open node response as a float  (q close, <Esc> close + exit graph)",
+    "  r              open node response as a full readable file  (q / <Esc> close tab)",
+    "  d              review node's diffs  (opens diff viewer)",
+    "  D              open node in Diffview",
+    "  p              prompt from selected node  (branch)",
+    "  P              prompt from a fresh root",
+    "  a              choose agent for this session",
+    "  q / <Esc>      close graph",
+    "",
+    "  ── sessions (shown in the left sidebar) ──────────────────────────",
+    "  PgDn           next session",
+    "  PgUp           previous session",
+    "  <C-t>          new session",
+    "  <C-w>          close session  (deletes its nodes)",
+    "",
+    "  ── diff viewer ───────────────────────────────────────────────────",
+    "  a              accept current hunk",
+    "  r              reject current hunk  (skip, keep your version)",
+    "  e              accept and edit  (apply, then tweak manually)",
+    "  n / p          next / previous hunk",
+    "  ] / [          next / previous changed file",
+    "  J / K          page down / up",
+    "  A              accept all hunks in current file",
+    "  q              end review, return to graph",
+    "",
+    "  Agents run in isolated git worktrees; snapshots stored as git refs.",
+    "  Accepted hunks are written to your real files immediately.",
+  }
+
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.bo[buf].modifiable = false
+  vim.bo[buf].bufhidden = "wipe"
+
+  local width = 0
+
+  for _, line in ipairs(lines) do
+    width = math.max(width, vim.fn.strdisplaywidth(line))
+  end
+
+  local win = vim.api.nvim_open_win(buf, true, {
+    relative = "editor",
+    row = math.floor((vim.o.lines - #lines) / 2) - 1,
+    col = math.floor((vim.o.columns - width - 2) / 2),
+    width = width + 2,
+    height = #lines,
+    style = "minimal",
+    border = "rounded",
+    title = " exocortex help ",
+    title_pos = "center",
+  })
+
+  for _, lhs in ipairs({ "q", "<Esc>", "g?" }) do
+    vim.keymap.set("n", lhs, function()
+      if vim.api.nvim_win_is_valid(win) then
+        vim.api.nvim_win_close(win, true)
+      end
+    end, { buffer = buf, silent = true, nowait = true })
+  end
+end
+
+local function set_keymaps(buf)
+  local function map(lhs, fn, desc)
+    vim.keymap.set("n", lhs, fn, { buffer = buf, silent = true, nowait = true, desc = desc })
+  end
+
+  map("h", function() M.move("left") end, "Parent node")
+  map("l", function() M.move("right") end, "Child node")
+  map("j", function() M.move("down") end, "Node below")
+  map("k", function() M.move("up") end, "Node above")
+  map("<Tab>", function() M.move("right") end, "Child node")
+  map("<S-Tab>", function() M.move("left") end, "Parent node")
+  map("<LeftRelease>", function()
+    local id = M.node_at_cursor()
+
+    if id then
+      M.select(id)
+    end
+  end, "Select node under mouse")
+
+  map("<CR>", function() require("exocortex").view_selected() end, "View node text")
+  map("r", function() require("exocortex").read_selected() end, "Read node response as file")
+  map("d", function() require("exocortex").review_selected() end, "Review node diffs")
+  map("D", function() require("exocortex").diffview_selected() end, "Open node in Diffview")
+  map("p", function() require("exocortex").prompt(M.selected) end, "Prompt from selected node")
+  map("P", function() require("exocortex").prompt(nil) end, "Prompt from a fresh root")
+  map("a", function() require("exocortex").choose_agent() end, "Choose agent")
+  map("<PageDown>", M.next_session, "Next session")
+  map("<PageUp>", M.prev_session, "Previous session")
+  map("<C-t>", M.create_new_session, "Create new session")
+  map("<C-w>", function() require("exocortex").close_session() end, "Close session")
+  map("R", M.render, "Redraw graph")
+  map("g?", show_help, "Help")
+  map("<Esc>", close_graph_tab, "Close graph")
+  map("q", close_graph_tab, "Close graph")
+end
+
+local function set_session_keymaps(buf)
+  local function map(lhs, fn, desc)
+    vim.keymap.set("n", lhs, fn, { buffer = buf, silent = true, nowait = true, desc = desc })
+  end
+
+  local function session_under_cursor()
+    local line = vim.api.nvim_win_get_cursor(0)[1]
+    local sessions = state.list_sessions()
+    local index = line - 2
+    return sessions[index]
+  end
+
+  map("<CR>", function()
+    local session_id = session_under_cursor()
+    if session_id and session_id ~= state.current_session then
+      state.switch_session(session_id)
+      M.session_changed("switched to session")
+    end
+
+    local win = graph_win()
+    if win then
+      vim.api.nvim_set_current_win(win)
+    end
+  end, "Switch session")
+  map("<PageDown>", M.next_session, "Next session")
+  map("<PageUp>", M.prev_session, "Previous session")
+  map("<C-t>", M.create_new_session, "Create new session")
+  map("<C-w>", function() require("exocortex").close_session() end, "Close session")
+  map("g?", show_help, "Help")
+  map("q", close_graph_tab, "Close graph")
+  map("<Esc>", close_graph_tab, "Close graph")
+end
+
+function M.open()
+  local existing_win = M.buf and vim.api.nvim_buf_is_valid(M.buf) and vim.fn.bufwinid(M.buf) or -1
+
+  if existing_win ~= -1 then
+    M.graph_win = existing_win
+    vim.api.nvim_set_current_win(existing_win)
+    ensure_session_sidebar()
+    if M.session_buf and vim.api.nvim_buf_is_valid(M.session_buf) then
+      set_session_keymaps(M.session_buf)
+    end
+    M.render()
+    return
+  end
+
+  vim.cmd("tabnew")
+  local placeholder = vim.api.nvim_get_current_buf()
+
+  if not (M.buf and vim.api.nvim_buf_is_valid(M.buf)) then
+    M.buf = find_named_buf("exocortex://graph") or vim.api.nvim_create_buf(false, true)
+    if vim.api.nvim_buf_get_name(M.buf) == "" then
+      vim.api.nvim_buf_set_name(M.buf, "exocortex://graph")
+    end
+    vim.bo[M.buf].swapfile = false
+    vim.bo[M.buf].filetype = "exocortex"
+  end
+
+  set_keymaps(M.buf)
+
+  vim.api.nvim_win_set_buf(0, M.buf)
+  M.graph_win = vim.api.nvim_get_current_win()
+
+  if vim.api.nvim_buf_is_valid(placeholder)
+    and placeholder ~= M.buf
+    and vim.api.nvim_buf_get_name(placeholder) == "" then
+    pcall(vim.api.nvim_buf_delete, placeholder, { force = true })
+  end
+
+  local win = vim.api.nvim_get_current_win()
+  vim.wo[win].wrap = false
+  vim.wo[win].number = false
+  vim.wo[win].relativenumber = false
+  vim.wo[win].signcolumn = "no"
+  vim.wo[win].cursorline = false
+  vim.wo[win].sidescrolloff = 8
+  vim.wo[win].scrolloff = 4
+  vim.wo[win].virtualedit = "all"
+  vim.wo[win].winbar = session_winbar()
+
+  ensure_session_sidebar()
+  if M.session_buf and vim.api.nvim_buf_is_valid(M.session_buf) then
+    set_session_keymaps(M.session_buf)
+  end
+  M.render()
+
+  if M.selected and M.layout[M.selected] then
+    cursor_to(M.selected)
+  else
+    local last = state.order[#state.order]
+
+    if last then
+      M.select(last)
+    end
+  end
+end
+
+function M.restore_win(win)
+  if not (win and vim.api.nvim_win_is_valid(win) and M.buf and vim.api.nvim_buf_is_valid(M.buf)) then
+    return
+  end
+
+  M.graph_win = win
+  vim.api.nvim_win_set_buf(win, M.buf)
+  vim.wo[win].wrap = false
+  vim.wo[win].number = false
+  vim.wo[win].relativenumber = false
+  vim.wo[win].signcolumn = "no"
+  vim.wo[win].cursorline = false
+  vim.wo[win].sidescrolloff = 8
+  vim.wo[win].scrolloff = 4
+  vim.wo[win].virtualedit = "all"
+  vim.wo[win].winbar = session_winbar()
+  ensure_session_sidebar()
+  if M.session_buf and vim.api.nvim_buf_is_valid(M.session_buf) then
+    set_session_keymaps(M.session_buf)
+  end
+  M.render()
+end
+
+return M
