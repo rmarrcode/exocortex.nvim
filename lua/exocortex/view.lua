@@ -47,8 +47,8 @@ function M.open(node, from_rect, root_dir)
     table.insert(lines, "")
     table.insert(lines, "## changed files")
 
-    for _, f in ipairs(node.files) do
-      table.insert(lines, string.format("- `%s` %s", f.status, f.path))
+    for i, f in ipairs(node.files) do
+      table.insert(lines, string.format("%d. `%s` %s", i, f.status, f.path))
     end
   end
 
@@ -88,6 +88,9 @@ function M.open(node, from_rect, root_dir)
   vim.wo[win].wrap = true
   vim.wo[win].linebreak = true
   vim.wo[win].conceallevel = 2
+  vim.wo[win].number = true
+  vim.wo[win].relativenumber = true
+  vim.wo[win].numberwidth = 4
 
   local function close()
     if vim.api.nvim_win_is_valid(win) then
@@ -98,9 +101,7 @@ function M.open(node, from_rect, root_dir)
   vim.keymap.set("n", "q", close, { buffer = buf, silent = true, nowait = true })
   vim.keymap.set("n", "<Esc>", function()
     close()
-    if not pcall(vim.cmd.tabclose) then
-      vim.cmd("enew")
-    end
+    require("exocortex.graph").return_to_code()
   end, { buffer = buf, silent = true, nowait = true })
 
   vim.keymap.set("n", "r", function()

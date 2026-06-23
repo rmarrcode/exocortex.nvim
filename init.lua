@@ -1431,21 +1431,249 @@ local dapui = require("dapui")
 
 dapui.setup({})
 
-dap.listeners.before.attach.dapui_auto_open = function()
+-- dapui.open() carves its panels out of the existing windows, which shrinks the
+-- bottom terminal and widens nvim-tree; closing it never restores them. Snapshot
+-- every window's size before opening and replay it after closing so the IDE
+-- layout is exactly where you left it.
+local dap_saved_layout = nil
+
+local function dapui_open_keep_layout()
+  if not dap_saved_layout then
+    dap_saved_layout = vim.fn.winrestcmd()
+  end
   dapui.open()
 end
 
-dap.listeners.before.launch.dapui_auto_open = function()
-  dapui.open()
+local function dapui_close_restore_layout()
+  dapui.close()
+
+  if dap_saved_layout then
+    local restore = dap_saved_layout
+    dap_saved_layout = nil
+    -- Defer so dapui's windows are fully gone before we resize the survivors.
+    vim.schedule(function()
+      pcall(vim.cmd, restore)
+    end)
+  end
 end
 
-dap.listeners.before.event_terminated.dapui_auto_close = function()
-  dapui.close()
+dap.listeners.before.attach.dapui_auto_open = dapui_open_keep_layout
+dap.listeners.before.launch.dapui_auto_open = dapui_open_keep_layout
+dap.listeners.before.event_terminated.dapui_auto_close = dapui_close_restore_layout
+dap.listeners.before.event_exited.dapui_auto_close = dapui_close_restore_layout
+
+-- ── debug keybinding hint window ─────────────────────────────────────────────
+
+local debug_hint_win = nil
+
+local function open_debug_hint()
+  if debug_hint_win and vim.api.nvim_win_is_valid(debug_hint_win) then
+    return
+  end
+
+  local lines = {
+    "  DEBUG  ",
+    " F5  ,dc  Continue  ",
+    " F6  ,db  Breakpoint",
+    " F7  ,di  Step Into ",
+    " F8  ,dn  Step Over ",
+    " F9  ,do  Step Out  ",
+    " F10 ,dx  Stop      ",
+    " F11 ,du  Toggle UI ",
+  }
+
+  local width = 0
+  for _, l in ipairs(lines) do
+    width = math.max(width, #l)
+  end
+
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.bo[buf].modifiable = false
+  vim.bo[buf].bufhidden = "wipe"
+
+  vim.api.nvim_buf_add_highlight(buf, -1, "Title", 0, 0, -1)
+
+  debug_hint_win = vim.api.nvim_open_win(buf, false, {
+    relative = "editor",
+    anchor = "NE",
+    row = 1,
+    col = vim.o.columns - 1,
+    width = width,
+    height = #lines,
+    style = "minimal",
+    border = "rounded",
+    focusable = false,
+    zindex = 50,
+  })
+
+  vim.wo[debug_hint_win].winblend = 15
 end
 
-dap.listeners.before.event_exited.dapui_auto_close = function()
-  dapui.close()
+local function close_debug_hint()
+  if debug_hint_win and vim.api.nvim_win_is_valid(debug_hint_win) then
+    vim.api.nvim_win_close(debug_hint_win, true)
+  end
+  debug_hint_win = nil
 end
+
+dap.listeners.after.attach.debug_hint_open = function()
+  vim.schedule(open_debug_hint)
+end
+
+dap.listeners.after.launch.debug_hint_open = function()
+  vim.schedule(open_debug_hint)
+end
+
+dap.listeners.before.event_terminated.debug_hint_close = function()
+  vim.schedule(close_debug_hint)
+end
+
+dap.listeners.before.event_exited.debug_hint_close = function()
+  vim.schedule(close_debug_hint)
+end
+
+-- Stopped-line visuals: amber gutter arrow + persistent line tint.
+-- nvim-dap places the DapStopped sign automatically on every pause.
+vim.api.nvim_set_hl(0, "DapStoppedLine",  { bg = "#2a2000" })
+vim.api.nvim_set_hl(0, "DapStoppedFlash", { bg = "#665500", bold = true })
+
+vim.fn.sign_define("DapStopped", {
+  text    = "▶",
+  texthl  = "DiagnosticWarn",
+  linehl  = "DapStoppedLine",
+  numhl   = "DiagnosticWarn",
+})
+
+local dap_label_ns = vim.api.nvim_create_namespace("dap_stopped_label")
+local dap_flash_ns = vim.api.nvim_create_namespace("dap_stopped_flash")
+local dap_last_buf = nil
+
+local function clear_dap_stopped_marks()
+  if dap_last_buf and vim.api.nvim_buf_is_valid(dap_last_buf) then
+    vim.api.nvim_buf_clear_namespace(dap_last_buf, dap_label_ns, 0, -1)
+    vim.api.nvim_buf_clear_namespace(dap_last_buf, dap_flash_ns, 0, -1)
+  end
+  dap_last_buf = nil
+end
+
+-- On any pause (breakpoint, step, exception), jump the cursor to the stopped
+-- line in the nearest editor window so the source is always in focus.
+dap.listeners.after.event_stopped["jump_to_source"] = function(session, body)
+  if not body.threadId then
+    return
+  end
+
+  session:request("stackTrace", { threadId = body.threadId, startFrame = 0, levels = 1 }, function(err, response)
+    if err or not response or not response.stackFrames or #response.stackFrames == 0 then
+      return
+    end
+
+    local frame = response.stackFrames[1]
+
+    if not frame.source or not frame.source.path then
+      return
+    end
+
+    local path = frame.source.path
+    local line = frame.line
+
+    vim.schedule(function()
+      local bufnr = vim.fn.bufadd(path)
+      vim.fn.bufload(bufnr)
+
+      local target_win = nil
+
+      for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+        if vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_config(win).relative == "" then
+          local wbuf = vim.api.nvim_win_get_buf(win)
+          if vim.bo[wbuf].buftype == "" and vim.bo[wbuf].filetype ~= "NvimTree" then
+            target_win = win
+            break
+          end
+        end
+      end
+
+      if not target_win then
+        return
+      end
+
+      vim.api.nvim_win_set_buf(target_win, bufnr)
+      vim.api.nvim_set_current_win(target_win)
+      vim.api.nvim_win_set_cursor(target_win, { line, 0 })
+      vim.cmd("normal! zz")
+
+      -- Clear any previous stop markers, then mark the new stopped line.
+      clear_dap_stopped_marks()
+      dap_last_buf = bufnr
+
+      local reason = body.reason or "stopped"
+      local label = reason == "exception" and "  ✗ exception"
+        or reason == "breakpoint"         and "  ◆ breakpoint"
+        or                                    "  ◆ " .. reason
+
+      -- Persistent end-of-line label (stays until continue/terminate).
+      vim.api.nvim_buf_set_extmark(bufnr, dap_label_ns, line - 1, 0, {
+        virt_text     = { { label, "DiagnosticWarn" } },
+        virt_text_pos = "eol",
+        priority      = 200,
+      })
+
+      -- Bright flash that fades after 500 ms, leaving the sign's linehl.
+      vim.api.nvim_buf_set_extmark(bufnr, dap_flash_ns, line - 1, 0, {
+        line_hl_group = "DapStoppedFlash",
+        priority      = 210,
+      })
+      vim.defer_fn(function()
+        if vim.api.nvim_buf_is_valid(bufnr) then
+          vim.api.nvim_buf_clear_namespace(bufnr, dap_flash_ns, 0, -1)
+        end
+      end, 500)
+    end)
+  end)
+end
+
+-- Remove the label when execution resumes or the session ends.
+local function on_dap_continue()
+  vim.schedule(clear_dap_stopped_marks)
+end
+
+dap.listeners.before.event_continued.clear_stopped  = on_dap_continue
+dap.listeners.before.event_terminated.clear_stopped = on_dap_continue
+dap.listeners.before.event_exited.clear_stopped     = on_dap_continue
+
+-- Pause on errors instead of letting the process exit. "uncaught" catches
+-- exceptions that crash the program; "userUnhandled" also catches the common
+-- case where a launcher/framework swallows the exception or calls sys.exit()
+-- after printing a traceback — debugpy breaks at the point it leaves your code.
+-- Set via defaults so nvim-dap sends it during the configuration phase (before
+-- configurationDone), which debugpy requires.
+dap.defaults.fallback.exception_breakpoints = { "uncaught", "userUnhandled" }
+
+-- Toggle breaking on EVERY raised exception (even ones caught internally by
+-- libraries). Useful when a framework swallows the error so deeply that even
+-- userUnhandled misses it; noisy otherwise, so it's opt-in.
+vim.keymap.set("n", "<leader>de", function()
+  local current = dap.defaults.fallback.exception_breakpoints
+  local on = type(current) == "table" and vim.tbl_contains(current, "raised")
+
+  if on then
+    dap.defaults.fallback.exception_breakpoints = { "uncaught", "userUnhandled" }
+    vim.notify("DAP: break on uncaught/userUnhandled exceptions", vim.log.levels.INFO)
+  else
+    dap.defaults.fallback.exception_breakpoints = { "raised", "uncaught", "userUnhandled" }
+    vim.notify("DAP: break on ALL raised exceptions", vim.log.levels.INFO)
+  end
+
+  -- Apply live if a session is already running.
+  local session = dap.session()
+  if session then
+    session:set_exception_breakpoints(dap.defaults.fallback.exception_breakpoints)
+  end
+end, {
+  silent = true,
+  desc = "Toggle break on all raised exceptions",
+})
 
 local function file_exists(path)
   return path ~= nil and vim.fn.filereadable(path) == 1
@@ -1733,6 +1961,55 @@ local function read_exocortex_config()
   return cfg
 end
 
+-- Resolve a path from exocortex.config relative to `base` (absolute passes through).
+local function resolve_config_path(base, p)
+  if p:find("^/") then
+    return vim.fn.fnamemodify(vim.fn.expand(p), ":p")
+  end
+  return vim.fn.fnamemodify(base .. "/" .. p, ":p"):gsub("/$", "")
+end
+
+-- Launch debugpy straight from explicit [debug] keys in exocortex.config
+-- (python/cwd/program/args) instead of parsing a shell script.
+local function run_training_debug_explicit(cfg)
+  local d = cfg.debug or {}
+  local base = cfg._dir
+
+  local cwd = d.cwd and resolve_config_path(base, d.cwd) or base
+  local python = d.python and resolve_config_path(base, d.python) or vim.fn.exepath("python3")
+  local program = resolve_config_path(cwd, d.program or "train.py")
+  local args = d.args and parse_shell_words(d.args) or {}
+
+  if not file_exists(python) then
+    vim.notify("Python interpreter not found: " .. python, vim.log.levels.ERROR)
+    return
+  end
+
+  if not file_exists(program) then
+    vim.notify("Training entrypoint not found: " .. program, vim.log.levels.ERROR)
+    return
+  end
+
+  if not ensure_debugpy(python) then
+    return
+  end
+
+  ensure_mlflow_ui(cwd, python)
+
+  dap.run({
+    type = "python",
+    request = "launch",
+    name = "Training run",
+    cwd = cwd,
+    program = program,
+    args = args,
+    pythonPath = python,
+    justMyCode = false,
+    subProcess = true,
+    console = "integratedTerminal",
+  })
+end
+
 vim.keymap.set("n", "<F5>", function()
   if dap.session() then
     dap.continue()
@@ -1740,7 +2017,15 @@ vim.keymap.set("n", "<F5>", function()
   end
 
   local cfg = read_exocortex_config()
-  local run_file = cfg.debug and cfg.debug.run_file
+  local d = cfg.debug or {}
+
+  -- Explicit interpreter/cwd/args take precedence over script parsing.
+  if cfg._dir and (d.python or d.cwd or d.program or d.args) then
+    run_training_debug_explicit(cfg)
+    return
+  end
+
+  local run_file = d.run_file
 
   if run_file and cfg._dir and not run_file:find("^/") then
     run_file = cfg._dir .. "/" .. run_file

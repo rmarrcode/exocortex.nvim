@@ -44,7 +44,14 @@ M.adapters = {
   codex = {
     exe = "codex",
     cmd = function(prompt)
-      return { "codex", "exec", "--json", "--full-auto", prompt }
+      return {
+        "codex",
+        "exec",
+        "--json",
+        "--sandbox",
+        "workspace-write",
+        prompt,
+      }
     end,
     parse = function(stdout)
       local last

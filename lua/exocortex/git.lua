@@ -17,6 +17,23 @@ local function run(dir, args, env)
   return vim.trim(result.stdout or "")
 end
 
+local function run_async(dir, args, env, on_done)
+  local cmd = { "git", "-C", dir }
+  vim.list_extend(cmd, args)
+  on_done = on_done or function() end
+
+  vim.system(cmd, { text = true, env = env }, function(result)
+    vim.schedule(function()
+      if result.code ~= 0 then
+        on_done(nil, vim.trim(result.stderr ~= "" and result.stderr or (result.stdout or "git failed")))
+        return
+      end
+
+      on_done(vim.trim(result.stdout or ""))
+    end)
+  end)
+end
+
 function M.repo_root(dir)
   return run(dir or assert(vim.uv.cwd()), { "rev-parse", "--show-toplevel" })
 end
@@ -50,9 +67,43 @@ function M.snapshot(dir, parent_sha)
   return run(dir, args)
 end
 
+function M.snapshot_async(dir, parent_sha, on_done)
+  local index = vim.fn.tempname()
+  local env = { GIT_INDEX_FILE = index }
+
+  run_async(dir, { "add", "-A", "." }, env, function(_, add_err)
+    if add_err then
+      os.remove(index)
+      on_done(nil, add_err)
+      return
+    end
+
+    run_async(dir, { "write-tree" }, env, function(tree, tree_err)
+      os.remove(index)
+
+      if not tree then
+        on_done(nil, tree_err)
+        return
+      end
+
+      local args = { "commit-tree", tree, "-m", "exocortex snapshot" }
+
+      if parent_sha then
+        vim.list_extend(args, { "-p", parent_sha })
+      end
+
+      run_async(dir, args, nil, on_done)
+    end)
+  end)
+end
+
 -- Keep node snapshots reachable so gc never prunes them.
 function M.update_ref(root, ref_id, sha)
   return run(root, { "update-ref", "refs/exocortex/" .. ref_id, sha })
+end
+
+function M.update_ref_async(root, ref_id, sha, on_done)
+  run_async(root, { "update-ref", "refs/exocortex/" .. ref_id, sha }, nil, on_done)
 end
 
 function M.delete_ref(root, ref_id)
@@ -70,12 +121,28 @@ function M.worktree_add(root, sha)
   return dir
 end
 
+function M.worktree_add_async(root, sha, on_done)
+  local dir = vim.fn.tempname()
+
+  run_async(root, { "worktree", "add", "--detach", dir, sha }, nil, function(_, err)
+    if err then
+      on_done(nil, err)
+      return
+    end
+
+    on_done(dir)
+  end)
+end
+
 function M.worktree_remove(root, dir)
   run(root, { "worktree", "remove", "--force", dir })
 end
 
-function M.changed_files(root, base, sha)
-  local out = run(root, { "diff", "--name-status", base, sha })
+function M.worktree_remove_async(root, dir, on_done)
+  run_async(root, { "worktree", "remove", "--force", dir }, nil, on_done)
+end
+
+local function parse_changed_files(out)
   local files = {}
 
   for line in (out or ""):gmatch("[^\n]+") do
@@ -91,9 +158,7 @@ function M.changed_files(root, base, sha)
   return files
 end
 
-function M.shortstat(root, base, sha)
-  local out = run(root, { "diff", "--shortstat", base, sha })
-
+local function parse_shortstat(out)
   if not out or out == "" then
     return "no file changes"
   end
@@ -103,6 +168,38 @@ function M.shortstat(root, base, sha)
   local minus = out:match("(%d+) deletion") or "0"
 
   return string.format("%s file%s  +%s -%s", files, files == "1" and "" or "s", plus, minus)
+end
+
+function M.changed_files(root, base, sha)
+  local out = run(root, { "diff", "--name-status", base, sha })
+  return parse_changed_files(out)
+end
+
+function M.changed_files_async(root, base, sha, on_done)
+  run_async(root, { "diff", "--name-status", base, sha }, nil, function(out, err)
+    if err then
+      on_done(nil, err)
+      return
+    end
+
+    on_done(parse_changed_files(out))
+  end)
+end
+
+function M.shortstat(root, base, sha)
+  local out = run(root, { "diff", "--shortstat", base, sha })
+  return parse_shortstat(out)
+end
+
+function M.shortstat_async(root, base, sha, on_done)
+  run_async(root, { "diff", "--shortstat", base, sha }, nil, function(out, err)
+    if err then
+      on_done(nil, err)
+      return
+    end
+
+    on_done(parse_shortstat(out))
+  end)
 end
 
 function M.file_at(root, sha, path)

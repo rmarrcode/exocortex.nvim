@@ -166,6 +166,41 @@ function M.switch_session(session_id)
   return true
 end
 
+function M.new_src_node()
+  local id = "n" .. M.next_id
+  M.next_id = M.next_id + 1
+
+  local session = M.sessions[M.current_session] or {}
+  local node = {
+    id = id,
+    kind = "src",
+    parent = nil,
+    status = "running",
+    stat = "snapshotting",
+    snapshot = nil,
+    created = os.time(),
+    session_id = M.current_session,
+    session_agent = session.agent,
+    root_dir = M.root_dir,
+  }
+
+  M.nodes[id] = node
+  table.insert(M.order, id)
+  M.save()
+  return node
+end
+
+-- True when every node in the session is a src node (no agent turns yet).
+function M.has_only_src()
+  for _, id in ipairs(M.order) do
+    local node = M.nodes[id]
+    if node and node.kind ~= "src" then
+      return false
+    end
+  end
+  return true
+end
+
 function M.new_node(parent_id, prompt, agent)
   local id = "n" .. M.next_id
   M.next_id = M.next_id + 1

@@ -63,12 +63,17 @@ end
 -- Agents are stateless across nodes in v1: branching replays the path-to-root
 -- transcript as context, which works identically for every CLI.
 local function build_prompt(parent_id, prompt)
-  local parts = {}
+  local parts = {
+    "You are running in an isolated proposal worktree. Modify only files under the current working directory.",
+    "Do not edit files through absolute paths outside this worktree. The user will review and explicitly accept proposed hunks later.",
+  }
 
   if parent_id then
     table.insert(parts, "You are continuing an existing conversation. Earlier turns, oldest first:")
 
     for _, node in ipairs(state.path_to_root(parent_id)) do
+      if node.kind == "src" then goto continue_build end
+
       table.insert(parts, "\n--- user ---\n" .. (node.prompt or ""))
 
       local response = node.response or ""
@@ -77,6 +82,8 @@ local function build_prompt(parent_id, prompt)
       end
 
       table.insert(parts, "\n--- assistant ---\n" .. response)
+
+      ::continue_build::
     end
 
     table.insert(parts, "\n--- new user request ---\n" .. prompt)
@@ -98,7 +105,56 @@ local function fail_node(node, err)
   node.response = err
   state.save()
   graph.render()
+
+  if graph.flash_code_win then
+    graph.flash_code_win("exocortex: " .. node.id .. " failed")
+  end
+
   vim.notify("exocortex: " .. node.id .. " failed: " .. (err or "?"), vim.log.levels.ERROR)
+end
+
+local function finish_node(node, root, base, ref_name, response, sha, files)
+  node.response = response
+  node.snapshot = sha
+  node.files = files or {}
+  node.stat = "updating stats"
+  state.save()
+  graph.render()
+
+  git.shortstat_async(root, base, sha, function(stat, stat_err)
+    node.stat = stat or (stat_err and ("stat failed: " .. stat_err:gsub("\n.*", "")) or "no file changes")
+
+    node.status = "done"
+    git.update_ref_async(root, ref_name, sha, function(_, ref_err)
+      if ref_err then
+        vim.notify("exocortex: failed to pin " .. node.id .. ": " .. ref_err, vim.log.levels.WARN)
+      end
+
+      state.save()
+      graph.render()
+
+      if graph.flash_code_win then
+        graph.flash_code_win("exocortex: " .. node.id .. " done")
+      end
+
+      if graph.flash_tabline then
+        graph.flash_tabline()
+      end
+
+      vim.notify("exocortex: " .. node.id .. " done (" .. node.stat .. ")", vim.log.levels.INFO)
+    end)
+  end)
+end
+
+local function finish_worktree_snapshot(node, root, base, ref_name, response, worktree_sha)
+  git.changed_files_async(root, base, worktree_sha, function(files, files_err)
+    if files_err then
+      fail_node(node, "diff: " .. files_err)
+      return
+    end
+
+    finish_node(node, root, base, ref_name, response, worktree_sha, files or {})
+  end)
 end
 
 function M.run_prompt(parent_id, prompt)
@@ -127,56 +183,65 @@ function M.run_prompt(parent_id, prompt)
     return
   end
 
-  -- Base tree: parent's snapshot, or the current working tree for a root.
-  local base, base_err
-
-  if parent then
-    base = parent.snapshot
-  else
-    base, base_err = git.snapshot(root)
-  end
-
-  if not base then
-    vim.notify("exocortex: snapshot failed: " .. (base_err or "?"), vim.log.levels.ERROR)
-    return
-  end
-
   local node = state.new_node(parent_id, prompt, agent)
-  node.base = base
+  local ref_name = state.ref_name(node.id)
+  node.stat = parent and "preparing worktree" or "snapshotting base"
   graph.select(node.id)
   graph.start_spinner()
 
-  local worktree, wt_err = git.worktree_add(root, base)
+  local function start_agent(base)
+    node.base = base
+    node.stat = "preparing worktree"
+    state.save()
+    graph.render()
 
-  if not worktree then
-    fail_node(node, "worktree: " .. (wt_err or "?"))
+    git.worktree_add_async(root, base, function(worktree, wt_err)
+      if not worktree then
+        fail_node(node, "worktree: " .. (wt_err or "?"))
+        return
+      end
+
+      node.stat = "running"
+      state.save()
+      graph.render()
+
+      agents.run(agent, build_prompt(parent_id, prompt), worktree, function(response, agent_err)
+        if agent_err then
+          git.worktree_remove_async(root, worktree)
+          fail_node(node, agent_err)
+          return
+        end
+
+        node.stat = "saving snapshot"
+        state.save()
+        graph.render()
+
+        git.snapshot_async(worktree, base, function(sha, snap_err)
+          git.worktree_remove_async(root, worktree)
+
+          if not sha then
+            fail_node(node, "snapshot: " .. (snap_err or "?"))
+            return
+          end
+
+          finish_worktree_snapshot(node, root, base, ref_name, response, sha)
+        end)
+      end)
+    end)
+  end
+
+  if parent then
+    start_agent(parent.snapshot)
     return
   end
 
-  agents.run(agent, build_prompt(parent_id, prompt), worktree, function(response, agent_err)
-    if agent_err then
-      git.worktree_remove(root, worktree)
-      fail_node(node, agent_err)
+  git.snapshot_async(root, nil, function(base, base_err)
+    if not base then
+      fail_node(node, "snapshot: " .. (base_err or "?"))
       return
     end
 
-    local sha, snap_err = git.snapshot(worktree, base)
-    git.worktree_remove(root, worktree)
-
-    if not sha then
-      fail_node(node, "snapshot: " .. (snap_err or "?"))
-      return
-    end
-
-    node.response = response
-    node.snapshot = sha
-    node.files = git.changed_files(root, base, sha)
-    node.stat = git.shortstat(root, base, sha)
-    node.status = "done"
-    git.update_ref(root, state.ref_name(node.id), sha)
-    state.save()
-    graph.render()
-    vim.notify("exocortex: " .. node.id .. " done (" .. node.stat .. ")", vim.log.levels.INFO)
+    start_agent(base)
   end)
 end
 
@@ -236,7 +301,7 @@ function M.prompt(parent_id)
 
   local current = state.session_agent()
 
-  if state.is_empty() and not current then
+  if (state.is_empty() or state.has_only_src()) and not current then
     prompt_for_session_agent(do_input)
     return
   end
@@ -258,6 +323,62 @@ local function selected_node()
   end
 
   return node
+end
+
+local function open_ai_view_from_terminal()
+  vim.schedule(function()
+    require("exocortex").open()
+  end)
+end
+
+local function set_terminal_keymaps(buf)
+  vim.keymap.set("t", "<C-a>i", open_ai_view_from_terminal, { buffer = buf, silent = true, nowait = true, desc = "Open AI view" })
+end
+
+local function bring_window_left()
+  vim.schedule(function()
+    local win = vim.api.nvim_get_current_win()
+    if not (win and vim.api.nvim_win_is_valid(win)) then
+      return
+    end
+
+    if vim.api.nvim_win_get_config(win).relative ~= "" then
+      return
+    end
+
+    pcall(vim.cmd, "wincmd H")
+  end)
+end
+
+local open_same_file_right
+
+local function set_file_keymaps(buf)
+  if vim.api.nvim_buf_is_valid(buf) and vim.bo[buf].buftype == "" and not vim.bo[buf].filetype:match("^exocortex") then
+    vim.keymap.set("n", "<C-\\>", open_same_file_right, { buffer = buf, silent = true, nowait = true, desc = "Open same file to the right" })
+    vim.keymap.set("n", "f", function() review.function_to_top(vim.api.nvim_get_current_win()) end, { buffer = buf, silent = true, nowait = true, desc = "Put function at top" })
+  end
+end
+
+open_same_file_right = function()
+  local win = vim.api.nvim_get_current_win()
+  if not (win and vim.api.nvim_win_is_valid(win)) then
+    return
+  end
+
+  if vim.api.nvim_win_get_config(win).relative ~= "" then
+    return
+  end
+
+  local buf = vim.api.nvim_win_get_buf(win)
+  if vim.bo[buf].buftype ~= "" or vim.bo[buf].filetype:match("^exocortex") then
+    return
+  end
+
+  local view = vim.fn.winsaveview()
+  vim.cmd("rightbelow vsplit")
+  local right = vim.api.nvim_get_current_win()
+  vim.api.nvim_win_set_buf(right, buf)
+  pcall(vim.fn.winrestview, view)
 end
 
 local function is_graph_buf(buf)
@@ -295,63 +416,40 @@ local function is_workspace_win(win)
   return bt == "" or bt == "terminal"
 end
 
-local function tabpage_winlayout(tab)
-  local current = vim.api.nvim_get_current_tabpage()
-
-  if tab ~= current then
-    vim.api.nvim_set_current_tabpage(tab)
-  end
-
-  local layout = vim.fn.winlayout()
-
-  if tab ~= current then
-    vim.api.nvim_set_current_tabpage(current)
-  end
-
-  return layout
-end
-
 local function capture_workspace_tab(tab)
   if not (tab and vim.api.nvim_tabpage_is_valid(tab)) then
     return nil
   end
 
-  local wins = vim.api.nvim_tabpage_list_wins(tab)
+  local current = vim.api.nvim_get_current_tabpage()
+  if tab ~= current then
+    vim.api.nvim_set_current_tabpage(tab)
+  end
+
   local target = nil
-  local state_by_win = {}
+  local target_key = nil
 
-  for _, win in ipairs(wins) do
-    local buf = vim.api.nvim_win_get_buf(win)
-    state_by_win[win] = {
-      buf = buf,
-      cursor = vim.api.nvim_win_get_cursor(win),
-      width = vim.api.nvim_win_get_width(win),
-      height = vim.api.nvim_win_get_height(win),
-    }
-
+  for _, win in ipairs(vim.api.nvim_tabpage_list_wins(tab)) do
     if is_workspace_win(win) then
-      if vim.bo[buf].buftype == "" then
-        target = win
-        break
-      end
+      local pos = vim.api.nvim_win_get_position(win)
+      local key = pos[2] * 1000 + pos[1]
 
-      target = target or win
+      if not target_key or key < target_key then
+        target = win
+        target_key = key
+      end
     end
+  end
+
+  if tab ~= current then
+    vim.api.nvim_set_current_tabpage(current)
   end
 
   if not target then
     return nil
   end
 
-  local layout = tabpage_winlayout(tab)
-
-  return {
-    tab = tab,
-    current = vim.api.nvim_tabpage_get_win(tab),
-    target = target,
-    layout = layout,
-    wins = state_by_win,
-  }
+  return { tab = tab, target = target }
 end
 
 local function find_workspace_tab()
@@ -368,6 +466,7 @@ local function find_workspace_tab()
     end
   end
 
+  add(graph.return_tab)
   add(alt)
   for _, tab in ipairs(tabs) do
     if tab ~= vim.api.nvim_get_current_tabpage() then
@@ -383,41 +482,6 @@ local function find_workspace_tab()
   end
 end
 
-local function restore_workspace_leaf(src_win, dst_win, captured)
-  local info = captured.wins[src_win]
-  if not info then
-    return
-  end
-
-  if info.buf and vim.api.nvim_buf_is_valid(info.buf) then
-    vim.api.nvim_win_set_buf(dst_win, info.buf)
-  end
-
-  pcall(vim.api.nvim_win_set_cursor, dst_win, info.cursor)
-  pcall(vim.api.nvim_win_set_width, dst_win, info.width)
-  pcall(vim.api.nvim_win_set_height, dst_win, info.height)
-end
-
-local function clone_workspace_layout(node, win_map, captured)
-  if node[1] == "leaf" then
-    local src_win = node[2]
-    local dst_win = vim.api.nvim_get_current_win()
-    win_map[src_win] = dst_win
-    restore_workspace_leaf(src_win, dst_win, captured)
-    return dst_win
-  end
-
-  local edge = clone_workspace_layout(node[2][1], win_map, captured)
-
-  for i = 2, #node[2] do
-    vim.api.nvim_set_current_win(edge)
-    vim.cmd(node[1] == "row" and "rightbelow vsplit" or "rightbelow split")
-    edge = clone_workspace_layout(node[2][i], win_map, captured)
-  end
-
-  return edge
-end
-
 local function open_response_tab(buf)
   local captured = find_workspace_tab()
 
@@ -428,15 +492,12 @@ local function open_response_tab(buf)
   end
 
   vim.api.nvim_set_current_tabpage(captured.tab)
-  vim.cmd("tabnew")
 
-  local win_map = {}
-  clone_workspace_layout(captured.layout, win_map, captured)
-  vim.cmd("wincmd =")
+  if vim.api.nvim_win_is_valid(captured.target) then
+    vim.api.nvim_set_current_win(captured.target)
+  end
 
-  local target = win_map[captured.target] or vim.api.nvim_get_current_win()
-  vim.api.nvim_set_current_win(target)
-  vim.api.nvim_win_set_buf(target, buf)
+  vim.api.nvim_win_set_buf(0, buf)
 end
 
 function M.read_selected()
@@ -462,6 +523,15 @@ function M.read_selected()
   vim.bo[buf].modifiable = false
   vim.bo[buf].readonly = true
   vim.bo[buf].modified = false
+
+  local function close_read_view()
+    if vim.api.nvim_buf_is_valid(buf) then
+      pcall(vim.cmd, "bdelete " .. buf)
+    end
+  end
+
+  vim.keymap.set("n", "q", close_read_view, { buffer = buf, silent = true, nowait = true })
+  vim.keymap.set("n", "<Esc>", close_read_view, { buffer = buf, silent = true, nowait = true })
 
   open_response_tab(buf)
 
@@ -561,6 +631,32 @@ function M.new_session()
 
   state.new_session()
   graph.session_changed("created session")
+  M.create_src_node()
+end
+
+function M.create_src_node()
+  local root = state.root_dir
+  if not root then return end
+
+  local node = state.new_src_node()
+  local ref_name = state.ref_name(node.id)
+  graph.render()
+  graph.select(node.id)
+  graph.start_spinner()
+
+  git.snapshot_async(root, nil, function(sha, snap_err)
+    if not sha then
+      node.status = "error"
+      node.stat = snap_err and snap_err:gsub("\n.*", ""):sub(1, 60) or "snapshot failed"
+    else
+      node.snapshot = sha
+      node.status = "done"
+      node.stat = sha:sub(1, 7)
+      git.update_ref_async(root, ref_name, sha, function() end)
+    end
+    state.save()
+    graph.render()
+  end)
 end
 
 function M.open()
@@ -577,17 +673,24 @@ function M.open()
   end
 
   graph.open()
+
+  if state.is_empty() then
+    M.create_src_node()
+  end
 end
 
 -- Colors match the VSCode-dark palette; reapplied on :colorscheme changes.
 local function set_highlights()
-  vim.api.nvim_set_hl(0, "ExocortexCard", { fg = "#8b919c", bg = "#252526" })
-  vim.api.nvim_set_hl(0, "ExocortexTitle", { fg = "#e5e5e5", bg = "#252526", bold = true })
-  vim.api.nvim_set_hl(0, "ExocortexRunning", { fg = "#dcdcaa", bg = "#252526" })
-  vim.api.nvim_set_hl(0, "ExocortexError", { fg = "#f44747", bg = "#252526" })
+  vim.api.nvim_set_hl(0, "ExocortexCard", { fg = "#8b919c", bg = "#1f1f1f" })
+  vim.api.nvim_set_hl(0, "ExocortexTitle", { fg = "#e5e5e5", bg = "#1f1f1f", bold = true })
+  vim.api.nvim_set_hl(0, "ExocortexRunning", { fg = "#dcdcaa", bg = "#1f1f1f" })
+  vim.api.nvim_set_hl(0, "ExocortexError", { fg = "#f44747", bg = "#1f1f1f" })
   vim.api.nvim_set_hl(0, "ExocortexSelected", { fg = "#ffffff", bg = "#264f78", bold = true })
   vim.api.nvim_set_hl(0, "ExocortexSession", { fg = "#8b919c", bg = "#1e1e1e" })
   vim.api.nvim_set_hl(0, "ExocortexSessionActive", { fg = "#ffffff", bg = "#264f78", bold = true })
+  vim.api.nvim_set_hl(0, "ExocortexFlash", { fg = "#1e1e1e", bg = "#ffcc00", bold = true })
+  vim.api.nvim_set_hl(0, "ExocortexSrc", { fg = "#4ec9b0", bg = "#1f1f1f" })
+  vim.api.nvim_set_hl(0, "ExocortexSrcTitle", { fg = "#4ec9b0", bg = "#1f1f1f", bold = true })
 end
 
 function M.setup(opts)
@@ -602,12 +705,38 @@ function M.setup(opts)
 
   set_highlights()
 
+  local augroup = vim.api.nvim_create_augroup("exocortex", { clear = true })
+
   vim.api.nvim_create_autocmd("ColorScheme", {
-    group = vim.api.nvim_create_augroup("exocortex", { clear = true }),
+    group = augroup,
     callback = set_highlights,
   })
 
+  vim.api.nvim_create_autocmd("TermOpen", {
+    group = augroup,
+    callback = function(args)
+      set_terminal_keymaps(args.buf)
+    end,
+  })
+
+  vim.api.nvim_create_autocmd({ "BufEnter", "BufWinEnter" }, {
+    group = augroup,
+    callback = function(args)
+      set_file_keymaps(args.buf)
+    end,
+  })
+
+  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_valid(buf) and vim.bo[buf].buftype == "terminal" then
+      set_terminal_keymaps(buf)
+    else
+      set_file_keymaps(buf)
+    end
+  end
+
   vim.api.nvim_create_user_command("Exocortex", M.open, { desc = "Open the exocortex agent graph" })
+
+  vim.keymap.set({ "n", "t" }, "<C-D-Left>", bring_window_left, { silent = true, nowait = true, desc = "Move window left" })
 end
 
 return M

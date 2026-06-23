@@ -1,17 +1,19 @@
--- One-hunk-at-a-time review. Full file visible for context; cursor navigates
--- between hunks. Left window = your real file (editable). Right = snapshot.
+-- One-diff-at-a-time review. Left window = the node proposal (read-only).
+-- Right window = your current file (editable). Each proposed diff gets a
+-- stable # marker; the real file changes only when you accept a focused hunk.
 --
---   a    accept current diff hunk
---   r    reject current diff hunk (skip, keep your version)
---   e    accept and edit (apply hunk, stay positioned for manual changes)
---   n    next diff hunk
---   p    previous diff hunk
---   ]    next changed file
---   [    previous changed file
---   J    page down
---   K    page up
---   A    accept all hunks in this file
---   q    end review, return to graph
+--   a             accept current diff hunk
+--   s             skip current diff hunk
+--   u             undo accept/skip and show the proposal again
+--   e             focus the editable right side
+--   PgDn / n      next diff hunk
+--   PgUp / p      previous diff hunk
+--   ]             next changed file
+--   [             previous changed file
+--   J             page down inside the file
+--   K             page up inside the file
+--   f             put the current function at the top of the window
+--   q             end review
 
 local git = require("exocortex.git")
 
@@ -19,12 +21,17 @@ local M = {}
 
 M.session = nil
 
-local REVIEW_MAPS = { "a", "r", "e", "n", "p", "]", "[", "J", "K", "A", "q" }
+local REVIEW_MAPS = { "a", "s", "u", "e", "n", "p", "]", "[", "J", "K", "f", "q", "<PageDown>", "<PageUp>" }
 
-local HUNK_NS = vim.api.nvim_create_namespace("exocortex_hunk")
-vim.api.nvim_set_hl(0, "ExocortexHunkMarker", { fg = "#ffcc00", bold = true, default = true })
+local MARK_NS = vim.api.nvim_create_namespace("exocortex_review_marks")
+local TRACK_NS = vim.api.nvim_create_namespace("exocortex_review_tracks")
 
-local GUIDE = "  a accept  r reject  e edit  │  n next hunk  p prev hunk  │  ] next file  [ prev file  │  J page↓  K page↑  │  A accept all  q quit  "
+vim.api.nvim_set_hl(0, "ExocortexDiffCurrent", { fg = "#ffcc00", bold = true, default = true })
+vim.api.nvim_set_hl(0, "ExocortexDiffPending", { fg = "#7aa2f7", default = true })
+vim.api.nvim_set_hl(0, "ExocortexDiffAccepted", { fg = "#73daca", default = true })
+vim.api.nvim_set_hl(0, "ExocortexDiffSkipped", { fg = "#8b919c", default = true })
+
+local GUIDE = "  a accept  s skip  u undo  e edit-right  │  PgDn/PgUp diff  │  ]/[ file  │  J/K page  │  f func top  │  q quit  "
 
 local function valid_win(win)
   return win ~= nil and vim.api.nvim_win_is_valid(win)
@@ -33,7 +40,8 @@ end
 local function is_editor_win(win)
   if vim.api.nvim_win_get_config(win).relative ~= "" then return false end
   local buf = vim.api.nvim_win_get_buf(win)
-  return vim.bo[buf].buftype == "" and vim.bo[buf].filetype ~= "NvimTree"
+  local ft = vim.bo[buf].filetype
+  return vim.bo[buf].buftype == "" and ft ~= "NvimTree" and not ft:match("^exocortex")
 end
 
 local function find_editor_window()
@@ -43,6 +51,7 @@ local function find_editor_window()
   local alt = alt_idx > 0 and tabs[alt_idx] or nil
   if alt then table.insert(ordered, alt) end
   vim.list_extend(ordered, tabs)
+
   for _, tab in ipairs(ordered) do
     if vim.api.nvim_tabpage_is_valid(tab) then
       for _, win in ipairs(vim.api.nvim_tabpage_list_wins(tab)) do
@@ -50,42 +59,59 @@ local function find_editor_window()
       end
     end
   end
+
   return nil
 end
 
-local function flush_pending_edits()
-  local s = M.session
-  if s and s.left_buf and vim.api.nvim_buf_is_valid(s.left_buf) and vim.bo[s.left_buf].modified then
-    vim.api.nvim_buf_call(s.left_buf, function()
-      vim.cmd("silent! update")
-    end)
-  end
+local function current_hunk(s)
+  if not s or not s.hunks then return nil end
+  return s.hunks[s.hunk_index or 1]
 end
 
-local function file_winbar(s)
+local function status_label(hunk)
+  if not hunk then return "no diffs" end
+  if hunk.status == "accepted" then return "accepted" end
+  if hunk.status == "skipped" then return "skipped" end
+  return "pending"
+end
+
+local function proposal_winbar(s)
   local f = s.files[s.index]
-  return string.format("  [%d/%d]  %s  [%s]  %%=%s", s.index, #s.files, f.path, f.status, GUIDE)
+  local h = current_hunk(s)
+  local target = h and string.format("proposal #%d/%d %s", h.index, #s.hunks, status_label(h)) or "no diffs"
+  return string.format("  [%d/%d]  %s  [%s]  %s  %%=%s", s.index, #s.files, f.path, f.status, target, GUIDE)
 end
 
-local function snapshot_winbar()
-  return "  snapshot (read-only)  %=" .. GUIDE
+local function target_winbar(s)
+  local h = current_hunk(s)
+  local target = h and string.format("target #%d/%d", h.index, #s.hunks) or "target"
+  return "  editable file  " .. target .. "  %=" .. GUIDE
+end
+
+local function open_node_diff(node)
+  if not (node.base and node.snapshot) then
+    return false
+  end
+
+  vim.cmd(string.format("DiffviewOpen %s..%s", node.base, node.snapshot))
+  return true
 end
 
 local function update_winbars()
   local s = M.session
   if not s then return end
-  if valid_win(s.left_win) then vim.wo[s.left_win].winbar = file_winbar(s) end
-  if valid_win(s.right_win) then vim.wo[s.right_win].winbar = snapshot_winbar() end
+  if valid_win(s.left_win) then vim.wo[s.left_win].winbar = proposal_winbar(s) end
+  if valid_win(s.right_win) then vim.wo[s.right_win].winbar = target_winbar(s) end
 end
 
-local function left_win_current()
+local function target_win_current()
   local s = M.session
   if not s then return nil end
-  if s.left_buf and vim.api.nvim_buf_is_valid(s.left_buf) then
-    local w = vim.fn.bufwinid(s.left_buf)
+  if s.right_buf and vim.api.nvim_buf_is_valid(s.right_buf) then
+    local w = vim.fn.bufwinid(s.right_buf)
     if w ~= -1 then return w end
   end
-  return valid_win(s.left_win) and s.left_win or nil
+  return valid_win(s.right_win) and s.right_win or nil
 end
 
 local function center_view(win)
@@ -94,129 +120,413 @@ local function center_view(win)
   end
 end
 
--- Walk up/down from cursor_line to find the full extent of the diff hunk.
-local function find_hunk_range(lwin, cursor_line)
-  local lbuf = vim.api.nvim_win_get_buf(lwin)
-  local n     = vim.api.nvim_buf_line_count(lbuf)
-  local hs, he = cursor_line, cursor_line
-
-  vim.api.nvim_win_call(lwin, function()
-    if vim.fn.diff_hlID(cursor_line, 1) == 0 then return end
-    for l = cursor_line - 1, math.max(1, cursor_line - 500), -1 do
-      if vim.fn.diff_hlID(l, 1) == 0 then break end
-      hs = l
-    end
-    for l = cursor_line + 1, math.min(n, cursor_line + 500) do
-      if vim.fn.diff_hlID(l, 1) == 0 then break end
-      he = l
-    end
-  end)
-
-  return hs, he
+local function top_view(win)
+  if valid_win(win) then
+    vim.api.nvim_win_call(win, function() vim.cmd("normal! zt") end)
+  end
 end
 
--- Place bracket signs in the left buffer marking every line of the current hunk.
-local function mark_current_hunk(lwin)
+local function is_function_node(node)
+  if not node then
+    return false
+  end
+
+  local typ = node:type():lower()
+  return typ:find("function", 1, true)
+    or typ:find("method", 1, true)
+    or typ:find("constructor", 1, true)
+    or typ:find("lambda", 1, true)
+    or typ:find("subroutine", 1, true)
+end
+
+local function function_start_row(buf, row0)
+  local ok, parser = pcall(vim.treesitter.get_parser, buf)
+  if ok and parser then
+    local parsed = parser:parse()
+    local tree = parsed and parsed[1]
+    if tree then
+      local node = vim.treesitter.get_node({ bufnr = buf, pos = { row0, 0 } })
+      while node do
+        if is_function_node(node) then
+          local start_row = node:range()
+          return start_row
+        end
+        node = node:parent()
+      end
+    end
+  end
+
+  local lines = vim.api.nvim_buf_get_lines(buf, 0, row0 + 1, false)
+  for i = #lines, 1, -1 do
+    local line = lines[i]
+    if line:match("^%s*function%s+")
+      or line:match("^%s*local%s+function%s+")
+      or line:match("^%s*def%s+")
+      or line:match("^%s*class%s+")
+      or line:match("^%s*[A-Za-z_][A-Za-z0-9_]*%s*=%s*function%s*") then
+      return i - 1
+    end
+  end
+end
+
+local function function_to_top(win)
+  if not valid_win(win) then
+    return
+  end
+
+  local buf = vim.api.nvim_win_get_buf(win)
+  local orig_cursor = vim.api.nvim_win_get_cursor(win)
+  local row0 = orig_cursor[1] - 1
+  local start_row = function_start_row(buf, row0)
+
+  if start_row == nil then
+    vim.notify("exocortex: no enclosing function found", vim.log.levels.INFO)
+    return
+  end
+
+  pcall(vim.api.nvim_win_set_cursor, win, { start_row + 1, 0 })
+  vim.cmd("normal! zt")
+  pcall(vim.api.nvim_win_set_cursor, win, orig_cursor)
+end
+
+local function make_target_editable(buf)
+  vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
+  vim.api.nvim_set_option_value("readonly", false, { buf = buf })
+end
+
+local function save_target()
+  local s = M.session
+  if not (s and s.right_buf and vim.api.nvim_buf_is_valid(s.right_buf)) then
+    return
+  end
+
+  if vim.bo[s.right_buf].modified then
+    vim.api.nvim_buf_call(s.right_buf, function()
+      pcall(vim.cmd, "silent! update")
+    end)
+  end
+end
+
+local function slice(lines, start, count)
+  local out = {}
+
+  if count <= 0 then
+    return out
+  end
+
+  for i = start, start + count - 1 do
+    out[#out + 1] = lines[i] or ""
+  end
+
+  return out
+end
+
+local function text_from_lines(lines)
+  return table.concat(lines, "\n")
+end
+
+local function compute_hunks(left_lines, right_lines)
+  local ok, diff = pcall(vim.diff, text_from_lines(left_lines), text_from_lines(right_lines), {
+    result_type = "indices",
+    algorithm = "histogram",
+  })
+
+  if not ok or type(diff) ~= "table" then
+    return {}
+  end
+
+  local hunks = {}
+
+  for _, item in ipairs(diff) do
+    local old_start, old_count, new_start, new_count = item[1], item[2], item[3], item[4]
+
+    if old_count > 0 or new_count > 0 then
+      local start0 = old_count > 0 and old_start - 1 or old_start
+      hunks[#hunks + 1] = {
+        index = #hunks + 1,
+        old_start = old_start,
+        old_count = old_count,
+        new_start = new_start,
+        new_count = new_count,
+        start0 = start0,
+        count = old_count,
+        original = slice(left_lines, old_start, old_count),
+        proposed = slice(right_lines, new_start, new_count),
+        status = "pending",
+      }
+    end
+  end
+
+  return hunks
+end
+
+local function ext_row(buf, row)
+  local n = vim.api.nvim_buf_line_count(buf)
+  if row < 0 then return 0 end
+  if row > n then return n end
+  return row
+end
+
+local function display_row(buf, row)
+  local n = vim.api.nvim_buf_line_count(buf)
+  return math.max(0, math.min(row, n - 1))
+end
+
+local function place_track(lbuf, hunk, start0, end0)
+  start0 = ext_row(lbuf, start0)
+  end0 = ext_row(lbuf, math.max(start0, end0))
+  hunk.start0 = start0
+  hunk.count = end0 - start0
+
+  hunk.start_mark = vim.api.nvim_buf_set_extmark(lbuf, TRACK_NS, start0, 0, {
+    id = hunk.start_mark,
+    right_gravity = false,
+  })
+  hunk.end_mark = vim.api.nvim_buf_set_extmark(lbuf, TRACK_NS, end0, 0, {
+    id = hunk.end_mark,
+    right_gravity = true,
+  })
+end
+
+local function place_tracks(lbuf, hunks)
+  vim.api.nvim_buf_clear_namespace(lbuf, TRACK_NS, 0, -1)
+
+  for _, hunk in ipairs(hunks) do
+    place_track(lbuf, hunk, hunk.start0, hunk.start0 + hunk.count)
+  end
+end
+
+local function mark_pos(buf, id, fallback)
+  if not id then return fallback end
+  local pos = vim.api.nvim_buf_get_extmark_by_id(buf, TRACK_NS, id, {})
+  if not pos or not pos[1] then return fallback end
+  return pos[1]
+end
+
+local function hunk_range(hunk)
+  local s = M.session
+  local buf = s and s.right_buf
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then
+    return hunk.start0, hunk.start0 + hunk.count
+  end
+
+  local start0 = mark_pos(buf, hunk.start_mark, hunk.start0)
+  local end0 = mark_pos(buf, hunk.end_mark, hunk.start0 + hunk.count)
+
+  if end0 < start0 then
+    -- Extmarks crossed: a previous accept shifted lines and the tracking is
+    -- broken for this hunk. Return a zero-length range so callers can detect
+    -- it rather than silently converting a replacement into an insertion.
+    end0 = start0
+  end
+
+  hunk.start0 = start0
+  hunk.count = end0 - start0
+  return start0, end0
+end
+
+local function marker_hl(hunk, current)
+  if current then return "ExocortexDiffCurrent" end
+  if hunk.status == "accepted" then return "ExocortexDiffAccepted" end
+  if hunk.status == "skipped" then return "ExocortexDiffSkipped" end
+  return "ExocortexDiffPending"
+end
+
+local function mark_hunks()
   local s = M.session
   if not s then return end
 
-  for buf in pairs(s.mapped_bufs) do
-    if vim.api.nvim_buf_is_valid(buf) then
-      vim.api.nvim_buf_clear_namespace(buf, HUNK_NS, 0, -1)
+  for _, buf in ipairs({ s.left_buf, s.right_buf }) do
+    if buf and vim.api.nvim_buf_is_valid(buf) then
+      vim.api.nvim_buf_clear_namespace(buf, MARK_NS, 0, -1)
     end
   end
 
-  if not valid_win(lwin) then return end
+  if not (s.left_buf and vim.api.nvim_buf_is_valid(s.left_buf)) then
+    return
+  end
 
-  local lbuf = vim.api.nvim_win_get_buf(lwin)
-  local row   = vim.api.nvim_win_get_cursor(lwin)[1]
-  local hs, he = find_hunk_range(lwin, row)
-  local span  = he - hs
+  local total = #(s.hunks or {})
 
-  for lnum = hs, he do
-    local text
-    if span == 0 then
-      text = "▶ "
-    elseif lnum == hs then
-      text = "┌ "
-    elseif lnum == he then
-      text = "└ "
-    else
-      text = "│ "
-    end
-    vim.api.nvim_buf_set_extmark(lbuf, HUNK_NS, lnum - 1, 0, {
-      sign_text     = text,
-      sign_hl_group = "ExocortexHunkMarker",
-      priority      = 100,
+  for _, hunk in ipairs(s.hunks or {}) do
+    local current = hunk.index == s.hunk_index
+    local hl = marker_hl(hunk, current)
+    local label = string.format("  #%d/%d %s%s", hunk.index, total, status_label(hunk), current and " current" or "")
+    local left_start0 = hunk.new_count > 0 and hunk.new_start - 1 or hunk.new_start
+    local left_row = display_row(s.left_buf, left_start0)
+
+    vim.api.nvim_buf_set_extmark(s.left_buf, MARK_NS, left_row, 0, {
+      sign_text = current and ">>" or "  ",
+      sign_hl_group = hl,
+      virt_text = { { label, hl } },
+      virt_text_pos = "eol",
+      priority = current and 140 or 120,
     })
-  end
-end
 
--- Move to next hunk in win. Returns true if cursor moved (hunk found).
-local function next_hunk(win)
-  local row_before = vim.api.nvim_win_get_cursor(win)[1]
-  vim.api.nvim_win_call(win, function()
-    pcall(vim.cmd, "normal! ]c")
-  end)
-  local moved = vim.api.nvim_win_get_cursor(win)[1] ~= row_before
-  if moved then
-    center_view(win)
-    mark_current_hunk(win)
-  end
-  return moved
-end
-
--- Move to previous hunk in win. Returns true if cursor moved.
-local function prev_hunk(win)
-  local row_before = vim.api.nvim_win_get_cursor(win)[1]
-  vim.api.nvim_win_call(win, function()
-    pcall(vim.cmd, "normal! [c")
-  end)
-  local moved = vim.api.nvim_win_get_cursor(win)[1] ~= row_before
-  if moved then
-    center_view(win)
-    mark_current_hunk(win)
-  end
-  return moved
-end
-
-local function make_left_editable(lbuf)
-  vim.api.nvim_set_option_value("modifiable", true, { buf = lbuf })
-  vim.api.nvim_set_option_value("readonly", false, { buf = lbuf })
-end
-
--- Apply the snapshot's version of the current hunk into the real file.
-local function accept_hunk(lwin)
-  local lbuf = vim.api.nvim_win_get_buf(lwin)
-  make_left_editable(lbuf)
-  vim.api.nvim_win_call(lwin, function()
-    pcall(vim.cmd, "diffget")
-  end)
-end
-
--- After acting on a hunk, move to the next one or advance to the next file.
-local function advance()
-  local s = M.session
-  local lwin = left_win_current()
-  if not lwin then return end
-
-  if next_hunk(lwin) then
-    vim.api.nvim_set_current_win(lwin)
-  else
-    flush_pending_edits()
-    if s.index < #s.files then
-      M.show_file(s.index + 1)
-    else
-      vim.notify("exocortex: review complete", vim.log.levels.INFO)
-      M.stop()
+    if s.right_buf and vim.api.nvim_buf_is_valid(s.right_buf) then
+      local right_start0 = hunk_range(hunk)
+      local right_row = display_row(s.right_buf, right_start0)
+      vim.api.nvim_buf_set_extmark(s.right_buf, MARK_NS, right_row, 0, {
+        virt_text = { { string.format("  #%d/%d target", hunk.index, total), hl } },
+        virt_text_pos = "eol",
+        priority = current and 140 or 120,
+      })
     end
   end
+end
+
+local function sync_diff()
+  local s = M.session
+  if not s then return end
+
+  for _, win in ipairs({ s.left_win, s.right_win }) do
+    if valid_win(win) then
+      vim.api.nvim_win_call(win, function() pcall(vim.cmd, "diffupdate") end)
+    end
+  end
+
+  mark_hunks()
+  update_winbars()
+end
+
+local function select_hunk(index)
+  local s = M.session
+  if not (s and s.hunks and #s.hunks > 0) then
+    update_winbars()
+    mark_hunks()
+    return false
+  end
+
+  s.hunk_index = math.max(1, math.min(index, #s.hunks))
+  local hunk = current_hunk(s)
+
+  if valid_win(s.left_win) and s.left_buf and vim.api.nvim_buf_is_valid(s.left_buf) then
+    local left_start0 = hunk.new_count > 0 and hunk.new_start - 1 or hunk.new_start
+    local left_row = display_row(s.left_buf, left_start0)
+    pcall(vim.api.nvim_win_set_cursor, s.left_win, { left_row + 1, 0 })
+    center_view(s.left_win)
+  end
+
+  if valid_win(s.right_win) and s.right_buf and vim.api.nvim_buf_is_valid(s.right_buf) then
+    local right_start0 = hunk_range(hunk)
+    local right_row = display_row(s.right_buf, right_start0)
+    vim.api.nvim_set_current_win(s.right_win)
+    pcall(vim.api.nvim_win_set_cursor, s.right_win, { right_row + 1, 0 })
+    center_view(s.right_win)
+  end
+
+  sync_diff()
+  return true
+end
+
+local function current_or_notify()
+  local s = M.session
+  local hunk = current_hunk(s)
+
+  if not hunk then
+    vim.notify("exocortex: no diffs in this file", vim.log.levels.INFO)
+    return nil
+  end
+
+  return hunk
+end
+
+local function replace_hunk(hunk, lines, status)
+  local s = M.session
+  if not (s and s.right_buf and vim.api.nvim_buf_is_valid(s.right_buf)) then
+    return
+  end
+
+  local start0, end0 = hunk_range(hunk)
+
+  -- hunk_range returns start0 == end0 when extmarks have crossed (broken
+  -- tracking after a complex multi-hunk accept sequence). Reject the accept
+  -- rather than silently turning a replacement into an insertion.
+  if hunk.count == 0 and #lines > 0 and end0 == start0 and (hunk.old_count or 0) > 0 then
+    vim.notify("exocortex: hunk position tracking lost — cannot safely apply this hunk", vim.log.levels.WARN)
+    return
+  end
+
+  make_target_editable(s.right_buf)
+  vim.api.nvim_buf_set_lines(s.right_buf, start0, end0, false, lines)
+  place_track(s.right_buf, hunk, start0, start0 + #lines)
+  hunk.status = status
+  save_target()
+  select_hunk(hunk.index)
+end
+
+local function accept_current()
+  local hunk = current_or_notify()
+  if not hunk then return end
+
+  local s = M.session
+  if s and s.right_buf and vim.api.nvim_buf_is_valid(s.right_buf) and hunk.status ~= "accepted" then
+    local start0, end0 = hunk_range(hunk)
+    hunk.target_original = vim.api.nvim_buf_get_lines(s.right_buf, start0, end0, false)
+  end
+
+  replace_hunk(hunk, hunk.proposed, "accepted")
+end
+
+local function skip_current()
+  local hunk = current_or_notify()
+  if not hunk then return end
+  hunk.status = "skipped"
+  select_hunk(hunk.index)
+end
+
+local function undo_current()
+  local hunk = current_or_notify()
+  if not hunk then return end
+
+  if hunk.status == "accepted" then
+    replace_hunk(hunk, hunk.target_original or hunk.original, "pending")
+    hunk.target_original = nil
+  else
+    hunk.status = "pending"
+    select_hunk(hunk.index)
+  end
+end
+
+local function edit_current()
+  local s = M.session
+  local hunk = current_or_notify()
+  if not (s and hunk and valid_win(s.right_win)) then return end
+  make_target_editable(s.right_buf)
+  select_hunk(hunk.index)
+  vim.notify("exocortex: edit on the right; proposal side is read-only", vim.log.levels.INFO)
+end
+
+local function next_hunk()
+  local s = M.session
+  if not (s and s.hunks and #s.hunks > 0) then return end
+
+  if s.hunk_index >= #s.hunks then
+    vim.notify("exocortex: already on last diff", vim.log.levels.INFO)
+    select_hunk(s.hunk_index)
+    return
+  end
+
+  select_hunk(s.hunk_index + 1)
+end
+
+local function prev_hunk()
+  local s = M.session
+  if not (s and s.hunks and #s.hunks > 0) then return end
+
+  if s.hunk_index <= 1 then
+    vim.notify("exocortex: already on first diff", vim.log.levels.INFO)
+    select_hunk(s.hunk_index)
+    return
+  end
+
+  select_hunk(s.hunk_index - 1)
 end
 
 local function page_scroll(dir)
-  local lwin = left_win_current()
-  if not lwin then return end
-  vim.api.nvim_set_current_win(lwin)
+  local win = target_win_current()
+  if not win then return end
+  vim.api.nvim_set_current_win(win)
   local key = dir > 0 and "<C-f>" or "<C-b>"
   vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(key, true, false, true), "n", false)
 end
@@ -228,49 +538,19 @@ local function set_review_maps(buf)
     vim.keymap.set("n", lhs, fn, { buffer = buf, silent = true, nowait = true, desc = desc })
   end
 
-  map("a", function()
-    local lwin = left_win_current()
-    if not lwin then return end
-    accept_hunk(lwin)
-    vim.api.nvim_set_current_win(lwin)
-    advance()
-  end, "Accept hunk")
-
-  map("r", function()
-    advance()
-  end, "Reject hunk (skip)")
-
-  map("e", function()
-    local lwin = left_win_current()
-    if not lwin then return end
-    accept_hunk(lwin)
-    vim.api.nvim_set_current_win(lwin)
-    center_view(lwin)
-  end, "Accept and edit hunk")
-
-  map("n", function()
-    local lwin = left_win_current()
-    if lwin then
-      next_hunk(lwin)
-      vim.api.nvim_set_current_win(lwin)
-    end
-  end, "Next hunk")
-
-  map("p", function()
-    local lwin = left_win_current()
-    if lwin then
-      prev_hunk(lwin)
-      vim.api.nvim_set_current_win(lwin)
-    end
-  end, "Previous hunk")
-
+  map("a", accept_current, "Accept diff")
+  map("s", skip_current, "Skip diff")
+  map("u", undo_current, "Undo accept/skip")
+  map("e", edit_current, "Edit right side")
+  map("n", next_hunk, "Next diff")
+  map("p", prev_hunk, "Previous diff")
+  map("<PageDown>", next_hunk, "Next diff")
+  map("<PageUp>", prev_hunk, "Previous diff")
   map("]", function() M.jump(1) end, "Next file")
   map("[", function() M.jump(-1) end, "Previous file")
-
   map("J", function() page_scroll(1) end, "Page down")
   map("K", function() page_scroll(-1) end, "Page up")
-
-  map("A", M.accept_file, "Accept all hunks in file")
+  map("f", function() function_to_top(vim.api.nvim_get_current_win()) end, "Put function at top")
   map("q", M.stop, "End review")
 end
 
@@ -288,12 +568,13 @@ function M.stop()
   local s = M.session
   if not s then return end
 
-  flush_pending_edits()
+  save_target()
   M.session = nil
 
   for buf in pairs(s.mapped_bufs) do
     if vim.api.nvim_buf_is_valid(buf) then
-      vim.api.nvim_buf_clear_namespace(buf, HUNK_NS, 0, -1)
+      vim.api.nvim_buf_clear_namespace(buf, MARK_NS, 0, -1)
+      vim.api.nvim_buf_clear_namespace(buf, TRACK_NS, 0, -1)
     end
   end
 
@@ -309,7 +590,18 @@ function M.stop()
   end
 
   if valid_win(s.right_win) then
-    vim.api.nvim_win_close(s.right_win, true)
+    vim.api.nvim_win_call(s.right_win, function()
+      vim.cmd("silent! diffoff")
+    end)
+    pcall(function()
+      vim.wo[s.right_win].winbar     = nil
+      vim.wo[s.right_win].signcolumn = "auto"
+      vim.wo[s.right_win].cursorline = false
+    end)
+  end
+
+  if valid_win(s.left_win) then
+    pcall(vim.api.nvim_win_close, s.left_win, true)
   end
 
   clear_review_maps(s.mapped_bufs)
@@ -356,29 +648,16 @@ function M.jump(delta)
     return
   end
 
-  flush_pending_edits()
+  save_target()
   M.show_file(i)
-end
-
-function M.accept_file()
-  local s = M.session
-  if not s then return end
-
-  local lwin = left_win_current()
-  if not lwin then return end
-  local lbuf = vim.api.nvim_win_get_buf(lwin)
-  make_left_editable(lbuf)
-
-  vim.api.nvim_win_call(lwin, function()
-    vim.cmd("silent! %diffget")
-    vim.cmd("silent! update")
-  end)
 end
 
 function M.show_file(index)
   local s = M.session
   local f = s.files[index]
   s.index = index
+  s.hunks = {}
+  s.hunk_index = 1
 
   ensure_windows()
 
@@ -388,45 +667,64 @@ function M.show_file(index)
 
   local real_path = s.root .. "/" .. f.path
   vim.fn.mkdir(vim.fn.fnamemodify(real_path, ":h"), "p")
-  vim.api.nvim_set_current_win(s.left_win)
-  vim.cmd("edit " .. vim.fn.fnameescape(real_path))
-  s.left_buf = vim.api.nvim_get_current_buf()
-  vim.bo[s.left_buf].modifiable = true
-  vim.bo[s.left_buf].readonly = false
-  set_review_maps(s.left_buf)
 
-  local right_buf = vim.api.nvim_create_buf(false, true)
-  pcall(vim.api.nvim_buf_set_name, right_buf, string.format("exocortex://%s/%s", s.node.id, f.path))
-  vim.api.nvim_buf_set_lines(right_buf, 0, -1, false, git.file_at(s.root, s.node.snapshot, f.path))
+  local proposal_buf = vim.api.nvim_create_buf(false, true)
+  s.left_buf = proposal_buf
+  pcall(vim.api.nvim_buf_set_name, proposal_buf, string.format("exocortex://%s/proposal/%s", s.node.id, f.path))
+
+  local proposal_lines = git.file_at(s.root, s.node.snapshot, f.path)
+  vim.api.nvim_buf_set_lines(proposal_buf, 0, -1, false, proposal_lines)
 
   local ft = vim.filetype.match({ filename = f.path })
-  if ft then vim.bo[right_buf].filetype = ft end
+  if ft then vim.bo[proposal_buf].filetype = ft end
 
-  vim.bo[right_buf].modifiable = false
-  vim.bo[right_buf].bufhidden = "wipe"
-  vim.api.nvim_win_set_buf(s.right_win, right_buf)
-  set_review_maps(right_buf)
+  vim.bo[proposal_buf].modifiable = false
+  vim.bo[proposal_buf].readonly = true
+  vim.bo[proposal_buf].bufhidden = "wipe"
+  vim.api.nvim_win_set_buf(s.left_win, proposal_buf)
+  set_review_maps(proposal_buf)
+
+  vim.api.nvim_set_current_win(s.right_win)
+  vim.cmd("edit " .. vim.fn.fnameescape(real_path))
+  s.right_buf = vim.api.nvim_get_current_buf()
+  vim.bo[s.right_buf].modifiable = true
+  vim.bo[s.right_buf].readonly = false
+  if ft then vim.bo[s.right_buf].filetype = ft end
+  set_review_maps(s.right_buf)
+
+  local base_lines = s.node.base and git.file_at(s.root, s.node.base, f.path) or {}
+  s.hunks = compute_hunks(base_lines, proposal_lines)
+  s.hunk_index = #s.hunks > 0 and 1 or 0
+  place_tracks(s.right_buf, s.hunks)
 
   for _, win in ipairs({ s.left_win, s.right_win }) do
     vim.api.nvim_win_call(win, function() vim.cmd("diffthis") end)
   end
 
-  -- Open all folds so the full file is visible for context.
   for _, win in ipairs({ s.left_win, s.right_win }) do
     vim.api.nvim_win_call(win, function() pcall(vim.cmd, "normal! zR") end)
   end
 
-  -- Fixed sign column keeps layout stable when marks appear/disappear.
-  vim.wo[s.left_win].signcolumn = "yes:1"
-  vim.wo[s.left_win].cursorline = true
+  vim.wo[s.left_win].signcolumn = "yes:2"
+  vim.wo[s.right_win].signcolumn = "yes:1"
+  vim.wo[s.left_win].number = true
+  vim.wo[s.left_win].relativenumber = true
+  vim.wo[s.left_win].numberwidth = 4
+  vim.wo[s.right_win].number = true
+  vim.wo[s.right_win].relativenumber = true
+  vim.wo[s.right_win].numberwidth = 4
+  vim.wo[s.left_win].cursorline = false
+  vim.wo[s.right_win].cursorline = true
 
   update_winbars()
+  mark_hunks()
 
-  -- Land on first hunk, centred, and mark it.
-  vim.api.nvim_set_current_win(s.left_win)
-  pcall(vim.cmd, "normal! gg]c")
-  center_view(s.left_win)
-  mark_current_hunk(s.left_win)
+  if #s.hunks > 0 then
+    select_hunk(1)
+  else
+    vim.api.nvim_set_current_win(s.right_win)
+    vim.notify(string.format("[%d/%d] %s: no proposed diffs", index, #s.files, f.path), vim.log.levels.INFO)
+  end
 
   vim.notify(string.format("[%d/%d] %s", index, #s.files, f.path), vim.log.levels.INFO)
 end
@@ -438,8 +736,15 @@ function M.start(node, root)
   end
 
   local files = node.files or {}
+
+  if #files == 0 and node.base then
+    files = git.changed_files(root, node.base, node.snapshot)
+  end
+
   if #files == 0 then
-    vim.notify("exocortex: node made no file changes", vim.log.levels.INFO)
+    if not open_node_diff(node) then
+      vim.notify("exocortex: node made no file changes", vim.log.levels.INFO)
+    end
     return
   end
 
@@ -450,11 +755,16 @@ function M.start(node, root)
     root = root,
     files = files,
     index = 0,
+    hunks = {},
+    hunk_index = 1,
     return_tab = vim.api.nvim_get_current_tabpage(),
     mapped_bufs = {},
   }
 
   M.show_file(1)
 end
+
+
+M.function_to_top = function_to_top
 
 return M
