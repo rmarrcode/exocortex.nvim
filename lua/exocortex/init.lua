@@ -16,45 +16,77 @@ local M = {}
 M.config = {
   agent = nil,          -- default: first available adapter
   context_chars = 4000, -- per-ancestor response replayed as branch context
-  terminal_lines = 50,  -- last N lines of terminal output appended to every prompt
+  terminal_lines = 50,  -- last N lines from each terminal appended to every prompt
 }
+
+local function get_terminal_label(buf)
+  local ok, label = pcall(vim.api.nvim_buf_get_var, buf, "bottom_terminal_label")
+  if ok and type(label) == "string" and label ~= "" then
+    return label
+  end
+  local shell = vim.fn.fnamemodify(vim.o.shell, ":t")
+  if shell == "" then
+    return "terminal"
+  end
+  return shell
+end
 
 -- ---------------------------------------------------------------------------
 -- Terminal context
 -- ---------------------------------------------------------------------------
 
--- Read the last N lines from whichever terminal buffer is currently visible
--- (or most recently active). Returns nil when no terminal is open.
+-- Read the last N lines from every open terminal buffer. Visible terminals are
+-- ordered first, then the rest by recency. Returns nil when no terminal is open.
 local function get_terminal_context()
   local max = M.config.terminal_lines
   if not max or max <= 0 then return nil end
 
-  local best_buf  = nil
-  local best_tick = -1
+  local terminals = {}
 
   for _, buf in ipairs(vim.api.nvim_list_bufs()) do
     if vim.api.nvim_buf_is_valid(buf) and vim.bo[buf].buftype == "terminal" then
-      local tick = vim.api.nvim_buf_get_changedtick(buf)
-      -- Visible terminal wins over a hidden one regardless of changedtick.
-      if vim.fn.bufwinid(buf) ~= -1 then tick = tick + 1e9 end
-      if tick > best_tick then
-        best_tick = tick
-        best_buf  = buf
+      local n = vim.api.nvim_buf_line_count(buf)
+      local lines = vim.api.nvim_buf_get_lines(buf, math.max(0, n - max), n, false)
+
+      -- Drop trailing blank lines.
+      while #lines > 0 and vim.trim(lines[#lines]) == "" do
+        table.remove(lines)
+      end
+
+      if #lines > 0 then
+        table.insert(terminals, {
+          buf = buf,
+          label = get_terminal_label(buf):gsub("[\r\n]", " "),
+          lines = table.concat(lines, "\n"),
+          visible = vim.fn.bufwinid(buf) ~= -1,
+          tick = vim.api.nvim_buf_get_changedtick(buf),
+        })
       end
     end
   end
 
-  if not best_buf then return nil end
-
-  local n     = vim.api.nvim_buf_line_count(best_buf)
-  local lines = vim.api.nvim_buf_get_lines(best_buf, math.max(0, n - max), n, false)
-
-  -- Drop trailing blank lines.
-  while #lines > 0 and vim.trim(lines[#lines]) == "" do
-    table.remove(lines)
+  if #terminals == 0 then
+    return nil
   end
 
-  return #lines > 0 and table.concat(lines, "\n") or nil
+  table.sort(terminals, function(a, b)
+    if a.visible ~= b.visible then
+      return a.visible
+    end
+
+    if a.tick ~= b.tick then
+      return a.tick > b.tick
+    end
+
+    return a.buf < b.buf
+  end)
+
+  local parts = {}
+  for _, term in ipairs(terminals) do
+    parts[#parts + 1] = string.format("--- terminal: %s (buf %d) ---\n%s", term.label, term.buf, term.lines)
+  end
+
+  return table.concat(parts, "\n\n")
 end
 
 -- ---------------------------------------------------------------------------
@@ -94,7 +126,7 @@ local function build_prompt(parent_id, prompt)
 
   local term = get_terminal_context()
   if term then
-    table.insert(parts, "\n\n--- terminal (last " .. M.config.terminal_lines .. " lines) ---\n" .. term)
+    table.insert(parts, "\n\n--- terminals (last " .. M.config.terminal_lines .. " lines each) ---\n" .. term)
   end
 
   return table.concat(parts, "\n")
@@ -154,6 +186,7 @@ local function finish_node(node, root, base, ref_name, response, sha, files)
 
       save_node(node)
       render_if_current(node)
+      graph.refresh_status_bar()
 
       -- Mirror the finished chat into the Obsidian vault (no-op when
       -- OBSIDIAN_DIR is unset); never let a vault error fail the node.
@@ -192,8 +225,28 @@ function M.run_prompt(parent_id, prompt)
     return
   end
 
+  local available_agents = agents.available()
+  local available = {}
+
+  for _, name in ipairs(available_agents) do
+    available[name] = true
+  end
+
+  if agent and not available[agent] then
+    local fallback = available_agents[1]
+
+    if fallback then
+      vim.notify("exocortex: saved agent " .. agent .. " is no longer supported; using " .. fallback, vim.log.levels.WARN)
+      agent = fallback
+      M.config.agent = fallback
+      state.set_session_agent(fallback)
+    else
+      agent = nil
+    end
+  end
+
   if not agent then
-    vim.notify("exocortex: no agent CLI found (looked for: claude, codex, gemini)", vim.log.levels.ERROR)
+    vim.notify("exocortex: no agent CLI found (looked for: claude, agy, codex, aider)", vim.log.levels.ERROR)
     return
   end
 
@@ -212,6 +265,7 @@ function M.run_prompt(parent_id, prompt)
   local node = state.new_node(parent_id, prompt, agent)
   local ref_name = state.ref_name(node.id)
   node.stat = parent and "preparing worktree" or "snapshotting base"
+  graph.bar_nodes[(node.session_id or "default") .. ":" .. node.id] = true
   graph.select(node.id)
   graph.start_spinner()
 
@@ -282,7 +336,7 @@ local function session_agent_choices()
   end
 
   local names = {}
-  for _, name in ipairs({ "claude", "codex", "gemini" }) do
+  for _, name in ipairs({ "claude", "antigravity", "codex", "aider" }) do
     if available[name] then
       table.insert(names, name)
     end
@@ -295,7 +349,7 @@ local function prompt_for_session_agent(on_choice)
   local names = session_agent_choices()
 
   if #names == 0 then
-    vim.notify("exocortex: no agent CLI found (looked for: claude, codex, gemini)", vim.log.levels.ERROR)
+    vim.notify("exocortex: no agent CLI found (looked for: claude, agy, codex, aider)", vim.log.levels.ERROR)
     return
   end
 
@@ -401,12 +455,17 @@ end
 
 local function open_ai_view_from_terminal()
   vim.schedule(function()
+    if vim.api.nvim_get_mode().mode == "t" then
+      vim.cmd("stopinsert")
+    end
     require("exocortex").open()
   end)
 end
 
 local function set_terminal_keymaps(buf)
-  vim.keymap.set("t", "<C-a>i", open_ai_view_from_terminal, { buffer = buf, silent = true, nowait = true, desc = "Open AI view" })
+  for _, lhs in ipairs({ "<C-a>i", "<C-a><Tab>" }) do
+    vim.keymap.set("t", lhs, open_ai_view_from_terminal, { buffer = buf, silent = true, nowait = true, desc = "Open AI view" })
+  end
 end
 
 local function bring_window_left()
@@ -487,7 +546,7 @@ local function is_workspace_win(win)
   end
 
   local bt = vim.bo[buf].buftype
-  return bt == "" or bt == "terminal"
+  return bt == ""
 end
 
 local function capture_workspace_tab(tab)
@@ -618,6 +677,8 @@ function M.view_selected()
   local node = selected_node()
 
   if node then
+    graph.bar_dismissed[(node.session_id or "default") .. ":" .. node.id] = true
+    graph.refresh_status_bar()
     view.open(node, graph.screen_rect(node.id), state.root_dir)
   end
 end
@@ -701,6 +762,13 @@ function M.new_session()
   if not state.root_dir then
     vim.notify("exocortex: open the graph first (:Exocortex)", vim.log.levels.ERROR)
     return
+  end
+
+  for _, node in pairs(state.nodes) do
+    if node.status == "running" and node.kind ~= "src" then
+      vim.notify("exocortex: wait for running nodes before switching sessions", vim.log.levels.WARN)
+      return
+    end
   end
 
   state.new_session()

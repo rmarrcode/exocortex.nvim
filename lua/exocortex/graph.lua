@@ -23,6 +23,12 @@ M.return_tab = nil
 M.return_win = nil
 M.selected = nil
 M.layout = {} -- id -> { row, col, depth, lane } (1-based grid cells)
+M.bar_nodes = {}     -- "session:node_id" -> true (tracked for status bar this nvim session)
+M.bar_dismissed = {} -- "session:node_id" -> true (dismissed from bar after viewing)
+
+function M.refresh_status_bar()
+  pcall(vim.cmd, "redrawtabline")
+end
 
 local ns = vim.api.nvim_create_namespace("exocortex_graph")
 local session_ns = vim.api.nvim_create_namespace("exocortex_sessions")
@@ -744,6 +750,7 @@ end
 function M.session_changed(what)
   M.selected = nil
   M.render()
+  ensure_session_sidebar()
   render_sessions()
 
   local win = graph_win()
@@ -780,8 +787,9 @@ local function cycle_session(step)
     end
   end
 
-  state.switch_session(sessions[(current_idx - 1 + step) % #sessions + 1])
-  M.session_changed("switched to session")
+  if state.switch_session(sessions[(current_idx - 1 + step) % #sessions + 1]) then
+    M.session_changed("switched to session")
+  end
 end
 
 function M.next_session()
@@ -824,6 +832,7 @@ function M.start_spinner()
         t:close()
       end
       M.render()
+      ensure_session_sidebar()
       render_sessions()
       return
     end
@@ -972,6 +981,15 @@ local function set_keymaps(buf)
   map("g?", show_help, "Help")
   map("<Esc>", function() M.return_to_code() end, "Return to code")
   map("q", close_graph_tab, "Close graph")
+  map("ZZ", close_graph_tab, "Close graph")
+  map("ZQ", close_graph_tab, "Close graph")
+
+  -- Swallow unmapped edit-mode entry keys so the nomodifiable buffer never
+  -- shows E21. The user shouldn't be inserting text here anyway.
+  local noop = function() end
+  for _, lhs in ipairs({ "i", "I", "gi", "A", "o", "O", "s", "S", "c", "C", "x", "X", "~", "J" }) do
+    map(lhs, noop, "")
+  end
 end
 
 local function set_session_keymaps(buf)
@@ -989,8 +1007,9 @@ local function set_session_keymaps(buf)
   map("<CR>", function()
     local session_id = session_under_cursor()
     if session_id and session_id ~= state.current_session then
-      state.switch_session(session_id)
-      M.session_changed("switched to session")
+      if state.switch_session(session_id) then
+        M.session_changed("switched to session")
+      end
     end
 
     local win = graph_win()
@@ -1005,14 +1024,34 @@ local function set_session_keymaps(buf)
   map("g?", show_help, "Help")
   map("q", close_graph_tab, "Close graph")
   map("<Esc>", function() M.return_to_code() end, "Return to code")
+  map("ZZ", close_graph_tab, "Close graph")
+  map("ZQ", close_graph_tab, "Close graph")
+
+  local noop = function() end
+  for _, lhs in ipairs({ "i", "I", "gi", "A", "o", "O", "s", "S", "c", "C", "x", "X", "~", "J" }) do
+    map(lhs, noop, "")
+  end
 end
 
 function M.open()
   M.remember_return_location()
 
-  local existing_win = M.buf and vim.api.nvim_buf_is_valid(M.buf) and vim.fn.bufwinid(M.buf) or -1
+  -- Search across all tabpages so repeated <C-a>i doesn't spawn extra graph tabs.
+  local existing_win
+  if M.buf and vim.api.nvim_buf_is_valid(M.buf) then
+    for _, win in ipairs(vim.fn.win_findbuf(M.buf)) do
+      if vim.api.nvim_win_is_valid(win) then
+        existing_win = win
+        break
+      end
+    end
+  end
 
-  if existing_win ~= -1 then
+  if existing_win then
+    local tab = vim.api.nvim_win_get_tabpage(existing_win)
+    if tab ~= vim.api.nvim_get_current_tabpage() then
+      vim.api.nvim_set_current_tabpage(tab)
+    end
     M.graph_win = existing_win
     vim.api.nvim_set_current_win(existing_win)
     ensure_session_sidebar()
@@ -1096,5 +1135,17 @@ function M.restore_win(win)
   end
   M.render()
 end
+
+local augroup_tabline = vim.api.nvim_create_augroup("exocortex_graph_tabline", { clear = true })
+vim.api.nvim_create_autocmd({ "TabEnter", "BufEnter" }, {
+  group = augroup_tabline,
+  callback = function()
+    if vim.bo.filetype == "exocortex" or vim.bo.filetype == "exocortex-sessions" then
+      vim.o.showtabline = 0
+    else
+      vim.o.showtabline = 2
+    end
+  end,
+})
 
 return M

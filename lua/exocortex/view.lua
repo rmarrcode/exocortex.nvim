@@ -98,11 +98,22 @@ function M.open(node, from_rect, root_dir)
     end
   end
 
-  vim.keymap.set("n", "q", close, { buffer = buf, silent = true, nowait = true })
-  vim.keymap.set("n", "<Esc>", function()
+  local function map(lhs, fn)
+    vim.keymap.set("n", lhs, fn, { buffer = buf, silent = true, nowait = true })
+  end
+
+  map("q", close)
+  map("ZZ", close)
+  map("ZQ", close)
+  map("<Esc>", function()
     close()
     require("exocortex.graph").return_to_code()
-  end, { buffer = buf, silent = true, nowait = true })
+  end)
+
+  local noop = function() end
+  for _, lhs in ipairs({ "i", "I", "gi", "a", "A", "o", "O", "s", "S", "c", "C", "x", "X", "~", "J" }) do
+    map(lhs, noop)
+  end
 
   vim.keymap.set("n", "r", function()
     close()

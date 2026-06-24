@@ -37,7 +37,7 @@ end
 vim.api.nvim_create_user_command("Messages", function()
   local lines = {
     "Neovim messages",
-    "Y copies this whole buffer. q closes it.",
+    "Y copies this whole buffer. L copies the latest message. q closes it.",
     "",
   }
 
@@ -73,6 +73,7 @@ vim.api.nvim_create_user_command("Messages", function()
   vim.api.nvim_win_set_buf(win, buf)
   vim.wo[win].wrap = true
   vim.wo[win].linebreak = true
+  vim.api.nvim_win_set_cursor(win, { vim.api.nvim_buf_line_count(buf), 0 })
 
   vim.keymap.set("n", "q", "<cmd>close<CR>", { buffer = buf, silent = true, desc = "Close messages" })
   vim.keymap.set("n", "Y", function()
@@ -81,11 +82,33 @@ vim.api.nvim_create_user_command("Messages", function()
     vim.fn.setreg("\"", content)
     vim.notify("Copied messages to clipboard", vim.log.levels.INFO)
   end, { buffer = buf, silent = true, desc = "Copy all messages" })
+  vim.keymap.set("n", "L", function()
+    local all_lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+    local latest = nil
+
+    for i = #all_lines, 1, -1 do
+      local line = all_lines[i]
+      if vim.trim(line) ~= "" and not line:match("^%-%-%-") then
+        latest = line
+        break
+      end
+    end
+
+    if latest then
+      vim.fn.setreg("+", latest)
+      vim.fn.setreg("\"", latest)
+      vim.notify("Copied latest message to clipboard", vim.log.levels.INFO)
+    end
+  end, { buffer = buf, silent = true, desc = "Copy latest message" })
 end, { desc = "Show copyable Neovim messages and notifications" })
 
 vim.keymap.set("n", "<leader>mm", "<cmd>Messages<CR>", {
   silent = true,
   desc = "Open copyable messages",
+})
+vim.keymap.set("n", "<leader>me", "<cmd>Messages<CR>", {
+  silent = true,
+  desc = "Open copyable errors",
 })
 vim.g.maplocalleader = ","
 
@@ -152,7 +175,8 @@ vim.o.relativenumber = true
 vim.o.termguicolors = true
 vim.o.mouse = "a"
 vim.o.hidden = true
-vim.o.showtabline = 0 -- never show the native tabline
+vim.o.showtabline = 2 -- always show (used for AI node status bar)
+vim.o.tabline = "%!v:lua.ExocortexTabLine()"
 vim.o.splitright = true
 vim.o.splitbelow = true
 vim.o.timeoutlen = 300
@@ -263,6 +287,9 @@ local function apply_vscode_dark_highlights()
   vim.api.nvim_set_hl(0, "DapUIFloatBorder", { fg = colors.accent, bg = colors.panel })
   vim.api.nvim_set_hl(0, "DapUIWinSelect", { fg = colors.accent, bg = colors.panel, bold = true })
   vim.api.nvim_set_hl(0, "DapUIBreakpointsCurrentLine", { fg = colors.orange, bg = colors.panel, bold = true })
+  vim.api.nvim_set_hl(0, "ExocortexStatusRunning", { fg = "#dcdcaa", bg = colors.tab_inactive, bold = true })
+  vim.api.nvim_set_hl(0, "ExocortexStatusDone",    { fg = "#6a9955", bg = colors.tab_inactive })
+  vim.api.nvim_set_hl(0, "ExocortexStatusError",   { fg = "#f44747", bg = colors.tab_inactive })
 end
 
 apply_vscode_dark_highlights()
@@ -301,6 +328,10 @@ require("nvim-tree").setup({
   },
   filters = {
     dotfiles = false,
+  },
+  filesystem_watchers = {
+    enable = true,
+    debounce_delay = 100,
   },
 })
 
@@ -493,10 +524,25 @@ setup_server_if_available("bashls", "bash-language-server")
 
 local window_tabs = {} -- winid -> ordered bufnr list
 
+local _empty_buf = nil
+
+local function get_empty_buf()
+  if _empty_buf and vim.api.nvim_buf_is_valid(_empty_buf) then
+    return _empty_buf
+  end
+  _empty_buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[_empty_buf].buftype = "nofile"
+  vim.bo[_empty_buf].bufhidden = "hide"
+  vim.bo[_empty_buf].swapfile = false
+  vim.bo[_empty_buf].modifiable = false
+  return _empty_buf
+end
+
 local function is_file_buffer(buf)
   return vim.api.nvim_buf_is_valid(buf)
     and vim.bo[buf].buflisted
     and vim.bo[buf].buftype == ""
+    and vim.api.nvim_buf_get_name(buf) ~= ""
 end
 
 local function window_tab_list(win)
@@ -563,8 +609,7 @@ local function render_window_header(win)
   local bo = vim.bo[buf]
 
   if bo.buftype == "terminal" then
-    vim.wo[win].winbar = "  terminal  "
-    return
+    return -- update_terminal_winbar() owns this winbar; don't overwrite with static text
   end
 
   if bo.filetype == "NvimTree" then
@@ -572,8 +617,13 @@ local function render_window_header(win)
     return
   end
 
-  if bo.filetype == "exocortex" then
-    return -- the graph window renders its own session winbar
+  if bo.filetype == "exocortex" or bo.filetype == "exocortex-sessions" then
+    return -- graph and session-sidebar manage their own winbar
+  end
+
+  if _empty_buf and buf == _empty_buf then
+    vim.wo[win].winbar = ""
+    return
   end
 
   if is_file_buffer(buf) then
@@ -654,20 +704,23 @@ local function leave_window_tab(win, buf)
     return
   end
 
-  local normal_wins = 0
+  local has_other_editor = false
 
   for _, w in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
-    if vim.api.nvim_win_get_config(w).relative == "" then
-      normal_wins = normal_wins + 1
+    if w ~= win and vim.api.nvim_win_get_config(w).relative == "" then
+      local wbuf = vim.api.nvim_win_get_buf(w)
+      local ft = vim.bo[wbuf].filetype
+      if vim.bo[wbuf].buftype ~= "terminal" and ft ~= "NvimTree" and not ft:match("^exocortex") then
+        has_other_editor = true
+        break
+      end
     end
   end
 
-  if normal_wins > 1 then
+  if has_other_editor then
     pcall(vim.api.nvim_win_close, win, false)
   else
-    vim.api.nvim_win_call(win, function()
-      vim.cmd("enew")
-    end)
+    vim.api.nvim_win_set_buf(win, get_empty_buf())
     render_window_header(win)
   end
 end
@@ -831,6 +884,10 @@ local capture_terminal_output
 -- once no other window's tab strip still holds it.
 local function close_current_tab()
   local current_buf = vim.api.nvim_get_current_buf()
+
+  if _empty_buf and current_buf == _empty_buf then
+    return
+  end
 
   if vim.bo[current_buf].buftype == "terminal" then
     if close_current_terminal then
@@ -1148,7 +1205,7 @@ local function render_terminal_tabs()
   end
 
   table.insert(parts, "%#WinBar#")
-  table.insert(parts, "  Ctrl-1..9 jump  ,tn new  ,th/,tl nav  ,tr rename  ,tx close")
+  table.insert(parts, "  Ctrl-1..9 jump  ,tn new  ,th/,tl nav  ,tr rename  ,tx close  :copybot copy")
 
   return table.concat(parts, "")
 end
@@ -1472,21 +1529,28 @@ vim.api.nvim_create_autocmd("BufLeave", {
   end,
 })
 
-vim.keymap.set({ "n", "t" }, "<leader>ty", function()
+local function copybot_fn()
   local buf = terminal_state.current and terminal_state.buffers[terminal_state.current]
   capture_terminal_output(buf)
   if vim.fn.filereadable(last_output_file) == 1 then
     local content = table.concat(vim.fn.readfile(last_output_file), "\n")
     vim.fn.setreg("+", content)
     vim.fn.setreg('"', content)
-    vim.notify("Captured to clipboard + " .. last_output_file, vim.log.levels.INFO)
+    vim.notify("Copybot: terminal output copied to clipboard", vim.log.levels.INFO)
   else
-    vim.notify("No terminal output captured", vim.log.levels.WARN)
+    vim.notify("Copybot: no terminal output to copy", vim.log.levels.WARN)
   end
-end, {
+end
+
+vim.keymap.set({ "n", "t" }, "<leader>ty", copybot_fn, {
   silent = true,
   desc = "Capture terminal output to clipboard and $NVIM_LAST_OUTPUT",
 })
+
+vim.api.nvim_create_user_command("Copybot", copybot_fn, {
+  desc = "Copy last bottom terminal output to clipboard",
+})
+vim.cmd("cabbrev copybot Copybot")
 
 -- ============================================================================
 -- DEBUGGING
@@ -1494,6 +1558,158 @@ end, {
 
 local dap = require("dap")
 local dapui = require("dapui")
+local dapui_util = require("dapui.util")
+local dapui_format_value = dapui_util.format_value
+local inspect_debug_expression
+
+vim.g.dapui_show_variable_values = true
+
+dapui_util.format_value = function(value_start, value)
+  if vim.g.dapui_show_variable_values then
+    return dapui_format_value(value_start, value)
+  end
+
+  return { "<hidden>" }
+end
+
+
+package.loaded["dapui.components.variables"] = nil
+package.preload["dapui.components.variables"] = function()
+  local config = require("dapui.config")
+  local util = require("dapui.util")
+  local partial = util.partial
+  local nio = require("nio")
+
+  return function(client, send_ready)
+    local expanded_children = {}
+    local partial_loads = {}  -- var_path -> indexedVariables count when using truncated load
+    local MAX_INDEXED = 100   -- threshold: more indexed children than this triggers partial load
+    local prompt_func
+    local prompt_fill
+    local rendered_vars = {}
+
+    local function reference_prefix(path, variable)
+      if variable.variablesReference == 0 then
+        return " "
+      end
+      return config.icons[expanded_children[path] and "expanded" or "collapsed"]
+    end
+
+    local function path_changed(path, value)
+      return rendered_vars[path] and rendered_vars[path] ~= value
+    end
+
+    local function render(canvas, parent_path, parent_ref, indent, use_partial)
+      if not canvas.prompt and prompt_func then
+        canvas:set_prompt("> ", prompt_func, { fill = prompt_fill })
+      end
+
+      indent = indent or 0
+      local req = { variablesReference = parent_ref }
+      if use_partial then
+        req.filter = "indexed"
+        req.start = 0
+        req.count = 1
+      end
+      local success, var_data = pcall(client.request.variables, req)
+      local variables = success and var_data.variables or {}
+
+      if config.render.sort_variables then
+        table.sort(variables, config.render.sort_variables)
+      end
+
+      for _, variable in pairs(variables) do
+        local var_path = parent_path .. "." .. variable.name
+
+        canvas:write({
+          string.rep(" ", indent),
+          { reference_prefix(var_path, variable), group = "DapUIDecoration" },
+          " ",
+          { variable.name, group = "DapUIVariable" },
+        })
+
+        local var_type = util.render_type(variable.type)
+        if #var_type > 0 then
+          canvas:write({ " ", { var_type, group = "DapUIType" } })
+        end
+
+        local var_group
+        if path_changed(var_path, variable.value) then
+          var_group = "DapUIModifiedValue"
+        else
+          var_group = "DapUIValue"
+        end
+        rendered_vars[var_path] = variable.value
+
+        local function add_var_line(line)
+          if variable.variablesReference > 0 then
+            canvas:add_mapping("expand", function()
+              if not expanded_children[var_path] then
+                expanded_children[var_path] = true
+                local idx = variable.indexedVariables or 0
+                if idx > MAX_INDEXED then
+                  partial_loads[var_path] = idx
+                end
+              else
+                expanded_children[var_path] = false
+                partial_loads[var_path] = nil
+              end
+              send_ready()
+            end)
+            if variable.evaluateName then
+              canvas:add_mapping("repl", partial(util.send_to_repl, variable.evaluateName))
+              canvas:add_mapping("watch", partial(util.send_to_watches, variable.evaluateName))
+            end
+          end
+          canvas:add_mapping("edit", function()
+            prompt_func = function(new_value)
+              nio.run(function()
+                prompt_func = nil
+                prompt_fill = nil
+                client.lib.set_variable(parent_ref, variable, new_value)
+                send_ready()
+              end)
+            end
+            prompt_fill = variable.value
+            send_ready()
+          end)
+          canvas:write(line .. "\n", { group = var_group })
+        end
+
+        local has_value = #(variable.value or "") > 0
+        local show_value = has_value and (variable.variablesReference == 0 or expanded_children[var_path])
+
+        if show_value then
+          canvas:write(" = ")
+          local value_start = #canvas.lines[canvas:length()]
+
+          for _, line in ipairs(util.format_value(value_start, variable.value)) do
+            add_var_line(line)
+          end
+        else
+          add_var_line("")
+        end
+
+        if expanded_children[var_path] and variable.variablesReference ~= 0 then
+          if partial_loads[var_path] then
+            render(canvas, var_path, variable.variablesReference, indent + config.render.indent, true)
+            canvas:write(
+              string.rep(" ", indent + config.render.indent + 2) ..
+              "(partial: [0] of " .. partial_loads[var_path] .. " — :DapInspectVariable for full view)\n",
+              { group = "Comment" }
+            )
+          else
+            render(canvas, var_path, variable.variablesReference, indent + config.render.indent)
+          end
+        end
+      end
+    end
+
+    return {
+      render = render,
+    }
+  end
+end
 
 dapui.setup({
   expand_lines = true,
@@ -1533,7 +1749,7 @@ dapui.setup({
   render = {
     indent = 2,
     max_type_length = nil,
-    max_value_lines = 500,
+    max_value_lines = 20,
   },
   floating = {
     border = "rounded",
@@ -1552,6 +1768,41 @@ local dapui_readable_filetypes = {
   dapui_watches = true,
 }
 
+local dapui_left_filetypes = {
+  dapui_breakpoints = true,
+  dapui_scopes = true,
+  dapui_stacks = true,
+  dapui_watches = true,
+}
+
+local function debug_sidebar_width()
+  return math.max(1, math.floor(vim.o.columns * 0.25))
+end
+
+local function resize_debug_sidebar()
+  local width = debug_sidebar_width()
+
+  for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+    if vim.api.nvim_win_is_valid(win) then
+      local buf = vim.api.nvim_win_get_buf(win)
+
+      if dapui_left_filetypes[vim.bo[buf].filetype] then
+        pcall(vim.api.nvim_win_set_width, win, width)
+      end
+    end
+  end
+end
+
+local function inspect_debug_word_under_cursor()
+  local expr = vim.fn.expand("<cword>")
+
+  vim.ui.input({ prompt = "DAP inspect expression: ", default = expr }, function(input)
+    if inspect_debug_expression then
+      inspect_debug_expression(input)
+    end
+  end)
+end
+
 local function configure_dapui_windows(buf)
   local wins = buf and vim.fn.win_findbuf(buf) or vim.api.nvim_tabpage_list_wins(0)
 
@@ -1567,6 +1818,20 @@ local function configure_dapui_windows(buf)
         vim.wo[win].wrap = true
         vim.wo[win].linebreak = true
         vim.wo[win].breakindent = true
+
+        if dapui_left_filetypes[vim.bo[wbuf].filetype] then
+          pcall(vim.api.nvim_win_set_width, win, debug_sidebar_width())
+        end
+
+        if vim.bo[wbuf].filetype == "dapui_breakpoints" then
+          vim.keymap.set("n", "<CR>", "o", { buffer = wbuf, remap = true, silent = true, desc = "Open breakpoint source" })
+          vim.keymap.set("n", "x", "d", { buffer = wbuf, remap = true, silent = true, desc = "Remove breakpoint" })
+          vim.keymap.set("n", "<Space>", "t", { buffer = wbuf, remap = true, silent = true, desc = "Toggle breakpoint" })
+        end
+
+        if vim.bo[wbuf].filetype == "dapui_scopes" or vim.bo[wbuf].filetype == "dapui_watches" then
+          vim.keymap.set("n", "i", inspect_debug_word_under_cursor, { buffer = wbuf, silent = true, desc = "Inspect debug variable" })
+        end
       end
     end
   end
@@ -1580,6 +1845,13 @@ vim.api.nvim_create_autocmd({ "FileType", "BufWinEnter" }, {
         configure_dapui_windows(args.buf)
       end)
     end
+  end,
+})
+
+vim.api.nvim_create_autocmd("VimResized", {
+  group = augroup,
+  callback = function()
+    vim.schedule(resize_debug_sidebar)
   end,
 })
 
@@ -1644,6 +1916,8 @@ end
 
 -- Entering debug mode should remove normal IDE furniture and keep crash output
 -- visible until F11 explicitly closes the debug UI.
+local set_debug_mode_keymaps
+
 local dap_saved_layout = nil
 local dap_restore_nvim_tree = false
 local dap_restore_bottom_terminal = false
@@ -1732,15 +2006,18 @@ local function dapui_open_keep_layout()
     hide_debug_distractions()
   end
 
+  set_debug_mode_keymaps(true)
   dapui.open()
   vim.schedule(function()
     configure_dapui_windows()
+    resize_debug_sidebar()
     focus_debug_source(pending_debug_source)
   end)
 end
 
 local function dapui_close_restore_layout()
   dapui.close()
+  set_debug_mode_keymaps(false)
 
   if not dap_saved_layout then
     restore_debug_distractions()
@@ -1778,11 +2055,60 @@ local debug_hint_keys = {
   " F9  ,do  Step Out  ",
   " F10 ,dx  Stop (UI stays)",
   " F11      Close UI",
+  " PgUp  ↑   Cursor up",
+  " PgDn  ↓   Cursor down",
+  " [     ←   Cursor left",
+  " ]     →   Cursor right",
   " ,du      Show UI ",
   " ,dv      Variables",
   " ,dw      Watches  ",
   " ,dC      Console  ",
+  " ,de      Inspect ",
+  " ,dV      Values  ",
 }
+
+local debug_mode_keymaps_active = false
+local debug_mode_saved_keymaps = {}
+
+set_debug_mode_keymaps = function(enabled)
+  if enabled == debug_mode_keymaps_active then
+    return
+  end
+
+  debug_mode_keymaps_active = enabled
+
+  local maps = {
+    { "<PageUp>", "<Up>" },
+    { "<PageDown>", "<Down>" },
+    { "[", "<Left>" },
+    { "]", "<Right>" },
+  }
+
+  if enabled then
+    debug_mode_saved_keymaps = {}
+
+    for _, map in ipairs(maps) do
+      local existing = vim.fn.maparg(map[1], "n", false, true)
+      if type(existing) == "table" and next(existing) ~= nil then
+        debug_mode_saved_keymaps[map[1]] = existing
+      end
+
+      vim.keymap.set("n", map[1], map[2], { silent = true, nowait = true, desc = "Debug navigation" })
+    end
+    return
+  end
+
+  for _, map in ipairs(maps) do
+    pcall(vim.keymap.del, "n", map[1])
+
+    local existing = debug_mode_saved_keymaps[map[1]]
+    if existing then
+      pcall(vim.fn.mapset, "n", false, existing)
+    end
+  end
+
+  debug_mode_saved_keymaps = {}
+end
 
 -- Rebuild the hint buffer from `debug_location` + the static keymap list and
 -- resize the floating window to fit. Called on open and on every stop/continue
@@ -1906,9 +2232,34 @@ vim.fn.sign_define("DapStopped", {
   numhl   = "DiagnosticWarn",
 })
 
+vim.fn.sign_define("DapBreakpoint", {
+  text = "●",
+  texthl = "DiagnosticError",
+  numhl = "DiagnosticError",
+})
+
+vim.fn.sign_define("DapBreakpointCondition", {
+  text = "◆",
+  texthl = "DiagnosticWarn",
+  numhl = "DiagnosticWarn",
+})
+
+vim.fn.sign_define("DapLogPoint", {
+  text = "◆",
+  texthl = "DiagnosticInfo",
+  numhl = "DiagnosticInfo",
+})
+
+vim.fn.sign_define("DapBreakpointRejected", {
+  text = "×",
+  texthl = "DiagnosticError",
+  numhl = "DiagnosticError",
+})
+
 local dap_label_ns = vim.api.nvim_create_namespace("dap_stopped_label")
 local dap_flash_ns = vim.api.nvim_create_namespace("dap_stopped_flash")
 local dap_last_buf = nil
+local debug_current_frame_id = nil
 
 local function clear_dap_stopped_marks()
   if dap_last_buf and vim.api.nvim_buf_is_valid(dap_last_buf) then
@@ -1931,6 +2282,7 @@ dap.listeners.after.event_stopped["jump_to_source"] = function(session, body)
     end
 
     local frame = response.stackFrames[1]
+    debug_current_frame_id = frame.id
 
     if not frame.source or not frame.source.path then
       return
@@ -2013,6 +2365,7 @@ end
 local function on_dap_continue()
   vim.schedule(function()
     clear_dap_stopped_marks()
+    debug_current_frame_id = nil
     set_debug_location({ running = true })
   end)
 end
@@ -2028,6 +2381,7 @@ local function close_debugger_ui()
   dapui_close_restore_layout()
   close_debug_hint()
   clear_dap_stopped_marks()
+  debug_current_frame_id = nil
   pending_debug_source = nil
 end
 
@@ -2044,6 +2398,100 @@ local function open_dap_float(element)
   vim.schedule(configure_dapui_windows)
 end
 
+local function open_debug_output(title, text)
+  local lines = vim.split(text or "", "\n", { plain = true })
+  if #lines == 0 then
+    lines = { "" }
+  end
+
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.bo[buf].bufhidden = "wipe"
+  vim.bo[buf].modifiable = false
+  vim.bo[buf].filetype = "text"
+
+  local width = math.min(math.max(70, math.floor(vim.o.columns * 0.72)), math.max(20, vim.o.columns - 4))
+  local height = math.min(math.max(12, math.floor(vim.o.lines * 0.62)), math.max(5, vim.o.lines - 6), #lines)
+  local win = vim.api.nvim_open_win(buf, true, {
+    relative = "editor",
+    width = width,
+    height = height,
+    row = math.floor((vim.o.lines - height) / 2),
+    col = math.floor((vim.o.columns - width) / 2),
+    style = "minimal",
+    border = "rounded",
+    title = " " .. title .. " ",
+    title_pos = "left",
+  })
+  vim.wo[win].wrap = false
+
+  vim.keymap.set("n", "q", function()
+    if vim.api.nvim_win_is_valid(win) then
+      vim.api.nvim_win_close(win, true)
+    end
+  end, { buffer = buf, silent = true, desc = "Close debug output" })
+end
+
+local function torch_summary_expression(expr)
+  expr = vim.trim(expr):gsub("\n", " ")
+
+  local template = [[(lambda __x: (("torch.Tensor(shape=%%s, dtype=%%s, device=%%s, requires_grad=%%s, numel=%%s)\n%%s" %% (tuple(__x.shape), __x.dtype, __x.device, getattr(__x, "requires_grad", False), __x.numel(), (__x.detach().to("cpu").tolist() if __x.numel() <= 256 else __x.detach().to("cpu").flatten()[:256].tolist()))) if (__import__("sys").modules.get("torch") is not None and isinstance(__x, __import__("sys").modules["torch"].Tensor)) else __import__("pprint").pformat(__x, width=120, compact=False)))(%s)]]
+  return template:format(expr)
+end
+
+inspect_debug_expression = function(expr)
+  expr = vim.trim(expr or "")
+  if expr == "" then
+    return
+  end
+
+  local session = dap.session()
+  if not session then
+    vim.notify("DAP: no active debug session", vim.log.levels.WARN)
+    return
+  end
+
+  if not debug_current_frame_id then
+    vim.notify("DAP: pause execution before inspecting variables", vim.log.levels.WARN)
+    return
+  end
+
+  session:request("evaluate", {
+    expression = torch_summary_expression(expr),
+    frameId = debug_current_frame_id,
+    context = "repl",
+  }, function(err, response)
+    vim.schedule(function()
+      if err then
+        vim.notify("DAP inspect failed: " .. tostring(err.message or err), vim.log.levels.ERROR)
+        return
+      end
+
+      open_debug_output("DAP inspect: " .. expr, response and response.result or "")
+    end)
+  end)
+end
+
+vim.api.nvim_create_user_command("DapInspectVariable", function(opts)
+  if opts.args and opts.args ~= "" then
+    inspect_debug_expression(opts.args)
+    return
+  end
+
+  vim.ui.input({ prompt = "DAP inspect expression: " }, inspect_debug_expression)
+end, {
+  nargs = "*",
+  desc = "Inspect a paused Python variable, copying torch CUDA tensors to CPU for display",
+})
+
+vim.api.nvim_create_user_command("DapToggleVariableValues", function()
+  vim.g.dapui_show_variable_values = not vim.g.dapui_show_variable_values
+  pcall(dapui.update_render, {})
+  vim.notify("DAP variable inline values: " .. (vim.g.dapui_show_variable_values and "shown" or "hidden"), vim.log.levels.INFO)
+end, {
+  desc = "Toggle inline DAP variable values in scopes and watches",
+})
+
 -- Pause on errors instead of letting the process exit. "uncaught" catches
 -- exceptions that crash the program; "userUnhandled" also catches the common
 -- case where a launcher/framework swallows the exception or calls sys.exit()
@@ -2055,7 +2503,7 @@ dap.defaults.fallback.exception_breakpoints = { "uncaught", "userUnhandled" }
 -- Toggle breaking on EVERY raised exception (even ones caught internally by
 -- libraries). Useful when a framework swallows the error so deeply that even
 -- userUnhandled misses it; noisy otherwise, so it's opt-in.
-vim.keymap.set("n", "<leader>de", function()
+vim.keymap.set("n", "<leader>dE", function()
   local current = dap.defaults.fallback.exception_breakpoints
   local on = type(current) == "table" and vim.tbl_contains(current, "raised")
 
@@ -2496,6 +2944,16 @@ local function run_current_python_file()
   return true
 end
 
+local function refresh_debug_views()
+  pcall(dapui.update_render, {})
+  resize_debug_sidebar()
+end
+
+local function toggle_breakpoint_refresh()
+  dap.toggle_breakpoint()
+  vim.schedule(refresh_debug_views)
+end
+
 vim.keymap.set("n", "<F5>", function()
   if dap.session() then
     dap.continue()
@@ -2538,7 +2996,7 @@ end, {
   silent = true,
   desc = "Debug current Python file or configured training run",
 })
-vim.keymap.set("n", "<F6>", dap.toggle_breakpoint, {
+vim.keymap.set("n", "<F6>", toggle_breakpoint_refresh, {
   silent = true,
   desc = "Toggle breakpoint",
 })
@@ -2562,7 +3020,7 @@ vim.keymap.set("n", "<F11>", close_debugger_ui, {
   silent = true,
   desc = "Close debug UI",
 })
-vim.keymap.set("n", "<leader>db", dap.toggle_breakpoint, {
+vim.keymap.set("n", "<leader>db", toggle_breakpoint_refresh, {
   silent = true,
   desc = "Toggle breakpoint",
 })
@@ -2603,6 +3061,16 @@ vim.keymap.set("n", "<leader>dC", function()
 end, {
   silent = true,
   desc = "Open large debug console",
+})
+vim.keymap.set("n", "<leader>de", function()
+  vim.ui.input({ prompt = "DAP inspect expression: " }, inspect_debug_expression)
+end, {
+  silent = true,
+  desc = "Inspect debug variable",
+})
+vim.keymap.set("n", "<leader>dV", "<cmd>DapToggleVariableValues<CR>", {
+  silent = true,
+  desc = "Toggle inline debug variable values",
 })
 vim.keymap.set("n", "<leader>dx", dap.terminate, {
   silent = true,
@@ -2749,10 +3217,57 @@ vim.keymap.set(
 
 require("exocortex").setup({})
 
+-- Tabline shows running / recently-completed AI nodes. Dismissed when the node
+-- is expanded via <CR> in the graph. Keyed by "session:node_id" to avoid
+-- collisions across sessions that both start from n1.
+function _G.ExocortexTabLine()
+  local ok_state, state = pcall(require, "exocortex.state")
+  local ok_graph, graph = pcall(require, "exocortex.graph")
+  if not (ok_state and ok_graph) then return "%#TabLineFill#" end
+
+  local parts = {}
+
+  for _, id in ipairs(state.order or {}) do
+    local node = state.nodes[id]
+    if not node or node.kind == "src" then goto bar_skip end
+
+    local key = (node.session_id or "default") .. ":" .. id
+    if not graph.bar_nodes[key] then goto bar_skip end
+    if graph.bar_dismissed[key] then goto bar_skip end
+
+    local hl, status_str
+    if node.status == "running" then
+      hl, status_str = "%#ExocortexStatusRunning#", "running"
+    elseif node.status == "done" then
+      hl, status_str = "%#ExocortexStatusDone#", "complete"
+    elseif node.status == "error" then
+      hl, status_str = "%#ExocortexStatusError#", "error"
+    else
+      goto bar_skip
+    end
+
+    local raw_sid = node.session_id or "default"
+    local info = state.sessions and state.sessions[raw_sid] or {}
+    local sid = info.name or ("Session " .. (info.seq or raw_sid:sub(-4)))
+    table.insert(parts, hl .. "  " .. sid .. "  " .. id .. "  " .. status_str .. "  %#TabLineFill#")
+
+    ::bar_skip::
+  end
+
+  return table.concat(parts, "") .. "%#TabLineFill#"
+end
+
 -- Ctrl-A then i. With Ctrl held through both keys the terminal encodes
 -- Ctrl-I as Tab, so map that variant too.
 for _, lhs in ipairs({ "<C-a>i", "<C-a><Tab>" }) do
-  vim.keymap.set("n", lhs, ":Exocortex<CR>", {
+  vim.keymap.set({ "n", "t" }, lhs, function()
+    vim.schedule(function()
+      if vim.api.nvim_get_mode().mode == "t" then
+        vim.cmd("stopinsert")
+      end
+      require("exocortex").open()
+    end)
+  end, {
     silent = true,
     desc = "Open agent DAG",
   })

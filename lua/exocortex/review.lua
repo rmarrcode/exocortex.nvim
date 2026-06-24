@@ -21,7 +21,7 @@ local M = {}
 
 M.session = nil
 
-local REVIEW_MAPS = { "a", "s", "u", "e", "n", "p", "]", "[", "J", "K", "f", "q", "<PageDown>", "<PageUp>" }
+local REVIEW_MAPS = { "a", "s", "u", "e", "n", "p", "]", "[", "J", "K", "f", "q", "l", "o" }
 
 local MARK_NS = vim.api.nvim_create_namespace("exocortex_review_marks")
 local TRACK_NS = vim.api.nvim_create_namespace("exocortex_review_tracks")
@@ -31,7 +31,7 @@ vim.api.nvim_set_hl(0, "ExocortexDiffPending", { fg = "#7aa2f7", default = true 
 vim.api.nvim_set_hl(0, "ExocortexDiffAccepted", { fg = "#73daca", default = true })
 vim.api.nvim_set_hl(0, "ExocortexDiffSkipped", { fg = "#8b919c", default = true })
 
-local GUIDE = "  a accept  s skip  u undo  e edit-right  │  PgDn/PgUp diff  │  ]/[ file  │  J/K page  │  f func top  │  q quit  "
+local GUIDE = "  a accept  s skip  u undo  e edit-right  │  n/p/l/o diff  │  J/K page  │  [/] file  │  f func  │  q quit  "
 
 local function valid_win(win)
   return win ~= nil and vim.api.nvim_win_is_valid(win)
@@ -451,7 +451,8 @@ local function current_or_notify()
   return hunk
 end
 
-local function replace_hunk(hunk, lines, status)
+local function replace_hunk(hunk, lines, status, opts)
+  opts = opts or {}
   local s = M.session
   if not (s and s.right_buf and vim.api.nvim_buf_is_valid(s.right_buf)) then
     return
@@ -462,7 +463,7 @@ local function replace_hunk(hunk, lines, status)
   -- hunk_range returns start0 == end0 when extmarks have crossed (broken
   -- tracking after a complex multi-hunk accept sequence). Reject the accept
   -- rather than silently turning a replacement into an insertion.
-  if hunk.count == 0 and #lines > 0 and end0 == start0 and (hunk.old_count or 0) > 0 then
+  if not opts.allow_zero_length_restore and hunk.count == 0 and #lines > 0 and end0 == start0 and (hunk.old_count or 0) > 0 then
     vim.notify("exocortex: hunk position tracking lost — cannot safely apply this hunk", vim.log.levels.WARN)
     return
   end
@@ -500,7 +501,7 @@ local function undo_current()
   if not hunk then return end
 
   if hunk.status == "accepted" then
-    replace_hunk(hunk, hunk.target_original or hunk.original, "pending")
+    replace_hunk(hunk, hunk.target_original or hunk.original, "pending", { allow_zero_length_restore = true })
     hunk.target_original = nil
   else
     hunk.status = "pending"
@@ -620,8 +621,8 @@ local function set_review_maps(buf)
   map("e", edit_current, "Edit right side")
   map("n", next_hunk, "Next diff")
   map("p", prev_hunk, "Previous diff")
-  map("<PageDown>", function() page_hunk(1) end, "Next diff from cursor")
-  map("<PageUp>", function() page_hunk(-1) end, "Previous diff from cursor")
+  map("l", function() page_hunk(1) end, "Next diff")
+  map("o", function() page_hunk(-1) end, "Previous diff")
   map("]", function() M.jump(1) end, "Next file")
   map("[", function() M.jump(-1) end, "Previous file")
   map("J", function() page_scroll(1) end, "Page down")

@@ -92,6 +92,7 @@ end
 M.adapters = {
   claude = {
     exe = "claude",
+    env = { CLAUDE_CODE_SUBPROCESS_ENV_SCRUB = "0" },
     cmd = function(prompt)
       return {
         "claude",
@@ -157,10 +158,39 @@ M.adapters = {
     end,
   },
 
-  gemini = {
-    exe = "gemini",
+  antigravity = {
+    exe = "agy",
     cmd = function(prompt)
-      return { "gemini", "--yolo", "-p", prompt }
+      return {
+        "agy",
+        "--print", prompt,
+        "--dangerously-skip-permissions",
+      }
+    end,
+    parse = function(stdout)
+      return vim.trim(stdout)
+    end,
+  },
+
+  -- Local LLMs via aider (supports ollama, lm-studio, llama.cpp, etc.).
+  -- Set adapters.aider.model in setup() to pick the backend, e.g.
+  -- "ollama/codellama" or "ollama/llama3.2" or "lm_studio/my-model".
+  aider = {
+    exe = "aider",
+    model = "ollama/codellama",
+    cmd = function(prompt)
+      local args = {
+        "aider",
+        "--message", prompt,
+        "--yes",
+        "--no-auto-commits",
+        "--no-pretty",
+      }
+      local model = M.adapters.aider.model
+      if model and model ~= "" then
+        vim.list_extend(args, { "--model", model })
+      end
+      return args
     end,
     parse = function(stdout)
       return vim.trim(stdout)
@@ -189,7 +219,7 @@ function M.run(name, prompt, cwd, on_done)
     return
   end
 
-  vim.system(adapter.cmd(prompt), { text = true, cwd = cwd }, function(result)
+  vim.system(adapter.cmd(prompt), { text = true, cwd = cwd, env = adapter.env }, function(result)
     vim.schedule(function()
       if result.code ~= 0 then
         local err = format_run_error(name, result.code, result.stdout or "", result.stderr or "")

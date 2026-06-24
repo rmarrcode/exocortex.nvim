@@ -223,6 +223,13 @@ function M.new_session()
 end
 
 function M.switch_session(session_id)
+  for _, node in pairs(M.nodes) do
+    if node.status == "running" and node.kind ~= "src" then
+      vim.notify("exocortex: wait for running nodes before switching sessions", vim.log.levels.WARN)
+      return false
+    end
+  end
+
   if not M.sessions[session_id] then
     vim.notify("exocortex: session not found: " .. session_id, vim.log.levels.ERROR)
     return false
