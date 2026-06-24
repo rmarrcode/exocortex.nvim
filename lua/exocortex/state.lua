@@ -12,6 +12,12 @@ M.root_dir = nil
 M.current_session = nil
 M.sessions = {} -- session_id -> metadata (name, created, etc)
 
+-- In-memory cache of every session loaded this run: session_id -> { nodes,
+-- order, next_id }. Switching sessions snapshots the live tables here so a
+-- session with an in-flight agent job keeps its node tables alive (and gets
+-- the completion the async callback writes) even while you work elsewhere.
+M.loaded = {}
+
 local function store_path(session_id)
   local base = vim.fn.stdpath("data") .. "/exocortex/" .. vim.fn.sha256(M.root_dir)
 
@@ -58,9 +64,27 @@ local function save_sessions_index()
   file:close()
 end
 
+-- Snapshot the live tables into the cache so they survive a session switch.
+local function snapshot_current()
+  if M.current_session then
+    M.loaded[M.current_session] = {
+      nodes = M.nodes,
+      order = M.order,
+      next_id = M.next_id,
+    }
+  end
+end
+
 function M.load(root_dir, session_id)
+  -- A different project means the cache (keyed by session id, not project) is
+  -- stale; drop it. Otherwise keep cached sessions so in-flight jobs survive.
+  if root_dir ~= M.root_dir then
+    M.loaded = {}
+  else
+    snapshot_current()
+  end
+
   M.root_dir = root_dir
-  M.nodes, M.order, M.next_id = {}, {}, 1
   M.current_session = session_id or "default"
 
   load_sessions_index()
@@ -70,33 +94,69 @@ function M.load(root_dir, session_id)
     save_sessions_index()
   end
 
+  -- Already in memory (possibly with a running job): reuse the live tables so
+  -- we see any completion that landed while this session was backgrounded.
+  local cached = M.loaded[M.current_session]
+  if cached then
+    M.nodes, M.order, M.next_id = cached.nodes, cached.order, cached.next_id
+    return
+  end
+
+  M.nodes, M.order, M.next_id = {}, {}, 1
+
   local file = io.open(store_path(M.current_session), "r")
   if not file then
+    M.loaded[M.current_session] = { nodes = M.nodes, order = M.order, next_id = M.next_id }
     return
   end
 
   local ok, data = pcall(vim.json.decode, file:read("*a"))
   file:close()
 
-  if not ok or type(data) ~= "table" then
+  if ok and type(data) == "table" then
+    M.nodes = data.nodes or {}
+    M.order = data.order or {}
+    M.next_id = data.next_id or (#M.order + 1)
+
+    -- Nodes persisted as "running" come from a previous nvim run (this session
+    -- was never in memory this run), so they can never finish.
+    for _, node in pairs(M.nodes) do
+      if node.status == "running" then
+        node.status = "error"
+        node.stat = "interrupted"
+      end
+    end
+  end
+
+  M.loaded[M.current_session] = { nodes = M.nodes, order = M.order, next_id = M.next_id }
+end
+
+-- Persist a specific session (defaults to the active one). Async completion
+-- callbacks pass the node's own session so a job that finishes while another
+-- session is in front still writes to the correct file and cache.
+function M.save_session(session_id)
+  session_id = session_id or M.current_session
+  if not session_id then
     return
   end
 
-  M.nodes = data.nodes or {}
-  M.order = data.order or {}
-  M.next_id = data.next_id or (#M.order + 1)
-
-  -- Nodes that were running when nvim exited can never finish.
-  for _, node in pairs(M.nodes) do
-    if node.status == "running" then
-      node.status = "error"
-      node.stat = "interrupted"
+  local data
+  if session_id == M.current_session then
+    data = { nodes = M.nodes, order = M.order, next_id = M.next_id }
+  else
+    local cached = M.loaded[session_id]
+    if not cached then
+      return
     end
+    data = { nodes = cached.nodes, order = cached.order, next_id = cached.next_id }
   end
-end
 
-function M.save()
-  local path = store_path(M.current_session)
+  -- Keep next_id in the cache current for the active session too.
+  if M.loaded[session_id] then
+    M.loaded[session_id].next_id = data.next_id
+  end
+
+  local path = store_path(session_id)
   vim.fn.mkdir(vim.fn.fnamemodify(path, ":h"), "p")
 
   local file = io.open(path, "w")
@@ -104,8 +164,12 @@ function M.save()
     return
   end
 
-  file:write(vim.json.encode({ nodes = M.nodes, order = M.order, next_id = M.next_id }))
+  file:write(vim.json.encode({ nodes = data.nodes, order = data.order, next_id = data.next_id }))
   file:close()
+end
+
+function M.save()
+  M.save_session(M.current_session)
 end
 
 -- Session-scoped ref id: node ids (n1, n2, ...) restart per session, so
@@ -123,6 +187,7 @@ end
 function M.delete_session(session_id)
   os.remove(store_path(session_id))
   M.sessions[session_id] = nil
+  M.loaded[session_id] = nil
   save_sessions_index()
 end
 
@@ -212,6 +277,7 @@ function M.new_node(parent_id, prompt, agent)
     agent = agent,
     status = "running",
     created = os.time(),
+    session_id = M.current_session,
   }
 
   M.nodes[id] = node

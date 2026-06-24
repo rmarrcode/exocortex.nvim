@@ -4,6 +4,91 @@
 
 local M = {}
 
+local LIMIT_PATTERNS = {
+  "usage limit",
+  "rate limit",
+  "quota",
+  "credit balance is too low",
+  "too many requests",
+  "try again later",
+}
+
+local function collect_json_text(raw)
+  local texts = {}
+
+  for line in (raw or ""):gmatch("[^\n]+") do
+    local ok, event = pcall(vim.json.decode, line)
+    if ok and type(event) == "table" then
+      if type(event.error) == "string" and vim.trim(event.error) ~= "" then
+        texts[#texts + 1] = event.error
+      end
+
+      if type(event.message) == "string" and vim.trim(event.message) ~= "" then
+        texts[#texts + 1] = event.message
+      end
+
+      if type(event.result) == "string" and vim.trim(event.result) ~= "" then
+        texts[#texts + 1] = event.result
+      end
+    end
+  end
+
+  return texts
+end
+
+local function classify_limit_error(text)
+  local lowered = (text or ""):lower()
+
+  for _, pattern in ipairs(LIMIT_PATTERNS) do
+    if lowered:find(pattern, 1, true) then
+      return true
+    end
+  end
+
+  return false
+end
+
+local function format_run_error(name, code, stdout, stderr)
+  local parts = {}
+
+  for _, text in ipairs(collect_json_text(stderr)) do
+    parts[#parts + 1] = text
+  end
+  for _, text in ipairs(collect_json_text(stdout)) do
+    parts[#parts + 1] = text
+  end
+
+  local fallback = vim.trim(stderr ~= "" and stderr or (stdout or ""))
+  if fallback ~= "" then
+    parts[#parts + 1] = fallback
+  end
+
+  local detail
+  for _, text in ipairs(parts) do
+    local trimmed = vim.trim(text)
+    if trimmed ~= "" and not trimmed:match("\"subtype\"%s*:%s*\"init\"") then
+      detail = trimmed
+      break
+    end
+  end
+
+  if not detail or detail == "" then
+    detail = "the agent exited before producing a usable response"
+  end
+
+  detail = detail:gsub("%s+", " ")
+
+  if classify_limit_error(detail) then
+    return string.format(
+      "%s hit a usage limit and stopped. Wait for the provider limit to reset or switch agents. %s",
+      name,
+      detail
+    )
+  end
+
+  return string.format("%s exited with %d: %s", name, code, detail)
+end
+
 M.adapters = {
   claude = {
     exe = "claude",
@@ -107,8 +192,8 @@ function M.run(name, prompt, cwd, on_done)
   vim.system(adapter.cmd(prompt), { text = true, cwd = cwd }, function(result)
     vim.schedule(function()
       if result.code ~= 0 then
-        local err = vim.trim(result.stderr ~= "" and result.stderr or (result.stdout or ""))
-        on_done(nil, string.format("%s exited with %d: %s", name, result.code, err:sub(1, 500)))
+        local err = format_run_error(name, result.code, result.stdout or "", result.stderr or "")
+        on_done(nil, err:sub(1, 500))
         return
       end
 

@@ -2,39 +2,91 @@
 
 vim.g.mapleader = ","
 
--- Notification history so messages can be copied.
+-- Notification and command-line message history so errors can be copied.
 local _notify_history = {}
 local _base_notify = vim.notify
+
+local function message_level_prefix(level)
+  return level == vim.log.levels.ERROR and "[E] "
+    or level == vim.log.levels.WARN and "[W] "
+    or "[I] "
+end
+
 vim.notify = function(msg, level, opts)
-  table.insert(_notify_history, { msg = msg, level = level, time = os.date("%H:%M:%S") })
+  table.insert(_notify_history, {
+    msg = tostring(msg),
+    level = level,
+    time = os.date("%H:%M:%S"),
+  })
   _base_notify(msg, level, opts)
 end
 
-vim.api.nvim_create_user_command("Messages", function()
-  local lines = {}
-  for _, entry in ipairs(_notify_history) do
-    local prefix = entry.level == vim.log.levels.ERROR and "[E] "
-      or entry.level == vim.log.levels.WARN and "[W] "
-      or "[I] "
-    for _, line in ipairs(vim.split(entry.msg, "\n")) do
-      table.insert(lines, entry.time .. " " .. prefix .. line)
+local function get_command_messages()
+  if vim.api.nvim_exec2 then
+    local ok, result = pcall(vim.api.nvim_exec2, "messages", { output = true })
+
+    if ok and result and result.output then
+      return result.output
     end
   end
 
-  if #lines == 0 then
-    lines = { "(no messages)" }
+  local ok, output = pcall(vim.api.nvim_exec, "messages", true)
+  return ok and output or ""
+end
+
+vim.api.nvim_create_user_command("Messages", function()
+  local lines = {
+    "Neovim messages",
+    "Y copies this whole buffer. q closes it.",
+    "",
+  }
+
+  local native_messages = vim.trim(get_command_messages())
+
+  if native_messages ~= "" then
+    table.insert(lines, "--- :messages ---")
+    vim.list_extend(lines, vim.split(native_messages, "\n", { plain = true }))
+    table.insert(lines, "")
+  end
+
+  if #_notify_history > 0 then
+    table.insert(lines, "--- vim.notify history ---")
+    for _, entry in ipairs(_notify_history) do
+      for _, line in ipairs(vim.split(entry.msg, "\n", { plain = true })) do
+        table.insert(lines, entry.time .. " " .. message_level_prefix(entry.level) .. line)
+      end
+    end
+  end
+
+  if #lines == 3 then
+    table.insert(lines, "(no messages)")
   end
 
   local buf = vim.api.nvim_create_buf(false, true)
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
   vim.bo[buf].modifiable = false
   vim.bo[buf].bufhidden = "wipe"
+  vim.bo[buf].filetype = "messages"
 
-  vim.cmd("split")
+  vim.cmd("botright 14split")
   local win = vim.api.nvim_get_current_win()
   vim.api.nvim_win_set_buf(win, buf)
-  vim.keymap.set("n", "q", "<cmd>close<CR>", { buffer = buf, silent = true })
-end, { desc = "Show copyable notification history" })
+  vim.wo[win].wrap = true
+  vim.wo[win].linebreak = true
+
+  vim.keymap.set("n", "q", "<cmd>close<CR>", { buffer = buf, silent = true, desc = "Close messages" })
+  vim.keymap.set("n", "Y", function()
+    local content = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
+    vim.fn.setreg("+", content)
+    vim.fn.setreg("\"", content)
+    vim.notify("Copied messages to clipboard", vim.log.levels.INFO)
+  end, { buffer = buf, silent = true, desc = "Copy all messages" })
+end, { desc = "Show copyable Neovim messages and notifications" })
+
+vim.keymap.set("n", "<leader>mm", "<cmd>Messages<CR>", {
+  silent = true,
+  desc = "Open copyable messages",
+})
 vim.g.maplocalleader = ","
 
 -- Dedicated venv for the Python provider (pynvim + jupyter_client for molten).
@@ -100,7 +152,7 @@ vim.o.relativenumber = true
 vim.o.termguicolors = true
 vim.o.mouse = "a"
 vim.o.hidden = true
-vim.o.showtabline = 1 -- native tabline only when there are 2+ tabpages
+vim.o.showtabline = 0 -- never show the native tabline
 vim.o.splitright = true
 vim.o.splitbelow = true
 vim.o.timeoutlen = 300
@@ -197,6 +249,20 @@ local function apply_vscode_dark_highlights()
   vim.api.nvim_set_hl(0, "NvimTreeEndOfBuffer", { fg = colors.panel, bg = colors.panel })
   vim.api.nvim_set_hl(0, "NvimTreeWinSeparator", { fg = colors.gutter, bg = colors.panel })
   vim.api.nvim_set_hl(0, "NvimTreeRootFolder", { fg = colors.accent, bg = colors.panel, bold = true })
+  vim.api.nvim_set_hl(0, "DapUIScope", { fg = colors.accent, bg = colors.panel, bold = true })
+  vim.api.nvim_set_hl(0, "DapUIType", { fg = colors.orange, bg = colors.panel })
+  vim.api.nvim_set_hl(0, "DapUIValue", { fg = colors.fg, bg = colors.panel })
+  vim.api.nvim_set_hl(0, "DapUIVariable", { fg = "#ffffff", bg = colors.panel })
+  vim.api.nvim_set_hl(0, "DapUIModifiedValue", { fg = colors.orange, bg = colors.panel, bold = true })
+  vim.api.nvim_set_hl(0, "DapUIDecoration", { fg = colors.gutter, bg = colors.panel })
+  vim.api.nvim_set_hl(0, "DapUIThread", { fg = colors.green, bg = colors.panel })
+  vim.api.nvim_set_hl(0, "DapUIStoppedThread", { fg = colors.orange, bg = colors.panel, bold = true })
+  vim.api.nvim_set_hl(0, "DapUIFrameName", { fg = colors.fg, bg = colors.panel })
+  vim.api.nvim_set_hl(0, "DapUISource", { fg = colors.accent, bg = colors.panel })
+  vim.api.nvim_set_hl(0, "DapUILineNumber", { fg = colors.orange, bg = colors.panel })
+  vim.api.nvim_set_hl(0, "DapUIFloatBorder", { fg = colors.accent, bg = colors.panel })
+  vim.api.nvim_set_hl(0, "DapUIWinSelect", { fg = colors.accent, bg = colors.panel, bold = true })
+  vim.api.nvim_set_hl(0, "DapUIBreakpointsCurrentLine", { fg = colors.orange, bg = colors.panel, bold = true })
 end
 
 apply_vscode_dark_highlights()
@@ -1429,78 +1495,376 @@ end, {
 local dap = require("dap")
 local dapui = require("dapui")
 
-dapui.setup({})
+dapui.setup({
+  expand_lines = true,
+  icons = {
+    expanded = "▾",
+    collapsed = "▸",
+    current_frame = "▸",
+  },
+  mappings = {
+    edit = "e",
+    expand = { "<CR>", "<Space>", "l", "za", "<2-LeftMouse>" },
+    open = "o",
+    remove = "d",
+    repl = "r",
+    toggle = "t",
+  },
+  layouts = {
+    {
+      elements = {
+        { id = "scopes", size = 0.55 },
+        { id = "watches", size = 0.20 },
+        { id = "stacks", size = 0.15 },
+        { id = "breakpoints", size = 0.10 },
+      },
+      position = "left",
+      size = math.floor(vim.o.columns * 0.25),
+    },
+    {
+      elements = {
+        { id = "repl", size = 0.35 },
+        { id = "console", size = 0.65 },
+      },
+      position = "bottom",
+      size = 12,
+    },
+  },
+  render = {
+    indent = 2,
+    max_type_length = nil,
+    max_value_lines = 500,
+  },
+  floating = {
+    border = "rounded",
+    mappings = {
+      close = { "q", "<Esc>" },
+    },
+  },
+})
 
--- dapui.open() carves its panels out of the existing windows, which shrinks the
--- bottom terminal and widens nvim-tree; closing it never restores them. Snapshot
--- every window's size before opening and replay it after closing so the IDE
--- layout is exactly where you left it.
+local dapui_readable_filetypes = {
+  ["dap-repl"] = true,
+  dapui_breakpoints = true,
+  dapui_console = true,
+  dapui_scopes = true,
+  dapui_stacks = true,
+  dapui_watches = true,
+}
+
+local function configure_dapui_windows(buf)
+  local wins = buf and vim.fn.win_findbuf(buf) or vim.api.nvim_tabpage_list_wins(0)
+
+  for _, win in ipairs(wins) do
+    if vim.api.nvim_win_is_valid(win) then
+      local wbuf = vim.api.nvim_win_get_buf(win)
+
+      if dapui_readable_filetypes[vim.bo[wbuf].filetype] then
+        vim.wo[win].number = false
+        vim.wo[win].relativenumber = false
+        vim.wo[win].signcolumn = "no"
+        vim.wo[win].cursorline = true
+        vim.wo[win].wrap = true
+        vim.wo[win].linebreak = true
+        vim.wo[win].breakindent = true
+      end
+    end
+  end
+end
+
+vim.api.nvim_create_autocmd({ "FileType", "BufWinEnter" }, {
+  group = augroup,
+  callback = function(args)
+    if dapui_readable_filetypes[vim.bo[args.buf].filetype] then
+      vim.schedule(function()
+        configure_dapui_windows(args.buf)
+      end)
+    end
+  end,
+})
+
+local pending_debug_source = nil
+
+local function is_debug_source_window(win)
+  if not vim.api.nvim_win_is_valid(win) or vim.api.nvim_win_get_config(win).relative ~= "" then
+    return false
+  end
+
+  local buf = vim.api.nvim_win_get_buf(win)
+  local ft = vim.bo[buf].filetype
+
+  return vim.bo[buf].buftype ~= "terminal" and ft ~= "NvimTree" and not dapui_readable_filetypes[ft]
+end
+
+local function focus_debug_source(path, line)
+  if not path or path == "" then
+    return
+  end
+
+  local expanded = vim.fn.fnamemodify(vim.fn.expand(path), ":p")
+
+  if vim.fn.filereadable(expanded) ~= 1 then
+    return
+  end
+
+  local bufnr = vim.fn.bufadd(expanded)
+  vim.fn.bufload(bufnr)
+
+  local target_win = nil
+  local current_win = vim.api.nvim_get_current_win()
+
+  if is_debug_source_window(current_win) then
+    target_win = current_win
+  else
+    for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+      if is_debug_source_window(win) then
+        target_win = win
+        break
+      end
+    end
+  end
+
+  if not target_win then
+    return
+  end
+
+  vim.api.nvim_win_set_buf(target_win, bufnr)
+  vim.api.nvim_set_current_win(target_win)
+  vim.api.nvim_win_set_cursor(target_win, { math.max(line or 1, 1), 0 })
+  vim.cmd("normal! zz")
+end
+
+local function set_debug_source(path, label)
+  pending_debug_source = path
+  focus_debug_source(path)
+
+  local display = vim.fn.fnamemodify(path, ":~:.")
+  vim.notify("DAP: debugging " .. display, vim.log.levels.INFO, { title = label or "Debug" })
+end
+
+-- Entering debug mode should remove normal IDE furniture and keep crash output
+-- visible until F11 explicitly closes the debug UI.
 local dap_saved_layout = nil
+local dap_restore_nvim_tree = false
+local dap_restore_bottom_terminal = false
+
+local function nvim_tree_visible()
+  for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+    if vim.api.nvim_win_is_valid(win) then
+      local buf = vim.api.nvim_win_get_buf(win)
+
+      if vim.bo[buf].filetype == "NvimTree" then
+        return true
+      end
+    end
+  end
+
+  return false
+end
+
+local function restore_bottom_terminal_window()
+  prune_terminal_buffers()
+
+  if #terminal_state.buffers == 0 then
+    return
+  end
+
+  local previous_win = vim.api.nvim_get_current_win()
+  local win = ensure_terminal_window()
+  local buf = terminal_state.buffers[terminal_state.current or 1]
+
+  if not buf then
+    return
+  end
+
+  if set_terminal_buffer_keymaps then
+    set_terminal_buffer_keymaps(buf)
+  end
+
+  vim.api.nvim_win_set_buf(win, buf)
+  configure_terminal_window(win)
+  update_terminal_winbar()
+
+  if vim.api.nvim_win_is_valid(previous_win) then
+    vim.api.nvim_set_current_win(previous_win)
+  end
+end
+
+local function hide_debug_distractions()
+  dap_restore_nvim_tree = nvim_tree_visible()
+  dap_restore_bottom_terminal = terminal_state.win and vim.api.nvim_win_is_valid(terminal_state.win) or false
+
+  if dap_restore_nvim_tree then
+    pcall(vim.cmd, "NvimTreeClose")
+  end
+
+  if dap_restore_bottom_terminal then
+    local buf = terminal_state.current and terminal_state.buffers[terminal_state.current]
+
+    if buf and capture_terminal_output then
+      capture_terminal_output(buf)
+    end
+
+    vim.api.nvim_win_hide(terminal_state.win)
+    terminal_state.win = nil
+  end
+end
+
+local function restore_debug_distractions()
+  local restore_tree = dap_restore_nvim_tree
+  local restore_terminal = dap_restore_bottom_terminal
+
+  dap_restore_nvim_tree = false
+  dap_restore_bottom_terminal = false
+
+  if restore_tree then
+    pcall(vim.cmd, "NvimTreeOpen")
+  end
+
+  if restore_terminal then
+    restore_bottom_terminal_window()
+  end
+end
 
 local function dapui_open_keep_layout()
   if not dap_saved_layout then
     dap_saved_layout = vim.fn.winrestcmd()
+    hide_debug_distractions()
   end
+
   dapui.open()
+  vim.schedule(function()
+    configure_dapui_windows()
+    focus_debug_source(pending_debug_source)
+  end)
 end
 
 local function dapui_close_restore_layout()
   dapui.close()
 
-  if dap_saved_layout then
-    local restore = dap_saved_layout
-    dap_saved_layout = nil
-    -- Defer so dapui's windows are fully gone before we resize the survivors.
-    vim.schedule(function()
-      pcall(vim.cmd, restore)
-    end)
+  if not dap_saved_layout then
+    restore_debug_distractions()
+    return
   end
+
+  local restore = dap_saved_layout
+  dap_saved_layout = nil
+
+  -- Defer so dapui windows are fully gone before restoring normal layout.
+  vim.schedule(function()
+    restore_debug_distractions()
+    vim.defer_fn(function()
+      pcall(vim.cmd, restore)
+    end, 20)
+  end)
 end
 
 dap.listeners.before.attach.dapui_auto_open = dapui_open_keep_layout
 dap.listeners.before.launch.dapui_auto_open = dapui_open_keep_layout
-dap.listeners.before.event_terminated.dapui_auto_close = dapui_close_restore_layout
-dap.listeners.before.event_exited.dapui_auto_close = dapui_close_restore_layout
 
 -- ── debug keybinding hint window ─────────────────────────────────────────────
 
 local debug_hint_win = nil
+local debug_hint_buf = nil
+-- Live location of the paused thread. nil before the first stop; { running = true }
+-- while the program is executing; otherwise { func, file, line, reason }.
+local debug_location = nil
 
-local function open_debug_hint()
-  if debug_hint_win and vim.api.nvim_win_is_valid(debug_hint_win) then
+local debug_hint_keys = {
+  " F5  ,dc  Continue  ",
+  " F6  ,db  Breakpoint",
+  " F7  ,di  Step Into ",
+  " F8  ,dn  Step Over ",
+  " F9  ,do  Step Out  ",
+  " F10 ,dx  Stop (UI stays)",
+  " F11      Close UI",
+  " ,du      Show UI ",
+  " ,dv      Variables",
+  " ,dw      Watches  ",
+  " ,dC      Console  ",
+}
+
+-- Rebuild the hint buffer from `debug_location` + the static keymap list and
+-- resize the floating window to fit. Called on open and on every stop/continue
+-- so the "current function" header always reflects where the debugger is.
+local function render_debug_hint()
+  if not (debug_hint_buf and vim.api.nvim_buf_is_valid(debug_hint_buf)) then
     return
   end
 
-  local lines = {
-    "  DEBUG  ",
-    " F5  ,dc  Continue  ",
-    " F6  ,db  Breakpoint",
-    " F7  ,di  Step Into ",
-    " F8  ,dn  Step Over ",
-    " F9  ,do  Step Out  ",
-    " F10 ,dx  Stop      ",
-    " F11 ,du  Toggle UI ",
-  }
+  local lines = {}
+  local loc_lines = 0
+
+  if debug_location then
+    if debug_location.running then
+      lines = { "  ▶ running…" }
+      loc_lines = 1
+    else
+      lines = {
+        "  ▶ in " .. (debug_location.func or "?"),
+        "    " .. (debug_location.file or "?") .. ":" .. (debug_location.line or 0),
+      }
+      loc_lines = 2
+    end
+    table.insert(lines, "")
+  end
+
+  local title_idx = #lines
+  table.insert(lines, "  DEBUG  ")
+  vim.list_extend(lines, debug_hint_keys)
 
   local width = 0
   for _, l in ipairs(lines) do
-    width = math.max(width, #l)
+    width = math.max(width, vim.fn.strdisplaywidth(l))
   end
 
-  local buf = vim.api.nvim_create_buf(false, true)
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-  vim.bo[buf].modifiable = false
-  vim.bo[buf].bufhidden = "wipe"
+  vim.bo[debug_hint_buf].modifiable = true
+  vim.api.nvim_buf_set_lines(debug_hint_buf, 0, -1, false, lines)
+  vim.bo[debug_hint_buf].modifiable = false
 
-  vim.api.nvim_buf_add_highlight(buf, -1, "Title", 0, 0, -1)
+  vim.api.nvim_buf_clear_namespace(debug_hint_buf, -1, 0, -1)
+  if loc_lines >= 1 then
+    vim.api.nvim_buf_add_highlight(debug_hint_buf, -1, "DiagnosticWarn", 0, 0, -1)
+  end
+  if loc_lines >= 2 then
+    vim.api.nvim_buf_add_highlight(debug_hint_buf, -1, "Comment", 1, 0, -1)
+  end
+  vim.api.nvim_buf_add_highlight(debug_hint_buf, -1, "Title", title_idx, 0, -1)
 
-  debug_hint_win = vim.api.nvim_open_win(buf, false, {
+  if debug_hint_win and vim.api.nvim_win_is_valid(debug_hint_win) then
+    vim.api.nvim_win_set_config(debug_hint_win, {
+      relative = "editor",
+      anchor = "NE",
+      row = 1,
+      col = vim.o.columns - 1,
+      width = width,
+      height = #lines,
+    })
+  end
+end
+
+-- Update the live location and refresh the hint window if it's open.
+local function set_debug_location(loc)
+  debug_location = loc
+  render_debug_hint()
+end
+
+local function open_debug_hint()
+  if debug_hint_win and vim.api.nvim_win_is_valid(debug_hint_win) then
+    render_debug_hint()
+    return
+  end
+
+  debug_hint_buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[debug_hint_buf].bufhidden = "wipe"
+
+  debug_hint_win = vim.api.nvim_open_win(debug_hint_buf, false, {
     relative = "editor",
     anchor = "NE",
     row = 1,
     col = vim.o.columns - 1,
-    width = width,
-    height = #lines,
+    width = 24,
+    height = #debug_hint_keys + 1,
     style = "minimal",
     border = "rounded",
     focusable = false,
@@ -1508,6 +1872,8 @@ local function open_debug_hint()
   })
 
   vim.wo[debug_hint_win].winblend = 15
+
+  render_debug_hint()
 end
 
 local function close_debug_hint()
@@ -1515,6 +1881,8 @@ local function close_debug_hint()
     vim.api.nvim_win_close(debug_hint_win, true)
   end
   debug_hint_win = nil
+  debug_hint_buf = nil
+  debug_location = nil
 end
 
 dap.listeners.after.attach.debug_hint_open = function()
@@ -1525,13 +1893,6 @@ dap.listeners.after.launch.debug_hint_open = function()
   vim.schedule(open_debug_hint)
 end
 
-dap.listeners.before.event_terminated.debug_hint_close = function()
-  vim.schedule(close_debug_hint)
-end
-
-dap.listeners.before.event_exited.debug_hint_close = function()
-  vim.schedule(close_debug_hint)
-end
 
 -- Stopped-line visuals: amber gutter arrow + persistent line tint.
 -- nvim-dap places the DapStopped sign automatically on every pause.
@@ -1612,6 +1973,20 @@ dap.listeners.after.event_stopped["jump_to_source"] = function(session, body)
         or reason == "breakpoint"         and "  ◆ breakpoint"
         or                                    "  ◆ " .. reason
 
+      -- Surface the function we stopped in, both inline and in the hint window,
+      -- so it's obvious the debugger is executing your code (and where).
+      local func = frame.name
+      if func and func ~= "" then
+        label = label .. "  in " .. func .. "()"
+      end
+
+      set_debug_location({
+        func = (func and func ~= "") and func or "?",
+        file = vim.fn.fnamemodify(path, ":t"),
+        line = line,
+        reason = reason,
+      })
+
       -- Persistent end-of-line label (stays until continue/terminate).
       vim.api.nvim_buf_set_extmark(bufnr, dap_label_ns, line - 1, 0, {
         virt_text     = { { label, "DiagnosticWarn" } },
@@ -1633,14 +2008,41 @@ dap.listeners.after.event_stopped["jump_to_source"] = function(session, body)
   end)
 end
 
--- Remove the label when execution resumes or the session ends.
+-- Remove the label only when execution resumes. On crash or exit, keep the
+-- last stop marker visible for post-mortem inspection until F11 closes the UI.
 local function on_dap_continue()
-  vim.schedule(clear_dap_stopped_marks)
+  vim.schedule(function()
+    clear_dap_stopped_marks()
+    set_debug_location({ running = true })
+  end)
 end
 
-dap.listeners.before.event_continued.clear_stopped  = on_dap_continue
-dap.listeners.before.event_terminated.clear_stopped = on_dap_continue
-dap.listeners.before.event_exited.clear_stopped     = on_dap_continue
+dap.listeners.before.event_continued.clear_stopped = on_dap_continue
+
+local function show_debugger_ui()
+  dapui_open_keep_layout()
+  vim.schedule(open_debug_hint)
+end
+
+local function close_debugger_ui()
+  dapui_close_restore_layout()
+  close_debug_hint()
+  clear_dap_stopped_marks()
+  pending_debug_source = nil
+end
+
+local function open_dap_float(element)
+  local width = math.min(math.max(50, math.floor(vim.o.columns * 0.82)), math.max(20, vim.o.columns - 4))
+  local height = math.min(math.max(16, math.floor(vim.o.lines * 0.75)), math.max(10, vim.o.lines - 6))
+
+  dapui.float_element(element, {
+    enter = true,
+    width = width,
+    height = height,
+    position = "center",
+  })
+  vim.schedule(configure_dapui_windows)
+end
 
 -- Pause on errors instead of letting the process exit. "uncaught" catches
 -- exceptions that crash the program; "userUnhandled" also catches the common
@@ -1906,6 +2308,7 @@ local function run_training_debug(script_path)
   end
 
   ensure_mlflow_ui(config.cwd, config.python)
+  set_debug_source(config.program, "Training run")
 
   dap.run({
     type = "python",
@@ -1935,6 +2338,35 @@ end, {
   silent = true,
   desc = "Debug default training run",
 })
+
+-- Open a debug mask/logit image saved by debug_utils.save_logit_mask.
+-- Usage: :DbgViewMask           -> opens /tmp/dbg/mask.png
+--        :DbgViewMask /tmp/dbg/mask_grid.png
+-- Or from DAP REPL: from src.debug_utils import save_logit_mask; save_logit_mask(outputs['pred_masks'], index=(0,0))
+local function open_dbg_image(path)
+  path = (path and path ~= "") and path or "/tmp/dbg/mask.png"
+  if vim.fn.filereadable(path) == 0 then
+    vim.notify("DbgViewMask: file not found: " .. path, vim.log.levels.WARN)
+    return
+  end
+  vim.fn.jobstart({ "eog", path }, { detach = true })
+end
+
+vim.api.nvim_create_user_command("DbgViewMask", function(opts)
+  open_dbg_image(opts.args)
+end, {
+  nargs = "?",
+  complete = "file",
+  desc = "Open a debug mask/logit image saved by debug_utils.save_logit_mask",
+})
+
+vim.keymap.set("n", "<leader>di", function()
+  open_dbg_image()
+end, {
+  silent = true,
+  desc = "View debug mask image (/tmp/dbg/mask.png)",
+})
+
 local function read_exocortex_config()
   local path = vim.fs.find("exocortex.config", {
     upward = true,
@@ -1995,6 +2427,7 @@ local function run_training_debug_explicit(cfg)
   end
 
   ensure_mlflow_ui(cwd, python)
+  set_debug_source(program, "Training run")
 
   dap.run({
     type = "python",
@@ -2005,9 +2438,62 @@ local function run_training_debug_explicit(cfg)
     args = args,
     pythonPath = python,
     justMyCode = false,
-    subProcess = true,
+    subProcess = false,
     console = "integratedTerminal",
   })
+end
+
+local function current_python_project_root(file)
+  local start = vim.fn.fnamemodify(file, ":h")
+  local marker = vim.fs.find({ "pyproject.toml", "setup.py", "setup.cfg", "requirements.txt", ".git" }, {
+    upward = true,
+    path = start,
+  })[1]
+
+  if marker then
+    return vim.fn.fnamemodify(marker, ":p:h")
+  end
+
+  return vim.fn.getcwd()
+end
+
+local function run_current_python_file()
+  if vim.bo.filetype ~= "python" then
+    return false
+  end
+
+  local file = vim.fn.expand("%:p")
+
+  if file == "" or vim.fn.filereadable(file) ~= 1 then
+    vim.notify("Save the current Python file before debugging", vim.log.levels.ERROR)
+    return true
+  end
+
+  local python = vim.fn.exepath("python3")
+
+  if python == "" then
+    vim.notify("python3 was not found on PATH", vim.log.levels.ERROR)
+    return true
+  end
+
+  if not ensure_debugpy(python) then
+    return true
+  end
+
+  set_debug_source(file, "Current file")
+
+  dap.run({
+    type = "python",
+    request = "launch",
+    name = "Current file",
+    program = file,
+    cwd = current_python_project_root(file),
+    pythonPath = python,
+    justMyCode = false,
+    console = "integratedTerminal",
+  })
+
+  return true
 end
 
 vim.keymap.set("n", "<F5>", function()
@@ -2025,16 +2511,32 @@ vim.keymap.set("n", "<F5>", function()
     return
   end
 
-  local run_file = d.run_file
+  if d.run_file then
+    local run_file = d.run_file
 
-  if run_file and cfg._dir and not run_file:find("^/") then
-    run_file = cfg._dir .. "/" .. run_file
+    if cfg._dir and not run_file:find("^/") then
+      run_file = cfg._dir .. "/" .. run_file
+    end
+
+    run_training_debug(run_file)
+    return
   end
 
-  run_training_debug(run_file)
+  if cfg._dir then
+    local default_run_file = cfg._dir .. "/training_run.sh"
+
+    run_training_debug(file_exists(default_run_file) and default_run_file or nil)
+    return
+  end
+
+  if run_current_python_file() then
+    return
+  end
+
+  run_training_debug()
 end, {
   silent = true,
-  desc = "Start or continue debug session",
+  desc = "Debug current Python file or configured training run",
 })
 vim.keymap.set("n", "<F6>", dap.toggle_breakpoint, {
   silent = true,
@@ -2056,9 +2558,9 @@ vim.keymap.set("n", "<F10>", dap.terminate, {
   silent = true,
   desc = "Stop debug session",
 })
-vim.keymap.set("n", "<F11>", dapui.toggle, {
+vim.keymap.set("n", "<F11>", close_debugger_ui, {
   silent = true,
-  desc = "Toggle debug UI",
+  desc = "Close debug UI",
 })
 vim.keymap.set("n", "<leader>db", dap.toggle_breakpoint, {
   silent = true,
@@ -2080,9 +2582,27 @@ vim.keymap.set("n", "<leader>do", dap.step_out, {
   silent = true,
   desc = "Step out",
 })
-vim.keymap.set("n", "<leader>du", dapui.toggle, {
+vim.keymap.set("n", "<leader>du", show_debugger_ui, {
   silent = true,
-  desc = "Toggle debug UI",
+  desc = "Show debug UI",
+})
+vim.keymap.set("n", "<leader>dv", function()
+  open_dap_float("scopes")
+end, {
+  silent = true,
+  desc = "Open large debug variables view",
+})
+vim.keymap.set("n", "<leader>dw", function()
+  open_dap_float("watches")
+end, {
+  silent = true,
+  desc = "Open large debug watches view",
+})
+vim.keymap.set("n", "<leader>dC", function()
+  open_dap_float("console")
+end, {
+  silent = true,
+  desc = "Open large debug console",
 })
 vim.keymap.set("n", "<leader>dx", dap.terminate, {
   silent = true,

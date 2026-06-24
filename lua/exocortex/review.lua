@@ -232,6 +232,7 @@ local function compute_hunks(left_lines, right_lines)
   })
 
   if not ok or type(diff) ~= "table" then
+    vim.notify(string.format("exocortex: vim.diff failed (ok=%s diff_type=%s err=%s)", tostring(ok), type(diff), tostring(diff)), vim.log.levels.ERROR)
     return {}
   end
 
@@ -323,6 +324,25 @@ local function hunk_range(hunk)
   hunk.start0 = start0
   hunk.count = end0 - start0
   return start0, end0
+end
+
+local function hunk_row_for_buf(hunk, buf)
+  local s = M.session
+  if not (s and hunk and buf and vim.api.nvim_buf_is_valid(buf)) then
+    return nil
+  end
+
+  if buf == s.left_buf then
+    local left_start0 = hunk.new_count > 0 and hunk.new_start - 1 or hunk.new_start
+    return display_row(buf, left_start0)
+  end
+
+  if buf == s.right_buf then
+    local right_start0 = hunk_range(hunk)
+    return display_row(buf, right_start0)
+  end
+
+  return nil
 end
 
 local function marker_hl(hunk, current)
@@ -523,6 +543,62 @@ local function prev_hunk()
   select_hunk(s.hunk_index - 1)
 end
 
+local function hunk_from_cursor(dir)
+  local s = M.session
+  if not (s and s.hunks and #s.hunks > 0) then
+    return nil
+  end
+
+  local win = vim.api.nvim_get_current_win()
+  local buf = vim.api.nvim_get_current_buf()
+
+  if not (valid_win(win) and (buf == s.left_buf or buf == s.right_buf)) then
+    win = target_win_current()
+    buf = win and vim.api.nvim_win_get_buf(win) or nil
+  end
+
+  if not (win and buf and vim.api.nvim_buf_is_valid(buf)) then
+    return nil
+  end
+
+  local cursor_row = vim.api.nvim_win_get_cursor(win)[1] - 1
+  local candidate
+
+  for _, hunk in ipairs(s.hunks) do
+    local hunk_row = hunk_row_for_buf(hunk, buf)
+    if hunk_row ~= nil then
+      if dir > 0 and hunk_row > cursor_row then
+        candidate = hunk.index
+        break
+      end
+
+      if dir < 0 and hunk_row < cursor_row then
+        candidate = hunk.index
+      end
+    end
+  end
+
+  return candidate
+end
+
+local function page_hunk(dir)
+  local s = M.session
+  if not (s and s.hunks and #s.hunks > 0) then return end
+
+  local candidate = hunk_from_cursor(dir)
+
+  if candidate then
+    select_hunk(candidate)
+    return
+  end
+
+  if dir > 0 then
+    vim.notify("exocortex: already on last diff", vim.log.levels.INFO)
+  else
+    vim.notify("exocortex: already on first diff", vim.log.levels.INFO)
+  end
+end
+
 local function page_scroll(dir)
   local win = target_win_current()
   if not win then return end
@@ -544,8 +620,8 @@ local function set_review_maps(buf)
   map("e", edit_current, "Edit right side")
   map("n", next_hunk, "Next diff")
   map("p", prev_hunk, "Previous diff")
-  map("<PageDown>", next_hunk, "Next diff")
-  map("<PageUp>", prev_hunk, "Previous diff")
+  map("<PageDown>", function() page_hunk(1) end, "Next diff from cursor")
+  map("<PageUp>", function() page_hunk(-1) end, "Previous diff from cursor")
   map("]", function() M.jump(1) end, "Next file")
   map("[", function() M.jump(-1) end, "Previous file")
   map("J", function() page_scroll(1) end, "Page down")
@@ -692,8 +768,9 @@ function M.show_file(index)
   if ft then vim.bo[s.right_buf].filetype = ft end
   set_review_maps(s.right_buf)
 
-  local base_lines = s.node.base and git.file_at(s.root, s.node.base, f.path) or {}
-  s.hunks = compute_hunks(base_lines, proposal_lines)
+  local current_lines = vim.api.nvim_buf_get_lines(s.right_buf, 0, -1, false)
+  s.hunks = compute_hunks(current_lines, proposal_lines)
+  vim.notify(string.format("exocortex: %d proposal lines, %d current lines → %d hunks", #proposal_lines, #current_lines, #s.hunks), vim.log.levels.INFO)
   s.hunk_index = #s.hunks > 0 and 1 or 0
   place_tracks(s.right_buf, s.hunks)
 

@@ -9,6 +9,7 @@ local agents = require("exocortex.agents")
 local graph = require("exocortex.graph")
 local view = require("exocortex.view")
 local review = require("exocortex.review")
+local obsidian = require("exocortex.obsidian")
 
 local M = {}
 
@@ -99,18 +100,39 @@ local function build_prompt(parent_id, prompt)
   return table.concat(parts, "\n")
 end
 
+-- The node may belong to a session the user has since switched away from, so
+-- persist to its own session and only redraw the graph when it's in front.
+local function save_node(node)
+  state.save_session(node.session_id)
+end
+
+local function render_if_current(node)
+  if node.session_id == state.current_session then
+    graph.render()
+  end
+end
+
+-- Tag completion notifications with the session when it isn't the active one,
+-- so a background job's result is unambiguous.
+local function session_suffix(node)
+  if node.session_id and node.session_id ~= state.current_session then
+    return " [" .. node.session_id .. "]"
+  end
+  return ""
+end
+
 local function fail_node(node, err)
   node.status = "error"
   node.stat = (err or "unknown error"):gsub("\n.*", ""):sub(1, 80)
   node.response = err
-  state.save()
-  graph.render()
+  save_node(node)
+  render_if_current(node)
 
   if graph.flash_code_win then
     graph.flash_code_win("exocortex: " .. node.id .. " failed")
   end
 
-  vim.notify("exocortex: " .. node.id .. " failed: " .. (err or "?"), vim.log.levels.ERROR)
+  vim.notify("exocortex: " .. node.id .. session_suffix(node) .. " failed: " .. (err or "?"), vim.log.levels.ERROR)
 end
 
 local function finish_node(node, root, base, ref_name, response, sha, files)
@@ -118,8 +140,8 @@ local function finish_node(node, root, base, ref_name, response, sha, files)
   node.snapshot = sha
   node.files = files or {}
   node.stat = "updating stats"
-  state.save()
-  graph.render()
+  save_node(node)
+  render_if_current(node)
 
   git.shortstat_async(root, base, sha, function(stat, stat_err)
     node.stat = stat or (stat_err and ("stat failed: " .. stat_err:gsub("\n.*", "")) or "no file changes")
@@ -130,8 +152,12 @@ local function finish_node(node, root, base, ref_name, response, sha, files)
         vim.notify("exocortex: failed to pin " .. node.id .. ": " .. ref_err, vim.log.levels.WARN)
       end
 
-      state.save()
-      graph.render()
+      save_node(node)
+      render_if_current(node)
+
+      -- Mirror the finished chat into the Obsidian vault (no-op when
+      -- OBSIDIAN_DIR is unset); never let a vault error fail the node.
+      pcall(obsidian.on_done, node)
 
       if graph.flash_code_win then
         graph.flash_code_win("exocortex: " .. node.id .. " done")
@@ -141,7 +167,7 @@ local function finish_node(node, root, base, ref_name, response, sha, files)
         graph.flash_tabline()
       end
 
-      vim.notify("exocortex: " .. node.id .. " done (" .. node.stat .. ")", vim.log.levels.INFO)
+      vim.notify("exocortex: " .. node.id .. session_suffix(node) .. " done (" .. node.stat .. ")", vim.log.levels.INFO)
     end)
   end)
 end
@@ -192,8 +218,8 @@ function M.run_prompt(parent_id, prompt)
   local function start_agent(base)
     node.base = base
     node.stat = "preparing worktree"
-    state.save()
-    graph.render()
+    save_node(node)
+    render_if_current(node)
 
     git.worktree_add_async(root, base, function(worktree, wt_err)
       if not worktree then
@@ -202,8 +228,8 @@ function M.run_prompt(parent_id, prompt)
       end
 
       node.stat = "running"
-      state.save()
-      graph.render()
+      save_node(node)
+      render_if_current(node)
 
       agents.run(agent, build_prompt(parent_id, prompt), worktree, function(response, agent_err)
         if agent_err then
@@ -213,8 +239,8 @@ function M.run_prompt(parent_id, prompt)
         end
 
         node.stat = "saving snapshot"
-        state.save()
-        graph.render()
+        save_node(node)
+        render_if_current(node)
 
         git.snapshot_async(worktree, base, function(sha, snap_err)
           git.worktree_remove_async(root, worktree)
@@ -286,11 +312,59 @@ local function prompt_for_session_agent(on_choice)
   end)
 end
 
+-- Multi-line prompt entry: a floating scratch buffer so the user can paste or
+-- type several lines. Submit with <C-s>, cancel with q / <C-c> (normal mode).
+local function multiline_input(title, on_submit)
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[buf].bufhidden = "wipe"
+  vim.bo[buf].filetype = "markdown"
+
+  local width = math.min(100, math.floor(vim.o.columns * 0.7))
+  local height = math.min(12, math.max(4, math.floor(vim.o.lines * 0.4)))
+  local win = vim.api.nvim_open_win(buf, true, {
+    relative = "editor",
+    width = width,
+    height = height,
+    row = math.floor((vim.o.lines - height) / 2),
+    col = math.floor((vim.o.columns - width) / 2),
+    style = "minimal",
+    border = "rounded",
+    title = " " .. title .. " ",
+    title_pos = "left",
+    footer = " <C-s> send · q/<C-c> cancel ",
+    footer_pos = "right",
+  })
+  vim.wo[win].wrap = true
+
+  local done = false
+  local function finish(submit)
+    if done then return end
+    done = true
+    local text
+    if submit then
+      text = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
+    end
+    if vim.api.nvim_win_is_valid(win) then
+      vim.api.nvim_win_close(win, true)
+    end
+    on_submit(submit and text or nil)
+  end
+
+  local function map(mode, lhs, submit)
+    vim.keymap.set(mode, lhs, function() finish(submit) end, { buffer = buf, nowait = true })
+  end
+  map({ "n", "i" }, "<C-s>", true)
+  map({ "n", "i" }, "<C-c>", false)
+  map("n", "q", false)
+
+  vim.cmd("startinsert")
+end
+
 function M.prompt(parent_id)
   local hint = parent_id and (" from " .. parent_id) or " (new root)"
 
   local function do_input(agent_name)
-    vim.ui.input({ prompt = "exocortex" .. hint .. " [" .. agent_name .. "] > " }, function(input)
+    multiline_input("exocortex" .. hint .. " [" .. agent_name .. "]", function(input)
       if input and vim.trim(input) ~= "" then
         M.config.agent = agent_name
         state.set_session_agent(agent_name)
@@ -654,8 +728,8 @@ function M.create_src_node()
       node.stat = sha:sub(1, 7)
       git.update_ref_async(root, ref_name, sha, function() end)
     end
-    state.save()
-    graph.render()
+    save_node(node)
+    render_if_current(node)
   end)
 end
 

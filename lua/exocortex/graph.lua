@@ -754,15 +754,16 @@ function M.session_changed(what)
   local last = state.order[#state.order]
   if last then M.select(last) end
 
+  -- A session can have an agent still running in the background; resume the
+  -- spinner so its card keeps animating now that it's in front again.
+  if any_running() then
+    M.start_spinner()
+  end
+
   vim.notify("exocortex: " .. what .. " " .. state.current_session, vim.log.levels.INFO)
 end
 
 local function cycle_session(step)
-  if any_running() then
-    vim.notify("exocortex: wait for running nodes before switching sessions", vim.log.levels.WARN)
-    return
-  end
-
   local sessions = state.list_sessions()
 
   if #sessions < 2 then
@@ -792,11 +793,6 @@ function M.prev_session()
 end
 
 function M.create_new_session()
-  if any_running() then
-    vim.notify("exocortex: wait for running nodes before switching sessions", vim.log.levels.WARN)
-    return
-  end
-
   require("exocortex").new_session()
 end
 
@@ -901,7 +897,7 @@ local function show_help()
     "  s              skip focused proposal hunk",
     "  u              undo accept/skip and show proposal again",
     "  e              focus editable right side",
-    "  PgDn / PgUp    next / previous diff marker",
+    "  PgDn / PgUp    next / previous diff marker from cursor",
     "  ] / [          next / previous changed file",
     "  J / K          page down / up inside the file",
     "  q              end review",
