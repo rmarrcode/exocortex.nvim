@@ -1,5 +1,5 @@
 return {
-  OBSIDIAN_DIR = "",
+  OBSIDIAN_DIR = "/home/ryan-marr/obs/obs/Exocortex",
   graph = {
     obsidian_session = "obsidian",
   },

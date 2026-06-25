@@ -10,20 +10,23 @@ local graph = require("exocortex.graph")
 local view = require("exocortex.view")
 local review = require("exocortex.review")
 local obsidian = require("exocortex.obsidian")
+local config_loader = require("exocortex.config_loader")
+local keymaps = require("exocortex.keymaps")
 
 local M = {}
 
-M.config = {
-  agent = nil,          -- default: first available adapter
-  context_chars = 4000, -- per-ancestor response replayed as branch context
-  terminal_lines = 50,  -- last N lines from each terminal appended to every prompt
-}
+M.config = vim.tbl_deep_extend("force", {
+  agent = nil,
+  context_chars = 4000,
+  terminal_lines = 50,
+}, config_loader.load().exocortex or {})
 
 local function get_terminal_label(buf)
   local ok, label = pcall(vim.api.nvim_buf_get_var, buf, "bottom_terminal_label")
   if ok and type(label) == "string" and label ~= "" then
     return label
   end
+
   local shell = vim.fn.fnamemodify(vim.o.shell, ":t")
   if shell == "" then
     return "terminal"
@@ -48,7 +51,6 @@ local function get_terminal_context()
       local n = vim.api.nvim_buf_line_count(buf)
       local lines = vim.api.nvim_buf_get_lines(buf, math.max(0, n - max), n, false)
 
-      -- Drop trailing blank lines.
       while #lines > 0 and vim.trim(lines[#lines]) == "" do
         table.remove(lines)
       end
@@ -73,11 +75,9 @@ local function get_terminal_context()
     if a.visible ~= b.visible then
       return a.visible
     end
-
     if a.tick ~= b.tick then
       return a.tick > b.tick
     end
-
     return a.buf < b.buf
   end)
 
@@ -133,7 +133,7 @@ local function build_prompt(parent_id, prompt)
 end
 
 -- The node may belong to a session the user has since switched away from, so
--- persist to its own session and only redraw the graph when it's in front.
+-- persist to its own session and redraw only when it is in front.
 local function save_node(node)
   state.save_session(node.session_id)
 end
@@ -144,8 +144,6 @@ local function render_if_current(node)
   end
 end
 
--- Tag completion notifications with the session when it isn't the active one,
--- so a background job's result is unambiguous.
 local function session_suffix(node)
   if node.session_id and node.session_id ~= state.current_session then
     return " [" .. node.session_id .. "]"
@@ -184,16 +182,17 @@ local function finish_node(node, root, base, ref_name, response, sha, files)
         vim.notify("exocortex: failed to pin " .. node.id .. ": " .. ref_err, vim.log.levels.WARN)
       end
 
+      graph.unread[node.id] = true
+      if graph.bar_nodes then
+        graph.bar_nodes[(node.session_id or "default") .. ":" .. node.id] = true
+      end
       save_node(node)
       render_if_current(node)
-      graph.refresh_status_bar()
-
-      -- Mirror the finished chat into the Obsidian vault (no-op when
-      -- OBSIDIAN_DIR is unset); never let a vault error fail the node.
+      if graph.refresh_status_bar then graph.refresh_status_bar() end
       pcall(obsidian.on_done, node)
 
       if graph.flash_code_win then
-        graph.flash_code_win("exocortex: " .. node.id .. " done")
+        graph.flash_code_win("exocortex: " .. node.id .. session_suffix(node) .. " done")
       end
 
       if graph.flash_tabline then
@@ -225,16 +224,19 @@ function M.run_prompt(parent_id, prompt)
     return
   end
 
+  if state.is_read_only_session() then
+    vim.notify("exocortex: obsidian session is read-only", vim.log.levels.WARN)
+    return
+  end
+
   local available_agents = agents.available()
   local available = {}
-
   for _, name in ipairs(available_agents) do
     available[name] = true
   end
 
   if agent and not available[agent] then
     local fallback = available_agents[1]
-
     if fallback then
       vim.notify("exocortex: saved agent " .. agent .. " is no longer supported; using " .. fallback, vim.log.levels.WARN)
       agent = fallback
@@ -262,10 +264,17 @@ function M.run_prompt(parent_id, prompt)
     return
   end
 
-  local node = state.new_node(parent_id, prompt, agent)
+  local node, node_err = state.new_node(parent_id, prompt, agent)
+  if not node then
+    vim.notify("exocortex: " .. (node_err or "could not create node"), vim.log.levels.WARN)
+    return
+  end
+
   local ref_name = state.ref_name(node.id)
   node.stat = parent and "preparing worktree" or "snapshotting base"
-  graph.bar_nodes[(node.session_id or "default") .. ":" .. node.id] = true
+  if graph.bar_nodes then
+    graph.bar_nodes[(node.session_id or "default") .. ":" .. node.id] = true
+  end
   graph.select(node.id)
   graph.start_spinner()
 
@@ -366,59 +375,16 @@ local function prompt_for_session_agent(on_choice)
   end)
 end
 
--- Multi-line prompt entry: a floating scratch buffer so the user can paste or
--- type several lines. Submit with <C-s>, cancel with q / <C-c> (normal mode).
-local function multiline_input(title, on_submit)
-  local buf = vim.api.nvim_create_buf(false, true)
-  vim.bo[buf].bufhidden = "wipe"
-  vim.bo[buf].filetype = "markdown"
-
-  local width = math.min(100, math.floor(vim.o.columns * 0.7))
-  local height = math.min(12, math.max(4, math.floor(vim.o.lines * 0.4)))
-  local win = vim.api.nvim_open_win(buf, true, {
-    relative = "editor",
-    width = width,
-    height = height,
-    row = math.floor((vim.o.lines - height) / 2),
-    col = math.floor((vim.o.columns - width) / 2),
-    style = "minimal",
-    border = "rounded",
-    title = " " .. title .. " ",
-    title_pos = "left",
-    footer = " <C-s> send · q/<C-c> cancel ",
-    footer_pos = "right",
-  })
-  vim.wo[win].wrap = true
-
-  local done = false
-  local function finish(submit)
-    if done then return end
-    done = true
-    local text
-    if submit then
-      text = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
-    end
-    if vim.api.nvim_win_is_valid(win) then
-      vim.api.nvim_win_close(win, true)
-    end
-    on_submit(submit and text or nil)
-  end
-
-  local function map(mode, lhs, submit)
-    vim.keymap.set(mode, lhs, function() finish(submit) end, { buffer = buf, nowait = true })
-  end
-  map({ "n", "i" }, "<C-s>", true)
-  map({ "n", "i" }, "<C-c>", false)
-  map("n", "q", false)
-
-  vim.cmd("startinsert")
-end
-
 function M.prompt(parent_id)
+  if state.is_read_only_session() then
+    vim.notify("exocortex: obsidian session is read-only", vim.log.levels.WARN)
+    return
+  end
+
   local hint = parent_id and (" from " .. parent_id) or " (new root)"
 
   local function do_input(agent_name)
-    multiline_input("exocortex" .. hint .. " [" .. agent_name .. "]", function(input)
+    vim.ui.input({ prompt = "exocortex" .. hint .. " [" .. agent_name .. "] > " }, function(input)
       if input and vim.trim(input) ~= "" then
         M.config.agent = agent_name
         state.set_session_agent(agent_name)
@@ -463,9 +429,13 @@ local function open_ai_view_from_terminal()
 end
 
 local function set_terminal_keymaps(buf)
-  for _, lhs in ipairs({ "<C-a>i", "<C-a><Tab>" }) do
-    vim.keymap.set("t", lhs, open_ai_view_from_terminal, { buffer = buf, silent = true, nowait = true, desc = "Open AI view" })
-  end
+  local keys = config_loader.keys("editor")
+  keymaps.set("t", keys.terminal_open_graph, open_ai_view_from_terminal, {
+    buffer = buf,
+    silent = true,
+    nowait = true,
+    desc = "Open AI view",
+  })
 end
 
 local function bring_window_left()
@@ -487,8 +457,9 @@ local open_same_file_right
 
 local function set_file_keymaps(buf)
   if vim.api.nvim_buf_is_valid(buf) and vim.bo[buf].buftype == "" and not vim.bo[buf].filetype:match("^exocortex") then
-    vim.keymap.set("n", "<C-\\>", open_same_file_right, { buffer = buf, silent = true, nowait = true, desc = "Open same file to the right" })
-    vim.keymap.set("n", "f", function() review.function_to_top(vim.api.nvim_get_current_win()) end, { buffer = buf, silent = true, nowait = true, desc = "Put function at top" })
+    local keys = config_loader.keys("editor")
+    keymaps.set("n", keys.open_same_file_right, open_same_file_right, { buffer = buf, silent = true, nowait = true, desc = "Open same file to the right" })
+    keymaps.set("n", keys.function_to_top, function() review.function_to_top(vim.api.nvim_get_current_win()) end, { buffer = buf, silent = true, nowait = true, desc = "Put function at top" })
   end
 end
 
@@ -546,7 +517,7 @@ local function is_workspace_win(win)
   end
 
   local bt = vim.bo[buf].buftype
-  return bt == ""
+  return bt == "" or bt == "terminal"
 end
 
 local function capture_workspace_tab(tab)
@@ -642,6 +613,8 @@ function M.read_selected()
     return
   end
 
+  graph.mark_read(node.id)
+
   local buf = vim.api.nvim_create_buf(true, false)
   local suffix = tostring((vim.uv or vim.loop).hrtime())
   pcall(vim.api.nvim_buf_set_name, buf,
@@ -663,8 +636,9 @@ function M.read_selected()
     end
   end
 
-  vim.keymap.set("n", "q", close_read_view, { buffer = buf, silent = true, nowait = true })
-  vim.keymap.set("n", "<Esc>", close_read_view, { buffer = buf, silent = true, nowait = true })
+  local read_keys = config_loader.keys("node_view")
+  keymaps.set("n", read_keys.close, close_read_view, { buffer = buf, silent = true, nowait = true })
+  keymaps.set("n", read_keys.return_to_code, close_read_view, { buffer = buf, silent = true, nowait = true })
 
   open_response_tab(buf)
 
@@ -677,8 +651,7 @@ function M.view_selected()
   local node = selected_node()
 
   if node then
-    graph.bar_dismissed[(node.session_id or "default") .. ":" .. node.id] = true
-    graph.refresh_status_bar()
+    graph.mark_read(node.id)
     view.open(node, graph.screen_rect(node.id), state.root_dir)
   end
 end
@@ -721,6 +694,11 @@ function M.close_session()
 
   local sid = state.current_session or "default"
 
+  if state.is_protected_session(sid) then
+    vim.notify("exocortex: session " .. sid .. " cannot be deleted", vim.log.levels.WARN)
+    return
+  end
+
   if vim.fn.confirm('Close session "' .. sid .. '" and delete its nodes?', "&Yes\n&No", 2) ~= 1 then
     return
   end
@@ -730,7 +708,11 @@ function M.close_session()
     git.delete_ref(state.root_dir, state.ref_name(id))
   end
 
-  state.delete_session(sid)
+  local deleted, delete_err = state.delete_session(sid)
+  if not deleted then
+    vim.notify("exocortex: " .. (delete_err or "could not delete session"), vim.log.levels.WARN)
+    return
+  end
 
   local remaining = state.list_sessions()
   state.load(state.root_dir, remaining[1] or "default")
@@ -764,13 +746,6 @@ function M.new_session()
     return
   end
 
-  for _, node in pairs(state.nodes) do
-    if node.status == "running" and node.kind ~= "src" then
-      vim.notify("exocortex: wait for running nodes before switching sessions", vim.log.levels.WARN)
-      return
-    end
-  end
-
   state.new_session()
   graph.session_changed("created session")
   M.create_src_node()
@@ -780,7 +755,12 @@ function M.create_src_node()
   local root = state.root_dir
   if not root then return end
 
-  local node = state.new_src_node()
+  local node, node_err = state.new_src_node()
+  if not node then
+    vim.notify("exocortex: " .. (node_err or "could not create source node"), vim.log.levels.WARN)
+    return
+  end
+
   local ref_name = state.ref_name(node.id)
   graph.render()
   graph.select(node.id)
@@ -816,7 +796,7 @@ function M.open()
 
   graph.open()
 
-  if state.is_empty() then
+  if state.is_empty() and not state.is_read_only_session() then
     M.create_src_node()
   end
 end
@@ -833,6 +813,7 @@ local function set_highlights()
   vim.api.nvim_set_hl(0, "ExocortexFlash", { fg = "#1e1e1e", bg = "#ffcc00", bold = true })
   vim.api.nvim_set_hl(0, "ExocortexSrc", { fg = "#4ec9b0", bg = "#1f1f1f" })
   vim.api.nvim_set_hl(0, "ExocortexSrcTitle", { fg = "#4ec9b0", bg = "#1f1f1f", bold = true })
+  vim.api.nvim_set_hl(0, "ExocortexUnread", { fg = "#ff9900", bold = true })
 end
 
 function M.setup(opts)
@@ -843,7 +824,7 @@ function M.setup(opts)
     opts.adapters = nil
   end
 
-  M.config = vim.tbl_deep_extend("force", M.config, opts)
+  M.config = vim.tbl_deep_extend("force", M.config, config_loader.load().exocortex or {}, opts)
 
   set_highlights()
 
@@ -878,7 +859,7 @@ function M.setup(opts)
 
   vim.api.nvim_create_user_command("Exocortex", M.open, { desc = "Open the exocortex agent graph" })
 
-  vim.keymap.set({ "n", "t" }, "<C-D-Left>", bring_window_left, { silent = true, nowait = true, desc = "Move window left" })
+  keymaps.set({ "n", "t" }, config_loader.keys("editor").move_window_left, bring_window_left, { silent = true, nowait = true, desc = "Move window left" })
 end
 
 return M

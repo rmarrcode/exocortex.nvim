@@ -1,7 +1,17 @@
 -- Node detail float with a grow-from-card transition. The float starts at the
 -- card's screen rect and animates to a centered reading pane.
 
+local config_loader = require("exocortex.config_loader")
+local keymaps = require("exocortex.keymaps")
+
 local M = {}
+
+local function first_key(lhses)
+  if type(lhses) == "table" then
+    return lhses[1] or ""
+  end
+  return lhses or ""
+end
 
 local function smoothstep(t)
   return t * t * (3 - 2 * t)
@@ -67,9 +77,10 @@ function M.open(node, from_rect, root_dir)
 
   local start = from_rect or final
 
+  local keys = config_loader.keys("node_view")
   local footer = node.snapshot
-    and "  r read  d review diffs  D diffview  q close  "
-    or  "  r read  q close  "
+    and string.format("  %s read  %s review diffs  %s diffview  %s close  ", first_key(keys.read), first_key(keys.review_diffs), first_key(keys.diffview), first_key(keys.close))
+    or string.format("  %s read  %s close  ", first_key(keys.read), first_key(keys.close))
 
   local win = vim.api.nvim_open_win(buf, true, {
     relative = "editor",
@@ -99,13 +110,11 @@ function M.open(node, from_rect, root_dir)
   end
 
   local function map(lhs, fn)
-    vim.keymap.set("n", lhs, fn, { buffer = buf, silent = true, nowait = true })
+    keymaps.set("n", lhs, fn, { buffer = buf, silent = true, nowait = true })
   end
 
-  map("q", close)
-  map("ZZ", close)
-  map("ZQ", close)
-  map("<Esc>", function()
+  map(keys.close, close)
+  map(keys.return_to_code, function()
     close()
     require("exocortex.graph").return_to_code()
   end)
@@ -115,18 +124,18 @@ function M.open(node, from_rect, root_dir)
     map(lhs, noop)
   end
 
-  vim.keymap.set("n", "r", function()
+  keymaps.set("n", keys.read, function()
     close()
     require("exocortex").read_selected()
   end, { buffer = buf, silent = true, nowait = true, desc = "Read view" })
 
   if node.snapshot and root_dir then
-    vim.keymap.set("n", "d", function()
+    keymaps.set("n", keys.review_diffs, function()
       close()
       require("exocortex.review").start(node, root_dir)
     end, { buffer = buf, silent = true, nowait = true, desc = "Review diffs" })
 
-    vim.keymap.set("n", "D", function()
+    keymaps.set("n", keys.diffview, function()
       close()
       vim.cmd(string.format("DiffviewOpen %s..%s", node.base, node.snapshot))
     end, { buffer = buf, silent = true, nowait = true, desc = "Open in Diffview" })

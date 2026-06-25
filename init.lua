@@ -115,8 +115,27 @@ vim.g.maplocalleader = ","
 -- Dedicated venv for the Python provider (pynvim + jupyter_client for molten).
 vim.g.python3_host_prog = vim.fn.expand("~/.local/share/nvim/venv/bin/python")
 
-if not vim.pack then
-  vim.notify("This config requires Neovim 0.12+", vim.log.levels.ERROR)
+local lazypath = vim.fn.stdpath("data") .. "/lazy/lazy.nvim"
+if not (vim.uv or vim.loop).fs_stat(lazypath) then
+  local result = vim.fn.system({
+    "git",
+    "clone",
+    "--filter=blob:none",
+    "--branch=stable",
+    "https://github.com/folke/lazy.nvim.git",
+    lazypath,
+  })
+
+  if vim.v.shell_error ~= 0 then
+    vim.notify("Failed to install lazy.nvim:\n" .. result, vim.log.levels.ERROR)
+    return
+  end
+end
+vim.opt.rtp:prepend(lazypath)
+
+local ok_lazy, lazy = pcall(require, "lazy")
+if not ok_lazy then
+  vim.notify("lazy.nvim is not available", vim.log.levels.ERROR)
   return
 end
 
@@ -124,43 +143,27 @@ end
 -- PLUGINS
 -- ============================================================================
 
-if not vim.g.pack_bootstrapped then
-  vim.g.pack_bootstrapped = true
-
-  vim.pack.add({
-  { src = "https://github.com/nvim-lua/plenary.nvim" },
-  { src = "https://github.com/nvim-tree/nvim-web-devicons" },
-  { src = "https://github.com/nvim-tree/nvim-tree.lua" },
-  { src = "https://github.com/nvim-telescope/telescope.nvim" },
-  { src = "https://github.com/mfussenegger/nvim-dap" },
-  { src = "https://github.com/nvim-neotest/nvim-nio" },
-  { src = "https://github.com/rcarriga/nvim-dap-ui" },
-  { src = "https://github.com/neovim/nvim-lspconfig" },
-  { src = "https://github.com/GCBallesteros/jupytext.nvim" },
-  { src = "https://github.com/benlubas/molten-nvim" },
-  { src = "https://github.com/nvim-mini/mini.nvim" },
-  { src = "https://github.com/mg979/vim-visual-multi" },
-  { src = "https://github.com/sindrets/diffview.nvim" },
-
-  -- CODEX
-  { src = "https://github.com/johnseth97/codex.nvim" },
+lazy.setup({
+  { "nvim-lua/plenary.nvim", lazy = false },
+  { "nvim-tree/nvim-web-devicons", lazy = false },
+  { "nvim-tree/nvim-tree.lua", lazy = false },
+  { "nvim-telescope/telescope.nvim", lazy = false },
+  { "mfussenegger/nvim-dap", lazy = false },
+  { "nvim-neotest/nvim-nio", lazy = false },
+  { "rcarriga/nvim-dap-ui", lazy = false },
+  { "neovim/nvim-lspconfig", lazy = false },
+  { "GCBallesteros/jupytext.nvim", lazy = false },
+  { "benlubas/molten-nvim", lazy = false },
+  { "nvim-mini/mini.nvim", lazy = false },
+  { "mg979/vim-visual-multi", lazy = false },
+  { "sindrets/diffview.nvim", lazy = false },
+  { "johnseth97/codex.nvim", lazy = false },
+}, {
+  root = vim.fn.stdpath("data") .. "/lazy",
+  lockfile = vim.fn.stdpath("config") .. "/lazy-lock.json",
+  change_detection = { notify = false },
+  install = { missing = true },
 })
-
-vim.cmd("packadd plenary.nvim")
-vim.cmd("packadd nvim-web-devicons")
-vim.cmd("packadd nvim-tree.lua")
-vim.cmd("packadd telescope.nvim")
-vim.cmd("packadd nvim-dap")
-vim.cmd("packadd nvim-nio")
-vim.cmd("packadd nvim-dap-ui")
-vim.cmd("packadd nvim-lspconfig")
-vim.cmd("packadd jupytext.nvim")
-vim.cmd("packadd molten-nvim")
-vim.cmd("packadd mini.nvim")
-vim.cmd("packadd vim-visual-multi")
-vim.cmd("packadd diffview.nvim")
-vim.cmd("packadd codex.nvim")
-end
 
 -- ============================================================================
 -- BASIC SETTINGS
@@ -2047,25 +2050,39 @@ local debug_hint_buf = nil
 -- while the program is executing; otherwise { func, file, line, reason }.
 local debug_location = nil
 
-local debug_hint_keys = {
-  " F5  ,dc  Continue  ",
-  " F6  ,db  Breakpoint",
-  " F7  ,di  Step Into ",
-  " F8  ,dn  Step Over ",
-  " F9  ,do  Step Out  ",
-  " F10 ,dx  Stop (UI stays)",
-  " F11      Close UI",
-  " PgUp  ↑   Cursor up",
-  " PgDn  ↓   Cursor down",
-  " [     ←   Cursor left",
-  " ]     →   Cursor right",
-  " ,du      Show UI ",
-  " ,dv      Variables",
-  " ,dw      Watches  ",
-  " ,dC      Console  ",
-  " ,de      Inspect ",
-  " ,dV      Values  ",
-}
+local function debug_key_list(lhses)
+  if lhses == nil or lhses == false then return {} end
+  if type(lhses) == "table" then return lhses end
+  return { lhses }
+end
+
+local function debug_key_label(lhses)
+  return table.concat(debug_key_list(lhses), " / ")
+end
+
+local function debug_hint_keys()
+  local keys = require("exocortex.config_loader").keys("debug")
+  return {
+    string.format(" %-18s Continue", debug_key_label(keys.start_continue)),
+    string.format(" %-18s Breakpoint", debug_key_label(keys.toggle_breakpoint)),
+    string.format(" %-18s Step into", debug_key_label(keys.step_into)),
+    string.format(" %-18s Step over", debug_key_label(keys.step_over)),
+    string.format(" %-18s Step out", debug_key_label(keys.step_out)),
+    string.format(" %-18s Stop", debug_key_label(keys.stop)),
+    string.format(" %-18s Close UI", debug_key_label(keys.close_ui)),
+    string.format(" %-18s Cursor up", debug_key_label(keys.debug_nav_up)),
+    string.format(" %-18s Cursor down", debug_key_label(keys.debug_nav_down)),
+    string.format(" %-18s Cursor left", debug_key_label(keys.debug_nav_left)),
+    string.format(" %-18s Cursor right", debug_key_label(keys.debug_nav_right)),
+    string.format(" %-18s Show UI", debug_key_label(keys.show_ui)),
+    string.format(" %-18s Variables", debug_key_label(keys.variables)),
+    string.format(" %-18s Watches", debug_key_label(keys.watches)),
+    string.format(" %-18s Console", debug_key_label(keys.console)),
+    string.format(" %-18s Inspect", debug_key_label(keys.inspect)),
+    string.format(" %-18s Values", debug_key_label(keys.toggle_values)),
+    string.format(" %-18s View mask", debug_key_label(keys.view_mask)),
+  }
+end
 
 local debug_mode_keymaps_active = false
 local debug_mode_saved_keymaps = {}
@@ -2077,31 +2094,43 @@ set_debug_mode_keymaps = function(enabled)
 
   debug_mode_keymaps_active = enabled
 
+  local keys = require("exocortex.config_loader").keys("debug")
   local maps = {
-    { "<PageUp>", "<Up>" },
-    { "<PageDown>", "<Down>" },
-    { "[", "<Left>" },
-    { "]", "<Right>" },
+    { keys.debug_nav_up, "<Up>" },
+    { keys.debug_nav_down, "<Down>" },
+    { keys.debug_nav_left, "<Left>" },
+    { keys.debug_nav_right, "<Right>" },
   }
+  local expanded = {}
+
+  for _, map in ipairs(maps) do
+    for _, lhs in ipairs(debug_key_list(map[1])) do
+      if lhs and lhs ~= "" then
+        expanded[#expanded + 1] = { lhs, map[2] }
+      end
+    end
+  end
 
   if enabled then
     debug_mode_saved_keymaps = {}
 
-    for _, map in ipairs(maps) do
-      local existing = vim.fn.maparg(map[1], "n", false, true)
+    for _, map in ipairs(expanded) do
+      local lhs, rhs = map[1], map[2]
+      local existing = vim.fn.maparg(lhs, "n", false, true)
       if type(existing) == "table" and next(existing) ~= nil then
-        debug_mode_saved_keymaps[map[1]] = existing
+        debug_mode_saved_keymaps[lhs] = existing
       end
 
-      vim.keymap.set("n", map[1], map[2], { silent = true, nowait = true, desc = "Debug navigation" })
+      vim.keymap.set("n", lhs, rhs, { silent = true, nowait = true, desc = "Debug navigation" })
     end
     return
   end
 
-  for _, map in ipairs(maps) do
-    pcall(vim.keymap.del, "n", map[1])
+  for _, map in ipairs(expanded) do
+    local lhs = map[1]
+    pcall(vim.keymap.del, "n", lhs)
 
-    local existing = debug_mode_saved_keymaps[map[1]]
+    local existing = debug_mode_saved_keymaps[lhs]
     if existing then
       pcall(vim.fn.mapset, "n", false, existing)
     end
@@ -2110,7 +2139,7 @@ set_debug_mode_keymaps = function(enabled)
   debug_mode_saved_keymaps = {}
 end
 
--- Rebuild the hint buffer from `debug_location` + the static keymap list and
+-- Rebuild the hint buffer from `debug_location` + the configured keymap list and
 -- resize the floating window to fit. Called on open and on every stop/continue
 -- so the "current function" header always reflects where the debugger is.
 local function render_debug_hint()
@@ -2137,7 +2166,7 @@ local function render_debug_hint()
 
   local title_idx = #lines
   table.insert(lines, "  DEBUG  ")
-  vim.list_extend(lines, debug_hint_keys)
+  vim.list_extend(lines, debug_hint_keys())
 
   local width = 0
   for _, l in ipairs(lines) do
@@ -2190,7 +2219,7 @@ local function open_debug_hint()
     row = 1,
     col = vim.o.columns - 1,
     width = 24,
-    height = #debug_hint_keys + 1,
+    height = #debug_hint_keys() + 1,
     style = "minimal",
     border = "rounded",
     focusable = false,
@@ -2503,7 +2532,7 @@ dap.defaults.fallback.exception_breakpoints = { "uncaught", "userUnhandled" }
 -- Toggle breaking on EVERY raised exception (even ones caught internally by
 -- libraries). Useful when a framework swallows the error so deeply that even
 -- userUnhandled misses it; noisy otherwise, so it's opt-in.
-vim.keymap.set("n", "<leader>dE", function()
+require("exocortex.keymaps").set("n", require("exocortex.config_loader").keys("debug").toggle_exception_breakpoints, function()
   local current = dap.defaults.fallback.exception_breakpoints
   local on = type(current) == "table" and vim.tbl_contains(current, "raised")
 
@@ -2780,7 +2809,7 @@ end, {
   desc = "Debug a FM-RTDETR training_run.sh wrapper",
 })
 
-vim.keymap.set("n", "<leader>dr", function()
+require("exocortex.keymaps").set("n", require("exocortex.config_loader").keys("debug").run_training, function()
   run_training_debug()
 end, {
   silent = true,
@@ -2808,7 +2837,7 @@ end, {
   desc = "Open a debug mask/logit image saved by debug_utils.save_logit_mask",
 })
 
-vim.keymap.set("n", "<leader>di", function()
+require("exocortex.keymaps").set("n", require("exocortex.config_loader").keys("debug").view_mask, function()
   open_dbg_image()
 end, {
   silent = true,
@@ -2954,7 +2983,10 @@ local function toggle_breakpoint_refresh()
   vim.schedule(refresh_debug_views)
 end
 
-vim.keymap.set("n", "<F5>", function()
+local debug_keys = require("exocortex.config_loader").keys("debug")
+local debug_keymaps = require("exocortex.keymaps")
+
+debug_keymaps.set("n", debug_keys.start_continue, function()
   if dap.session() then
     dap.continue()
     return
@@ -2963,7 +2995,6 @@ vim.keymap.set("n", "<F5>", function()
   local cfg = read_exocortex_config()
   local d = cfg.debug or {}
 
-  -- Explicit interpreter/cwd/args take precedence over script parsing.
   if cfg._dir and (d.python or d.cwd or d.program or d.args) then
     run_training_debug_explicit(cfg)
     return
@@ -2996,85 +3027,61 @@ end, {
   silent = true,
   desc = "Debug current Python file or configured training run",
 })
-vim.keymap.set("n", "<F6>", toggle_breakpoint_refresh, {
+debug_keymaps.set("n", debug_keys.toggle_breakpoint, toggle_breakpoint_refresh, {
   silent = true,
   desc = "Toggle breakpoint",
 })
-vim.keymap.set("n", "<F7>", dap.step_into, {
+debug_keymaps.set("n", debug_keys.step_into, dap.step_into, {
   silent = true,
   desc = "Step into",
 })
-vim.keymap.set("n", "<F8>", dap.step_over, {
+debug_keymaps.set("n", debug_keys.step_over, dap.step_over, {
   silent = true,
   desc = "Step over",
 })
-vim.keymap.set("n", "<F9>", dap.step_out, {
+debug_keymaps.set("n", debug_keys.step_out, dap.step_out, {
   silent = true,
   desc = "Step out",
 })
-vim.keymap.set("n", "<F10>", dap.terminate, {
+debug_keymaps.set("n", debug_keys.stop, dap.terminate, {
   silent = true,
   desc = "Stop debug session",
 })
-vim.keymap.set("n", "<F11>", close_debugger_ui, {
+debug_keymaps.set("n", debug_keys.close_ui, close_debugger_ui, {
   silent = true,
   desc = "Close debug UI",
 })
-vim.keymap.set("n", "<leader>db", toggle_breakpoint_refresh, {
-  silent = true,
-  desc = "Toggle breakpoint",
-})
-vim.keymap.set("n", "<leader>dc", dap.continue, {
-  silent = true,
-  desc = "Start or continue debug session",
-})
-vim.keymap.set("n", "<leader>dn", dap.step_over, {
-  silent = true,
-  desc = "Step over",
-})
-vim.keymap.set("n", "<leader>di", dap.step_into, {
-  silent = true,
-  desc = "Step into",
-})
-vim.keymap.set("n", "<leader>do", dap.step_out, {
-  silent = true,
-  desc = "Step out",
-})
-vim.keymap.set("n", "<leader>du", show_debugger_ui, {
+debug_keymaps.set("n", debug_keys.show_ui, show_debugger_ui, {
   silent = true,
   desc = "Show debug UI",
 })
-vim.keymap.set("n", "<leader>dv", function()
+debug_keymaps.set("n", debug_keys.variables, function()
   open_dap_float("scopes")
 end, {
   silent = true,
   desc = "Open large debug variables view",
 })
-vim.keymap.set("n", "<leader>dw", function()
+debug_keymaps.set("n", debug_keys.watches, function()
   open_dap_float("watches")
 end, {
   silent = true,
   desc = "Open large debug watches view",
 })
-vim.keymap.set("n", "<leader>dC", function()
+debug_keymaps.set("n", debug_keys.console, function()
   open_dap_float("console")
 end, {
   silent = true,
   desc = "Open large debug console",
 })
-vim.keymap.set("n", "<leader>de", function()
+debug_keymaps.set("n", debug_keys.inspect, function()
   vim.ui.input({ prompt = "DAP inspect expression: " }, inspect_debug_expression)
 end, {
   silent = true,
   desc = "Inspect debug variable",
 })
-vim.keymap.set("n", "<leader>dV", "<cmd>DapToggleVariableValues<CR>", {
+debug_keymaps.set("n", debug_keys.toggle_values, "<cmd>DapToggleVariableValues<CR>", {
   silent = true,
   desc = "Toggle inline debug variable values",
-})
-vim.keymap.set("n", "<leader>dx", dap.terminate, {
-  silent = true,
-  desc = "Stop debug session",
 })
 
 vim.api.nvim_create_autocmd("VimLeavePre", {
@@ -3215,6 +3222,10 @@ vim.keymap.set(
 -- EXOCORTEX (talk to coding agents in a DAG)
 -- ============================================================================
 
+local exocortex_config_loader = require("exocortex.config_loader")
+local exocortex_keymaps = require("exocortex.keymaps")
+local exocortex_keys = exocortex_config_loader.keys("editor")
+
 require("exocortex").setup({})
 
 -- Tabline shows running / recently-completed AI nodes. Dismissed when the node
@@ -3259,47 +3270,73 @@ end
 
 -- Ctrl-A then i. With Ctrl held through both keys the terminal encodes
 -- Ctrl-I as Tab, so map that variant too.
-for _, lhs in ipairs({ "<C-a>i", "<C-a><Tab>" }) do
-  vim.keymap.set({ "n", "t" }, lhs, function()
-    vim.schedule(function()
-      if vim.api.nvim_get_mode().mode == "t" then
-        vim.cmd("stopinsert")
-      end
-      require("exocortex").open()
-    end)
-  end, {
-    silent = true,
-    desc = "Open agent DAG",
-  })
-end
+exocortex_keymaps.set({ "n", "t" }, exocortex_keys.open_graph, function()
+  vim.schedule(function()
+    if vim.api.nvim_get_mode().mode == "t" then
+      vim.cmd("stopinsert")
+    end
+    require("exocortex").open()
+  end)
+end, {
+  silent = true,
+  desc = "Open agent DAG",
+})
 
 -- Ctrl+Shift+A then i: open the graph and start a fresh session. Depending
--- on when Ctrl/Shift are released, the second key arrives as i, I, C-S-i,
--- C-i, or Tab — map them all. Telling Ctrl+Shift+A apart from Ctrl+A needs
--- the kitty keyboard protocol (enabled in ~/.config/wezterm/wezterm.lua).
-for _, second in ipairs({ "i", "I", "<C-S-i>", "<C-i>", "<Tab>" }) do
-  vim.keymap.set("n", "<C-S-a>" .. second, function()
-    require("exocortex").open()
-    require("exocortex.graph").create_new_session()
-  end, {
-    silent = true,
-    desc = "New exocortex session",
-  })
-end
+-- on when Ctrl/Shift are released, the second key arrives as several variants.
+exocortex_keymaps.set("n", exocortex_keys.new_session, function()
+  require("exocortex").open()
+  require("exocortex.graph").create_new_session()
+end, {
+  silent = true,
+  desc = "New exocortex session",
+})
 
 -- ============================================================================
 -- RELOAD CONFIG
 -- ============================================================================
 
-vim.keymap.set("n", "<F2>", function()
+local function reload_exocortex_plugin()
+  local graph_open = false
+  for _, win in ipairs(vim.api.nvim_list_wins()) do
+    local buf = vim.api.nvim_win_get_buf(win)
+    local name = vim.api.nvim_buf_get_name(buf)
+    local ft = vim.bo[buf].filetype
+    if name == "exocortex://graph" or ft == "exocortex" or ft == "exocortex-sessions" then
+      graph_open = true
+      break
+    end
+  end
+
   for key in pairs(package.loaded) do
-    if key:match("^exocortex") then
+    if key == "exocortex" or key:match("^exocortex%.") then
       package.loaded[key] = nil
     end
   end
-  vim.cmd("source ~/.config/nvim/init.lua")
-  print("Neovim config reloaded")
-end)
+
+  local ok, exocortex = pcall(require, "exocortex")
+  if not ok then
+    vim.notify("Exocortex reload failed: " .. tostring(exocortex), vim.log.levels.ERROR)
+    return
+  end
+
+  exocortex.setup({})
+
+  if graph_open then
+    exocortex.open()
+  end
+
+  vim.notify("Exocortex plugin reloaded", vim.log.levels.INFO)
+end
+
+vim.api.nvim_create_user_command("ExocortexReload", reload_exocortex_plugin, {
+  desc = "Reload Exocortex plugin modules",
+})
+
+exocortex_keymaps.set("n", exocortex_keys.reload_plugin, reload_exocortex_plugin, {
+  silent = true,
+  desc = "Reload Exocortex plugin",
+})
 
 -- ============================================================================
 -- QUIT

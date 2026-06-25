@@ -1,4 +1,6 @@
-return {
+local M = {}
+
+M.defaults = {
   OBSIDIAN_DIR = "",
   graph = {
     obsidian_session = "obsidian",
@@ -99,3 +101,22 @@ return {
     },
   },
 }
+
+local function load_user()
+  local ok, user = pcall(require, "exocortex.config")
+  if ok and type(user) == "table" then
+    return user
+  end
+  return {}
+end
+
+function M.load()
+  return vim.tbl_deep_extend("force", M.defaults, load_user())
+end
+
+function M.keys(section)
+  local cfg = M.load()
+  return (cfg.keys and cfg.keys[section]) or {}
+end
+
+return M

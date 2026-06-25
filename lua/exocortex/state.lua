@@ -2,6 +2,8 @@
 -- A node is one prompt/response turn: { id, parent, prompt, response, agent,
 -- status, base, snapshot, files, stat, created }.
 
+local config_loader = require("exocortex.config_loader")
+
 local M = {}
 local next_seq
 
@@ -17,6 +19,40 @@ M.sessions = {} -- session_id -> metadata (name, created, etc)
 -- session with an in-flight agent job keeps its node tables alive (and gets
 -- the completion the async callback writes) even while you work elsewhere.
 M.loaded = {}
+
+local function obsidian_session_id()
+  local cfg = config_loader.load()
+  return (cfg.graph and cfg.graph.obsidian_session) or "obsidian"
+end
+
+function M.obsidian_session_id()
+  return obsidian_session_id()
+end
+
+function M.is_obsidian_session(session_id)
+  return (session_id or M.current_session) == obsidian_session_id()
+end
+
+function M.is_protected_session(session_id)
+  return M.is_obsidian_session(session_id)
+end
+
+function M.is_read_only_session(session_id)
+  return M.is_obsidian_session(session_id)
+end
+
+local function ensure_static_sessions()
+  local sid = obsidian_session_id()
+  M.sessions[sid] = vim.tbl_deep_extend("force", M.sessions[sid] or {}, {
+    name = sid,
+    agent = "vault",
+    created = 0,
+    seq = -1,
+    protected = true,
+    virtual = true,
+    read_only = true,
+  })
+end
 
 local function store_path(session_id)
   local base = vim.fn.stdpath("data") .. "/exocortex/" .. vim.fn.sha256(M.root_dir)
@@ -38,6 +74,7 @@ local function load_sessions_index()
   local file = io.open(sessions_index_path(), "r")
   if not file then
     M.sessions = {}
+    ensure_static_sessions()
     return
   end
 
@@ -49,6 +86,8 @@ local function load_sessions_index()
   else
     M.sessions = {}
   end
+
+  ensure_static_sessions()
 end
 
 local function save_sessions_index()
@@ -88,6 +127,16 @@ function M.load(root_dir, session_id)
   M.current_session = session_id or "default"
 
   load_sessions_index()
+
+  if M.is_obsidian_session(M.current_session) then
+    local ok, obsidian = pcall(require, "exocortex.obsidian")
+    local data = ok and obsidian.load_session_nodes() or { nodes = {}, order = {}, next_id = 1 }
+    M.nodes = data.nodes or {}
+    M.order = data.order or {}
+    M.next_id = data.next_id or (#M.order + 1)
+    M.loaded[M.current_session] = { nodes = M.nodes, order = M.order, next_id = M.next_id }
+    return
+  end
 
   if not M.sessions[M.current_session] then
     M.sessions[M.current_session] = { created = os.time(), seq = next_seq() }
@@ -136,7 +185,7 @@ end
 -- session is in front still writes to the correct file and cache.
 function M.save_session(session_id)
   session_id = session_id or M.current_session
-  if not session_id then
+  if not session_id or M.is_obsidian_session(session_id) then
     return
   end
 
@@ -185,10 +234,15 @@ function M.ref_name(node_id)
 end
 
 function M.delete_session(session_id)
+  if M.is_protected_session(session_id) then
+    return false, "protected session"
+  end
+
   os.remove(store_path(session_id))
   M.sessions[session_id] = nil
   M.loaded[session_id] = nil
   save_sessions_index()
+  return true
 end
 
 next_seq = function()
@@ -239,6 +293,10 @@ function M.switch_session(session_id)
 end
 
 function M.new_src_node()
+  if M.is_read_only_session() then
+    return nil, "read-only session"
+  end
+
   local id = "n" .. M.next_id
   M.next_id = M.next_id + 1
 
@@ -274,6 +332,10 @@ function M.has_only_src()
 end
 
 function M.new_node(parent_id, prompt, agent)
+  if M.is_read_only_session() then
+    return nil, "read-only session"
+  end
+
   local id = "n" .. M.next_id
   M.next_id = M.next_id + 1
 

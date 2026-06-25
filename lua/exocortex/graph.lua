@@ -4,14 +4,33 @@
 -- drawn with a double-line border and a highlight overlay.
 
 local state = require("exocortex.state")
+local config_loader = require("exocortex.config_loader")
+local keymaps = require("exocortex.keymaps")
 
 local M = {}
 
-local CARD_W = 36
+local BASE_CARD_W = 36
 local CARD_H = 4
-local HGAP = 6
-local VGAP = 1
+local BASE_HGAP = 6
+local BASE_VGAP = 1
 local SESSION_SIDEBAR_W = 28
+
+local function card_w()
+  return state.is_obsidian_session and state.is_obsidian_session() and 24 or BASE_CARD_W
+end
+
+local function hgap()
+  return state.is_obsidian_session and state.is_obsidian_session() and 3 or BASE_HGAP
+end
+
+local function vgap()
+  return state.is_obsidian_session and state.is_obsidian_session() and 0 or BASE_VGAP
+end
+
+local function first_key(lhses)
+  if type(lhses) == "table" then return lhses[1] or "" end
+  return lhses or ""
+end
 
 local SPINNER = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧" }
 
@@ -23,8 +42,8 @@ M.return_tab = nil
 M.return_win = nil
 M.selected = nil
 M.layout = {} -- id -> { row, col, depth, lane } (1-based grid cells)
-M.bar_nodes = {}     -- "session:node_id" -> true (tracked for status bar this nvim session)
-M.bar_dismissed = {} -- "session:node_id" -> true (dismissed from bar after viewing)
+M.bar_nodes = {}
+M.bar_dismissed = {}
 
 function M.refresh_status_bar()
   pcall(vim.cmd, "redrawtabline")
@@ -36,6 +55,8 @@ local byte_index = {} -- per row: cell -> 0-based byte offset
 local spin_frame = 1
 local spin_timer = nil
 local flash_seq = 0
+
+M.unread = {} -- node id -> true when finished but not yet viewed
 
 -- ---------------------------------------------------------------------------
 -- Layout: column = depth, lane assignment by DFS. The first child inherits
@@ -301,24 +322,25 @@ local function draw_card(grid, node, rect, selected)
     local sha_hint = node.snapshot and node.snapshot:sub(1, 7)
       or (SPINNER[spin_frame] .. " snapshotting")
 
-    put(grid, rect.row,     rect.col, tl .. hz .. " " .. fit("◈ source", CARD_W - 6) .. " " .. hz .. tr)
-    put(grid, rect.row + 1, rect.col, vt .. " " .. fit(agent, CARD_W - 4) .. " " .. vt)
-    put(grid, rect.row + 2, rect.col, vt .. " " .. fit(timestamp .. "  " .. sha_hint, CARD_W - 4) .. " " .. vt)
-    put(grid, rect.row + 3, rect.col, bl .. string.rep(hz, CARD_W - 2) .. br)
+    put(grid, rect.row,     rect.col, tl .. hz .. " " .. fit("◈ source", card_w() - 6) .. " " .. hz .. tr)
+    put(grid, rect.row + 1, rect.col, vt .. " " .. fit(agent, card_w() - 4) .. " " .. vt)
+    put(grid, rect.row + 2, rect.col, vt .. " " .. fit(timestamp .. "  " .. sha_hint, card_w() - 4) .. " " .. vt)
+    put(grid, rect.row + 3, rect.col, bl .. string.rep(hz, card_w() - 2) .. br)
     return
   end
 
   local icon, detail = status_line(node)
-  put(grid, rect.row,     rect.col, tl .. hz .. " " .. fit(node.prompt, CARD_W - 6) .. " " .. hz .. tr)
-  put(grid, rect.row + 1, rect.col, vt .. " " .. fit((node.agent or "?") .. " · " .. icon, CARD_W - 4) .. " " .. vt)
-  put(grid, rect.row + 2, rect.col, vt .. " " .. fit(detail, CARD_W - 4) .. " " .. vt)
-  put(grid, rect.row + 3, rect.col, bl .. string.rep(hz, CARD_W - 2) .. br)
+  local badge = M.unread[node.id] and "●" or " "
+  put(grid, rect.row,     rect.col, tl .. hz .. " " .. fit(node.prompt, card_w() - 6) .. badge .. hz .. tr)
+  put(grid, rect.row + 1, rect.col, vt .. " " .. fit((node.agent or "?") .. " · " .. icon, card_w() - 4) .. " " .. vt)
+  put(grid, rect.row + 2, rect.col, vt .. " " .. fit(detail, card_w() - 4) .. " " .. vt)
+  put(grid, rect.row + 3, rect.col, bl .. string.rep(hz, card_w() - 2) .. br)
 end
 
 local function draw_edge(grid, parent_rect, child_rect)
   local from_row = parent_rect.row + 1
   local to_row = child_rect.row + 1
-  local from_col = parent_rect.col + CARD_W
+  local from_col = parent_rect.col + card_w()
   local to_col = child_rect.col - 1
 
   if from_row == to_row then
@@ -385,9 +407,9 @@ local function card_extmarks(id, rect)
   for r = rect.row, rect.row + CARD_H - 1 do
     local bidx = byte_index[r]
 
-    if bidx and bidx[rect.col] and bidx[rect.col + CARD_W] then
+    if bidx and bidx[rect.col] and bidx[rect.col + card_w()] then
       vim.api.nvim_buf_set_extmark(M.buf, ns, r - 1, bidx[rect.col], {
-        end_col = bidx[rect.col + CARD_W],
+        end_col = bidx[rect.col + card_w()],
         hl_group = base,
         priority = 100,
       })
@@ -398,9 +420,9 @@ local function card_extmarks(id, rect)
   local top = byte_index[rect.row]
   local title_hl = node.kind == "src" and "ExocortexSrcTitle" or "ExocortexTitle"
 
-  if top and top[rect.col + 3] and top[rect.col + CARD_W - 3] then
+  if top and top[rect.col + 3] and top[rect.col + card_w() - 3] then
     vim.api.nvim_buf_set_extmark(M.buf, ns, rect.row - 1, top[rect.col + 3], {
-      end_col = top[rect.col + CARD_W - 3],
+      end_col = top[rect.col + card_w() - 3],
       hl_group = title_hl,
       priority = 105,
     })
@@ -410,13 +432,26 @@ local function card_extmarks(id, rect)
     for r = rect.row, rect.row + CARD_H - 1 do
       local bidx = byte_index[r]
 
-      if bidx and bidx[rect.col] and bidx[rect.col + CARD_W] then
+      if bidx and bidx[rect.col] and bidx[rect.col + card_w()] then
         vim.api.nvim_buf_set_extmark(M.buf, ns, r - 1, bidx[rect.col], {
-          end_col = bidx[rect.col + CARD_W],
+          end_col = bidx[rect.col + card_w()],
           hl_group = "ExocortexSelected",
           priority = 110,
         })
       end
+    end
+  end
+
+  -- unread badge: highlight the ● on the top border (cell rect.col + card_w() - 3)
+  if M.unread[id] and node.kind ~= "src" then
+    local badge_cell = rect.col + card_w() - 3
+    local bidx = byte_index[rect.row]
+    if bidx and bidx[badge_cell] and bidx[badge_cell + 1] then
+      vim.api.nvim_buf_set_extmark(M.buf, ns, rect.row - 1, bidx[badge_cell], {
+        end_col = bidx[badge_cell + 1],
+        hl_group = "ExocortexUnread",
+        priority = 120,
+      })
     end
   end
 end
@@ -438,8 +473,8 @@ function M.render()
 
   for id, p in pairs(placed) do
     M.layout[id] = {
-      row = p.lane * (CARD_H + VGAP) + 1,
-      col = p.depth * (CARD_W + HGAP) + 1,
+      row = p.lane * (CARD_H + vgap()) + 1,
+      col = p.depth * (card_w() + hgap()) + 1,
       depth = p.depth,
       lane = p.lane,
     }
@@ -448,10 +483,11 @@ function M.render()
   local lines
 
   if state.is_empty() then
-    lines = { "", "  no nodes yet — press p to send the first prompt, g? for help", "" }
+    local graph_keys = config_loader.keys("graph")
+    lines = { "", string.format("  no nodes yet - press %s to send the first prompt, %s for help", first_key(graph_keys.prompt_branch), first_key(graph_keys.help)), "" }
     byte_index = {}
   else
-    local grid = blank_grid((max_lane + 1) * (CARD_H + VGAP), (max_depth + 1) * (CARD_W + HGAP))
+    local grid = blank_grid((max_lane + 1) * (CARD_H + vgap()), (max_depth + 1) * (card_w() + hgap()))
 
     for id, rect in pairs(M.layout) do
       local node = state.nodes[id]
@@ -509,6 +545,13 @@ local function cursor_to(id)
 
   if bidx and bidx[rect.col + 2] then
     vim.api.nvim_win_set_cursor(win, { rect.row + 1, bidx[rect.col + 2] })
+  end
+end
+
+function M.mark_read(id)
+  if M.unread[id] then
+    M.unread[id] = nil
+    M.render()
   end
 end
 
@@ -612,7 +655,7 @@ function M.node_at_cursor()
   end
 
   for id, rect in pairs(M.layout) do
-    if pos[1] >= rect.row and pos[1] < rect.row + CARD_H and cell >= rect.col and cell < rect.col + CARD_W then
+    if pos[1] >= rect.row and pos[1] < rect.row + CARD_H and cell >= rect.col and cell < rect.col + card_w() then
       return id
     end
   end
@@ -635,7 +678,7 @@ function M.screen_rect(id)
     return nil
   end
 
-  return { row = pos.row - 1, col = pos.col - 1, width = CARD_W, height = CARD_H }
+  return { row = pos.row - 1, col = pos.col - 1, width = card_w(), height = CARD_H }
 end
 
 local function any_running()
@@ -649,8 +692,12 @@ local function any_running()
 end
 
 local function session_winbar()
-  local agent = state.session_agent() or "—"
-  return "  [" .. agent .. "]  %=  ↵ view  r read  p prompt  d diff  a agent  Ctrl+T new session  PgDn/PgUp switch  g? help  q quit  "
+  local keys = config_loader.keys("graph")
+  local agent = state.session_agent() or "-"
+  return string.format("  [%s]  %%=  %s view  %s read  %s prompt  %s diff  %s agent  %s new session  %s/%s switch  %s help  %s quit  ",
+    agent, first_key(keys.view), first_key(keys.read), first_key(keys.prompt_branch), first_key(keys.review_diffs),
+    first_key(keys.choose_agent), first_key(keys.new_session), first_key(keys.next_session), first_key(keys.previous_session),
+    first_key(keys.help), first_key(keys.close))
 end
 
 local function current_session_index()
@@ -761,16 +808,15 @@ function M.session_changed(what)
   local last = state.order[#state.order]
   if last then M.select(last) end
 
-  -- A session can have an agent still running in the background; resume the
-  -- spinner so its card keeps animating now that it's in front again.
-  if any_running() then
-    M.start_spinner()
-  end
-
   vim.notify("exocortex: " .. what .. " " .. state.current_session, vim.log.levels.INFO)
 end
 
 local function cycle_session(step)
+  if any_running() then
+    vim.notify("exocortex: wait for running nodes before switching sessions", vim.log.levels.WARN)
+    return
+  end
+
   local sessions = state.list_sessions()
 
   if #sessions < 2 then
@@ -801,6 +847,11 @@ function M.prev_session()
 end
 
 function M.create_new_session()
+  if any_running() then
+    vim.notify("exocortex: wait for running nodes before switching sessions", vim.log.levels.WARN)
+    return
+  end
+
   require("exocortex").new_session()
 end
 
@@ -832,7 +883,6 @@ function M.start_spinner()
         t:close()
       end
       M.render()
-      ensure_session_sidebar()
       render_sessions()
       return
     end
@@ -879,39 +929,45 @@ function M.return_to_code()
 end
 
 local function show_help()
+  local graph_keys = config_loader.keys("graph")
+  local session_keys = config_loader.keys("sessions")
+  local diff_keys = config_loader.keys("diff")
+  local function pair(a, b) return first_key(a) .. " / " .. first_key(b) end
   local lines = {
-    "  exocortex — talk to coding agents in a DAG",
+    "  exocortex - talk to coding agents in a DAG",
     "",
-    "  ── graph navigation ──────────────────────────────────────────────",
-    "  h / l          parent / child node",
-    "  j / k          node below / above",
-    "  <CR>           open node response as a float  (q close, <Esc> return to code)",
-    "  r              open node response as a full readable file  (q / <Esc> close buffer)",
-    "  d              review node's diffs  (opens diff viewer)",
-    "  D              open node in Diffview",
-    "  p              prompt from selected node  (branch)",
-    "  P              prompt from a fresh root",
-    "  a              choose agent for this session",
-    "  q              close graph",
-    "  <Esc>          return to code",
+    "  -- graph navigation ---------------------------------------------",
+    string.format("  %-18s parent / child node", pair(graph_keys.parent, graph_keys.child)),
+    string.format("  %-18s node below / above", pair(graph_keys.below, graph_keys.above)),
+    string.format("  %-18s open node response float", first_key(graph_keys.view)),
+    string.format("  %-18s open node response buffer", first_key(graph_keys.read)),
+    string.format("  %-18s review node diffs", first_key(graph_keys.review_diffs)),
+    string.format("  %-18s open node in Diffview", first_key(graph_keys.diffview)),
+    string.format("  %-18s prompt from selected node", first_key(graph_keys.prompt_branch)),
+    string.format("  %-18s prompt from a fresh root", first_key(graph_keys.prompt_root)),
+    string.format("  %-18s choose session agent", first_key(graph_keys.choose_agent)),
+    string.format("  %-18s redraw graph", first_key(graph_keys.redraw)),
+    string.format("  %-18s close graph", first_key(graph_keys.close)),
+    string.format("  %-18s return to code", first_key(graph_keys.return_to_code)),
     "",
-    "  ── sessions (shown in the left sidebar) ──────────────────────────",
-    "  PgDn           next session",
-    "  PgUp           previous session",
-    "  <C-t>          new session",
-    "  <C-w>          close session  (deletes its nodes)",
+    "  -- sessions -----------------------------------------------------",
+    string.format("  %-18s switch session", first_key(session_keys.switch)),
+    string.format("  %-18s next / previous session", pair(session_keys.next_session, session_keys.previous_session)),
+    string.format("  %-18s new session", first_key(session_keys.new_session)),
+    string.format("  %-18s close mutable session", first_key(session_keys.close_session)),
+    "  obsidian is read-only and cannot be deleted",
     "",
-    "  ── diff viewer ───────────────────────────────────────────────────",
-    "  a              accept focused proposal hunk",
-    "  s              skip focused proposal hunk",
-    "  u              undo accept/skip and show proposal again",
-    "  e              focus editable right side",
-    "  PgDn / PgUp    next / previous diff marker from cursor",
-    "  ] / [          next / previous changed file",
-    "  J / K          page down / up inside the file",
-    "  q              end review",
+    "  -- diff viewer --------------------------------------------------",
+    string.format("  %-18s accept focused proposal hunk", first_key(diff_keys.accept)),
+    string.format("  %-18s skip/reject focused proposal hunk", first_key(diff_keys.skip)),
+    string.format("  %-18s undo accept/skip", first_key(diff_keys.undo)),
+    string.format("  %-18s focus editable right side", first_key(diff_keys.edit_right)),
+    string.format("  %-18s next / previous diff", pair(diff_keys.next, diff_keys.previous)),
+    string.format("  %-18s next / previous changed file", pair(diff_keys.next_file, diff_keys.previous_file)),
+    string.format("  %-18s page down / up inside file", pair(diff_keys.page_down, diff_keys.page_up)),
+    string.format("  %-18s end review", first_key(diff_keys.close)),
     "",
-    "  Agents run in isolated git worktrees; snapshots are proposals stored as git refs.",
+    "  Agents run in isolated git worktrees. Snapshots are proposals stored as git refs.",
     "  Real files change only when you accept hunks or edit the right pane.",
   }
 
@@ -938,7 +994,7 @@ local function show_help()
     title_pos = "center",
   })
 
-  for _, lhs in ipairs({ "q", "<Esc>", "g?" }) do
+  for _, lhs in ipairs(keymaps.flatten({ graph_keys.close, graph_keys.return_to_code, graph_keys.help, session_keys.close, session_keys.return_to_code })) do
     vim.keymap.set("n", lhs, function()
       if vim.api.nvim_win_is_valid(win) then
         vim.api.nvim_win_close(win, true)
@@ -949,16 +1005,18 @@ end
 
 local function set_keymaps(buf)
   local function map(lhs, fn, desc)
-    vim.keymap.set("n", lhs, fn, { buffer = buf, silent = true, nowait = true, desc = desc })
+    keymaps.set("n", lhs, fn, { buffer = buf, silent = true, nowait = true, desc = desc })
   end
 
-  map("h", function() M.move("left") end, "Parent node")
-  map("l", function() M.move("right") end, "Child node")
-  map("j", function() M.move("down") end, "Node below")
-  map("k", function() M.move("up") end, "Node above")
-  map("<Tab>", function() M.move("right") end, "Child node")
-  map("<S-Tab>", function() M.move("left") end, "Parent node")
-  map("<LeftRelease>", function()
+  local keys = config_loader.keys("graph")
+
+  map(keys.parent, function() M.move("left") end, "Parent node")
+  map(keys.child, function() M.move("right") end, "Child node")
+  map(keys.below, function() M.move("down") end, "Node below")
+  map(keys.above, function() M.move("up") end, "Node above")
+  map(keys.child_alt, function() M.move("right") end, "Child node")
+  map(keys.parent_alt, function() M.move("left") end, "Parent node")
+  map(keys.select_mouse, function()
     local id = M.node_at_cursor()
 
     if id then
@@ -966,36 +1024,29 @@ local function set_keymaps(buf)
     end
   end, "Select node under mouse")
 
-  map("<CR>", function() require("exocortex").view_selected() end, "View node text")
-  map("r", function() require("exocortex").read_selected() end, "Read node response as file")
-  map("d", function() require("exocortex").review_selected() end, "Review node diffs")
-  map("D", function() require("exocortex").diffview_selected() end, "Open node in Diffview")
-  map("p", function() require("exocortex").prompt(M.selected) end, "Prompt from selected node")
-  map("P", function() require("exocortex").prompt(nil) end, "Prompt from a fresh root")
-  map("a", function() require("exocortex").choose_agent() end, "Choose agent")
-  map("<PageDown>", M.next_session, "Next session")
-  map("<PageUp>", M.prev_session, "Previous session")
-  map("<C-t>", M.create_new_session, "Create new session")
-  map("<C-w>", function() require("exocortex").close_session() end, "Close session")
-  map("R", M.render, "Redraw graph")
-  map("g?", show_help, "Help")
-  map("<Esc>", function() M.return_to_code() end, "Return to code")
-  map("q", close_graph_tab, "Close graph")
-  map("ZZ", close_graph_tab, "Close graph")
-  map("ZQ", close_graph_tab, "Close graph")
-
-  -- Swallow unmapped edit-mode entry keys so the nomodifiable buffer never
-  -- shows E21. The user shouldn't be inserting text here anyway.
-  local noop = function() end
-  for _, lhs in ipairs({ "i", "I", "gi", "A", "o", "O", "s", "S", "c", "C", "x", "X", "~", "J" }) do
-    map(lhs, noop, "")
-  end
+  map(keys.view, function() require("exocortex").view_selected() end, "View node text")
+  map(keys.read, function() require("exocortex").read_selected() end, "Read node response as file")
+  map(keys.review_diffs, function() require("exocortex").review_selected() end, "Review node diffs")
+  map(keys.diffview, function() require("exocortex").diffview_selected() end, "Open node in Diffview")
+  map(keys.prompt_branch, function() require("exocortex").prompt(M.selected) end, "Prompt from selected node")
+  map(keys.prompt_root, function() require("exocortex").prompt(nil) end, "Prompt from a fresh root")
+  map(keys.choose_agent, function() require("exocortex").choose_agent() end, "Choose agent")
+  map(keys.next_session, M.next_session, "Next session")
+  map(keys.previous_session, M.prev_session, "Previous session")
+  map(keys.new_session, M.create_new_session, "Create new session")
+  map(keys.close_session, function() require("exocortex").close_session() end, "Close session")
+  map(keys.redraw, M.render, "Redraw graph")
+  map(keys.help, show_help, "Help")
+  map(keys.return_to_code, function() M.return_to_code() end, "Return to code")
+  map(keys.close, close_graph_tab, "Close graph")
 end
 
 local function set_session_keymaps(buf)
   local function map(lhs, fn, desc)
-    vim.keymap.set("n", lhs, fn, { buffer = buf, silent = true, nowait = true, desc = desc })
+    keymaps.set("n", lhs, fn, { buffer = buf, silent = true, nowait = true, desc = desc })
   end
+
+  local keys = config_loader.keys("sessions")
 
   local function session_under_cursor()
     local line = vim.api.nvim_win_get_cursor(0)[1]
@@ -1004,7 +1055,7 @@ local function set_session_keymaps(buf)
     return sessions[index]
   end
 
-  map("<CR>", function()
+  map(keys.switch, function()
     local session_id = session_under_cursor()
     if session_id and session_id ~= state.current_session then
       if state.switch_session(session_id) then
@@ -1017,41 +1068,21 @@ local function set_session_keymaps(buf)
       vim.api.nvim_set_current_win(win)
     end
   end, "Switch session")
-  map("<PageDown>", M.next_session, "Next session")
-  map("<PageUp>", M.prev_session, "Previous session")
-  map("<C-t>", M.create_new_session, "Create new session")
-  map("<C-w>", function() require("exocortex").close_session() end, "Close session")
-  map("g?", show_help, "Help")
-  map("q", close_graph_tab, "Close graph")
-  map("<Esc>", function() M.return_to_code() end, "Return to code")
-  map("ZZ", close_graph_tab, "Close graph")
-  map("ZQ", close_graph_tab, "Close graph")
-
-  local noop = function() end
-  for _, lhs in ipairs({ "i", "I", "gi", "A", "o", "O", "s", "S", "c", "C", "x", "X", "~", "J" }) do
-    map(lhs, noop, "")
-  end
+  map(keys.next_session, M.next_session, "Next session")
+  map(keys.previous_session, M.prev_session, "Previous session")
+  map(keys.new_session, M.create_new_session, "Create new session")
+  map(keys.close_session, function() require("exocortex").close_session() end, "Close session")
+  map(keys.help, show_help, "Help")
+  map(keys.close, close_graph_tab, "Close graph")
+  map(keys.return_to_code, function() M.return_to_code() end, "Return to code")
 end
 
 function M.open()
   M.remember_return_location()
 
-  -- Search across all tabpages so repeated <C-a>i doesn't spawn extra graph tabs.
-  local existing_win
-  if M.buf and vim.api.nvim_buf_is_valid(M.buf) then
-    for _, win in ipairs(vim.fn.win_findbuf(M.buf)) do
-      if vim.api.nvim_win_is_valid(win) then
-        existing_win = win
-        break
-      end
-    end
-  end
+  local existing_win = M.buf and vim.api.nvim_buf_is_valid(M.buf) and vim.fn.bufwinid(M.buf) or -1
 
-  if existing_win then
-    local tab = vim.api.nvim_win_get_tabpage(existing_win)
-    if tab ~= vim.api.nvim_get_current_tabpage() then
-      vim.api.nvim_set_current_tabpage(tab)
-    end
+  if existing_win ~= -1 then
     M.graph_win = existing_win
     vim.api.nvim_set_current_win(existing_win)
     ensure_session_sidebar()
@@ -1135,17 +1166,5 @@ function M.restore_win(win)
   end
   M.render()
 end
-
-local augroup_tabline = vim.api.nvim_create_augroup("exocortex_graph_tabline", { clear = true })
-vim.api.nvim_create_autocmd({ "TabEnter", "BufEnter" }, {
-  group = augroup_tabline,
-  callback = function()
-    if vim.bo.filetype == "exocortex" or vim.bo.filetype == "exocortex-sessions" then
-      vim.o.showtabline = 0
-    else
-      vim.o.showtabline = 2
-    end
-  end,
-})
 
 return M

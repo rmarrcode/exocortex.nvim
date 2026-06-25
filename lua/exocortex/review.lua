@@ -16,22 +16,36 @@
 --   q             end review
 
 local git = require("exocortex.git")
+local config_loader = require("exocortex.config_loader")
+local keymaps = require("exocortex.keymaps")
 
 local M = {}
 
 M.session = nil
 
-local REVIEW_MAPS = { "a", "s", "u", "e", "n", "p", "]", "[", "J", "K", "f", "q", "l", "o" }
+local function review_maps()
+  return keymaps.flatten(config_loader.keys("diff"))
+end
+
+local function first_key(lhses)
+  if type(lhses) == "table" then return lhses[1] or "" end
+  return lhses or ""
+end
 
 local MARK_NS = vim.api.nvim_create_namespace("exocortex_review_marks")
 local TRACK_NS = vim.api.nvim_create_namespace("exocortex_review_tracks")
 
 vim.api.nvim_set_hl(0, "ExocortexDiffCurrent", { fg = "#ffcc00", bold = true, default = true })
-vim.api.nvim_set_hl(0, "ExocortexDiffPending", { fg = "#7aa2f7", default = true })
+vim.api.nvim_set_hl(0, "ExocortexDiffProposed", { fg = "#7aa2f7", default = true })
 vim.api.nvim_set_hl(0, "ExocortexDiffAccepted", { fg = "#73daca", default = true })
 vim.api.nvim_set_hl(0, "ExocortexDiffSkipped", { fg = "#8b919c", default = true })
 
-local GUIDE = "  a accept  s skip  u undo  e edit-right  │  n/p/l/o diff  │  J/K page  │  [/] file  │  f func  │  q quit  "
+local function guide()
+  local keys = config_loader.keys("diff")
+  return string.format("  %s accept  %s skip  %s undo  %s edit-right  |  %s/%s diff  |  %s/%s page  |  %s/%s file  |  %s func  |  %s quit  ",
+    first_key(keys.accept), first_key(keys.skip), first_key(keys.undo), first_key(keys.edit_right), first_key(keys.next), first_key(keys.previous),
+    first_key(keys.page_down), first_key(keys.page_up), first_key(keys.previous_file), first_key(keys.next_file), first_key(keys.function_to_top), first_key(keys.close))
+end
 
 local function valid_win(win)
   return win ~= nil and vim.api.nvim_win_is_valid(win)
@@ -71,21 +85,21 @@ end
 local function status_label(hunk)
   if not hunk then return "no diffs" end
   if hunk.status == "accepted" then return "accepted" end
-  if hunk.status == "skipped" then return "skipped" end
-  return "pending"
+  if hunk.status == "skipped" then return "skipped/rejected" end
+  return "proposed"
 end
 
 local function proposal_winbar(s)
   local f = s.files[s.index]
   local h = current_hunk(s)
   local target = h and string.format("proposal #%d/%d %s", h.index, #s.hunks, status_label(h)) or "no diffs"
-  return string.format("  [%d/%d]  %s  [%s]  %s  %%=%s", s.index, #s.files, f.path, f.status, target, GUIDE)
+  return string.format("  [%d/%d]  %s  [%s]  %s  %%=%s", s.index, #s.files, f.path, f.status, target, guide())
 end
 
 local function target_winbar(s)
   local h = current_hunk(s)
-  local target = h and string.format("target #%d/%d", h.index, #s.hunks) or "target"
-  return "  editable file  " .. target .. "  %=" .. GUIDE
+  local target = h and string.format("target #%d/%d %s", h.index, #s.hunks, status_label(h)) or "target"
+  return "  editable file  " .. target .. "  %=" .. guide()
 end
 
 local function open_node_diff(node)
@@ -253,7 +267,7 @@ local function compute_hunks(left_lines, right_lines)
         count = old_count,
         original = slice(left_lines, old_start, old_count),
         proposed = slice(right_lines, new_start, new_count),
-        status = "pending",
+        status = "proposed",
       }
     end
   end
@@ -349,7 +363,7 @@ local function marker_hl(hunk, current)
   if current then return "ExocortexDiffCurrent" end
   if hunk.status == "accepted" then return "ExocortexDiffAccepted" end
   if hunk.status == "skipped" then return "ExocortexDiffSkipped" end
-  return "ExocortexDiffPending"
+  return "ExocortexDiffProposed"
 end
 
 local function mark_hunks()
@@ -387,7 +401,7 @@ local function mark_hunks()
       local right_start0 = hunk_range(hunk)
       local right_row = display_row(s.right_buf, right_start0)
       vim.api.nvim_buf_set_extmark(s.right_buf, MARK_NS, right_row, 0, {
-        virt_text = { { string.format("  #%d/%d target", hunk.index, total), hl } },
+        virt_text = { { string.format("  #%d/%d target %s", hunk.index, total, status_label(hunk)), hl } },
         virt_text_pos = "eol",
         priority = current and 140 or 120,
       })
@@ -501,10 +515,10 @@ local function undo_current()
   if not hunk then return end
 
   if hunk.status == "accepted" then
-    replace_hunk(hunk, hunk.target_original or hunk.original, "pending", { allow_zero_length_restore = true })
+    replace_hunk(hunk, hunk.target_original or hunk.original, "proposed", { allow_zero_length_restore = true })
     hunk.target_original = nil
   else
-    hunk.status = "pending"
+    hunk.status = "proposed"
     select_hunk(hunk.index)
   end
 end
@@ -612,29 +626,31 @@ local function set_review_maps(buf)
   M.session.mapped_bufs[buf] = true
 
   local function map(lhs, fn, desc)
-    vim.keymap.set("n", lhs, fn, { buffer = buf, silent = true, nowait = true, desc = desc })
+    keymaps.set("n", lhs, fn, { buffer = buf, silent = true, nowait = true, desc = desc })
   end
 
-  map("a", accept_current, "Accept diff")
-  map("s", skip_current, "Skip diff")
-  map("u", undo_current, "Undo accept/skip")
-  map("e", edit_current, "Edit right side")
-  map("n", next_hunk, "Next diff")
-  map("p", prev_hunk, "Previous diff")
-  map("l", function() page_hunk(1) end, "Next diff")
-  map("o", function() page_hunk(-1) end, "Previous diff")
-  map("]", function() M.jump(1) end, "Next file")
-  map("[", function() M.jump(-1) end, "Previous file")
-  map("J", function() page_scroll(1) end, "Page down")
-  map("K", function() page_scroll(-1) end, "Page up")
-  map("f", function() function_to_top(vim.api.nvim_get_current_win()) end, "Put function at top")
-  map("q", M.stop, "End review")
+  local keys = config_loader.keys("diff")
+
+  map(keys.accept, accept_current, "Accept diff")
+  map(keys.skip, skip_current, "Skip diff")
+  map(keys.undo, undo_current, "Undo accept/skip")
+  map(keys.edit_right, edit_current, "Edit right side")
+  map(keys.next, next_hunk, "Next diff")
+  map(keys.previous, prev_hunk, "Previous diff")
+  map(keys.next_from_cursor, function() page_hunk(1) end, "Next diff")
+  map(keys.previous_from_cursor, function() page_hunk(-1) end, "Previous diff")
+  map(keys.next_file, function() M.jump(1) end, "Next file")
+  map(keys.previous_file, function() M.jump(-1) end, "Previous file")
+  map(keys.page_down, function() page_scroll(1) end, "Page down")
+  map(keys.page_up, function() page_scroll(-1) end, "Page up")
+  map(keys.function_to_top, function() function_to_top(vim.api.nvim_get_current_win()) end, "Put function at top")
+  map(keys.close, M.stop, "End review")
 end
 
 local function clear_review_maps(mapped_bufs)
   for buf in pairs(mapped_bufs) do
     if vim.api.nvim_buf_is_valid(buf) then
-      for _, lhs in ipairs(REVIEW_MAPS) do
+      for _, lhs in ipairs(review_maps()) do
         pcall(vim.keymap.del, "n", lhs, { buffer = buf })
       end
     end
@@ -745,11 +761,12 @@ function M.show_file(index)
   local real_path = s.root .. "/" .. f.path
   vim.fn.mkdir(vim.fn.fnamemodify(real_path, ":h"), "p")
 
+  local file_state = s.file_states[f.path]
+  local proposal_lines = file_state and file_state.proposal_lines or git.file_at(s.root, s.node.snapshot, f.path)
+
   local proposal_buf = vim.api.nvim_create_buf(false, true)
   s.left_buf = proposal_buf
   pcall(vim.api.nvim_buf_set_name, proposal_buf, string.format("exocortex://%s/proposal/%s", s.node.id, f.path))
-
-  local proposal_lines = git.file_at(s.root, s.node.snapshot, f.path)
   vim.api.nvim_buf_set_lines(proposal_buf, 0, -1, false, proposal_lines)
 
   local ft = vim.filetype.match({ filename = f.path })
@@ -770,8 +787,15 @@ function M.show_file(index)
   set_review_maps(s.right_buf)
 
   local current_lines = vim.api.nvim_buf_get_lines(s.right_buf, 0, -1, false)
-  s.hunks = compute_hunks(current_lines, proposal_lines)
-  vim.notify(string.format("exocortex: %d proposal lines, %d current lines → %d hunks", #proposal_lines, #current_lines, #s.hunks), vim.log.levels.INFO)
+  if file_state then
+    s.hunks = file_state.hunks
+  else
+    s.hunks = compute_hunks(current_lines, proposal_lines)
+    file_state = { proposal_lines = proposal_lines, hunks = s.hunks }
+    s.file_states[f.path] = file_state
+  end
+
+  vim.notify(string.format("exocortex: %d proposal lines, %d current lines -> %d tracked hunks", #proposal_lines, #current_lines, #s.hunks), vim.log.levels.INFO)
   s.hunk_index = #s.hunks > 0 and 1 or 0
   place_tracks(s.right_buf, s.hunks)
 
@@ -837,6 +861,7 @@ function M.start(node, root)
     hunk_index = 1,
     return_tab = vim.api.nvim_get_current_tabpage(),
     mapped_bufs = {},
+    file_states = {},
   }
 
   M.show_file(1)
