@@ -57,7 +57,7 @@ local function build_markdown(node)
   add("---")
   add("exocortex_id: " .. node.id)
   add("session: " .. session)
-  add("agent: " .. (node.agent or "?"))
+  add("agent: " .. state.format_agent(node.agent, node.model))
   add("status: " .. (node.status or "?"))
   add("created: " .. os.date("%Y-%m-%d %H:%M:%S", node.created or os.time()))
   if node.snapshot then add("snapshot: " .. node.snapshot) end

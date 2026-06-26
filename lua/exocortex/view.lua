@@ -3,6 +3,7 @@
 
 local config_loader = require("exocortex.config_loader")
 local keymaps = require("exocortex.keymaps")
+local state = require("exocortex.state")
 
 local M = {}
 
@@ -46,7 +47,7 @@ end
 function M.open(node, from_rect, root_dir)
   local lines = { "# " .. (node.prompt or ""):gsub("\n", " "), "" }
 
-  table.insert(lines, string.format("_%s · %s · %s_", node.agent or "?", node.status, node.stat or ""))
+  table.insert(lines, string.format("_%s · %s · %s_", state.format_agent(node.agent, node.model), node.status, node.stat or ""))
   table.insert(lines, "")
 
   for _, line in ipairs(vim.split(node.response or "(no response yet)", "\n")) do

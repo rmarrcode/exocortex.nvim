@@ -671,30 +671,33 @@ function M.stop()
     end
   end
 
+  for _, win in ipairs({ s.left_win, s.right_win }) do
+    if valid_win(win) then
+      vim.api.nvim_win_call(win, function() vim.cmd("silent! diffoff") end)
+    end
+  end
+
+  -- close the review split and restore the original window to what it showed before
+  if valid_win(s.right_win) then
+    pcall(vim.api.nvim_win_close, s.right_win, true)
+  end
+
   if valid_win(s.left_win) then
-    vim.api.nvim_win_call(s.left_win, function()
-      vim.cmd("silent! diffoff")
-    end)
     pcall(function()
       vim.wo[s.left_win].winbar     = nil
       vim.wo[s.left_win].signcolumn = "auto"
       vim.wo[s.left_win].cursorline = false
     end)
+    if s.original_left_buf and vim.api.nvim_buf_is_valid(s.original_left_buf) then
+      pcall(vim.api.nvim_win_set_buf, s.left_win, s.original_left_buf)
+    end
   end
 
-  if valid_win(s.right_win) then
-    vim.api.nvim_win_call(s.right_win, function()
-      vim.cmd("silent! diffoff")
-    end)
-    pcall(function()
-      vim.wo[s.right_win].winbar     = nil
-      vim.wo[s.right_win].signcolumn = "auto"
-      vim.wo[s.right_win].cursorline = false
-    end)
-  end
-
-  if valid_win(s.left_win) then
-    pcall(vim.api.nvim_win_close, s.left_win, true)
+  -- delete buffers the review opened that the user didn't already have loaded
+  for buf in pairs(s.opened_bufs or {}) do
+    if vim.api.nvim_buf_is_valid(buf) and not vim.bo[buf].modified then
+      pcall(vim.api.nvim_buf_delete, buf, { force = false })
+    end
   end
 
   clear_review_maps(s.mapped_bufs)
@@ -761,6 +764,10 @@ function M.show_file(index)
   local real_path = s.root .. "/" .. f.path
   vim.fn.mkdir(vim.fn.fnamemodify(real_path, ":h"), "p")
 
+  if not s.original_left_buf then
+    s.original_left_buf = vim.api.nvim_win_get_buf(s.left_win)
+  end
+
   local file_state = s.file_states[f.path]
   local proposal_lines = file_state and file_state.proposal_lines or git.file_at(s.root, s.node.snapshot, f.path)
 
@@ -778,9 +785,13 @@ function M.show_file(index)
   vim.api.nvim_win_set_buf(s.left_win, proposal_buf)
   set_review_maps(proposal_buf)
 
+  local was_loaded = vim.fn.bufloaded(real_path) == 1
   vim.api.nvim_set_current_win(s.right_win)
   vim.cmd("edit " .. vim.fn.fnameescape(real_path))
   s.right_buf = vim.api.nvim_get_current_buf()
+  if not was_loaded then
+    s.opened_bufs[s.right_buf] = true
+  end
   vim.bo[s.right_buf].modifiable = true
   vim.bo[s.right_buf].readonly = false
   if ft then vim.bo[s.right_buf].filetype = ft end
@@ -804,7 +815,7 @@ function M.show_file(index)
   end
 
   for _, win in ipairs({ s.left_win, s.right_win }) do
-    vim.api.nvim_win_call(win, function() pcall(vim.cmd, "normal! zR") end)
+    vim.wo[win].foldlevel = 999
   end
 
   vim.wo[s.left_win].signcolumn = "yes:2"
@@ -862,6 +873,7 @@ function M.start(node, root)
     return_tab = vim.api.nvim_get_current_tabpage(),
     mapped_bufs = {},
     file_states = {},
+    opened_bufs = {},
   }
 
   M.show_file(1)

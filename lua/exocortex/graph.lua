@@ -317,7 +317,7 @@ local function draw_card(grid, node, rect, selected)
 
   if node.kind == "src" then
     local session_meta = state.sessions[node.session_id or state.current_session] or {}
-    local agent = node.session_agent or session_meta.agent or "no agent"
+    local agent = state.format_agent(node.session_agent or session_meta.agent, node.session_model or session_meta.model)
     local timestamp = os.date("%Y-%m-%d  %H:%M", node.created or 0)
     local sha_hint = node.snapshot and node.snapshot:sub(1, 7)
       or (SPINNER[spin_frame] .. " snapshotting")
@@ -332,7 +332,7 @@ local function draw_card(grid, node, rect, selected)
   local icon, detail = status_line(node)
   local badge = M.unread[node.id] and "●" or " "
   put(grid, rect.row,     rect.col, tl .. hz .. " " .. fit(node.prompt, card_w() - 6) .. badge .. hz .. tr)
-  put(grid, rect.row + 1, rect.col, vt .. " " .. fit((node.agent or "?") .. " · " .. icon, card_w() - 4) .. " " .. vt)
+  put(grid, rect.row + 1, rect.col, vt .. " " .. fit(state.format_agent(node.agent, node.model) .. " · " .. icon, card_w() - 4) .. " " .. vt)
   put(grid, rect.row + 2, rect.col, vt .. " " .. fit(detail, card_w() - 4) .. " " .. vt)
   put(grid, rect.row + 3, rect.col, bl .. string.rep(hz, card_w() - 2) .. br)
 end
@@ -549,10 +549,12 @@ local function cursor_to(id)
 end
 
 function M.mark_read(id)
-  if M.unread[id] then
-    M.unread[id] = nil
-    M.render()
-  end
+  local node = state.nodes[id]
+  local key = ((node and node.session_id) or "default") .. ":" .. id
+  M.unread[id] = nil
+  M.bar_dismissed[key] = true
+  M.refresh_status_bar()
+  M.render()
 end
 
 function M.select(id)
@@ -578,46 +580,39 @@ function M.move(dir)
   end
 
   if dir == "left" then
-    local node = state.nodes[M.selected]
-
-    if node and node.parent then
-      M.select(node.parent)
+    -- only move if there is a node at depth-1 in the same lane
+    for id, rect in pairs(M.layout) do
+      if rect.depth == cur.depth - 1 and rect.lane == cur.lane then
+        M.select(id)
+        return
+      end
     end
-
     return
   end
 
   if dir == "right" then
-    local best, best_dist
-
-    for _, kid in ipairs(state.children(M.selected)) do
-      local rect = M.layout[kid.id]
-      local dist = rect and math.abs(rect.lane - cur.lane) or math.huge
-
-      if not best or dist < best_dist then
-        best, best_dist = kid, dist
+    -- only move if there is a node at depth+1 in the same lane
+    for id, rect in pairs(M.layout) do
+      if rect.depth == cur.depth + 1 and rect.lane == cur.lane then
+        M.select(id)
+        return
       end
     end
-
-    if best then
-      M.select(best.id)
-    end
-
     return
   end
 
-  -- up/down: nearest lane in that direction, tie-break on depth distance
+  -- up/down: same depth column only, nearest lane in that direction
   local want_below = dir == "down"
-  local best_id, best_key
+  local best_id, best_dl
 
   for id, rect in pairs(M.layout) do
-    local dl = rect.lane - cur.lane
+    if rect.depth == cur.depth then
+      local dl = rect.lane - cur.lane
 
-    if (want_below and dl > 0) or (not want_below and dl < 0) then
-      local key = math.abs(dl) * 1000 + math.abs(rect.depth - cur.depth)
-
-      if not best_key or key < best_key then
-        best_id, best_key = id, key
+      if (want_below and dl > 0) or (not want_below and dl < 0) then
+        if not best_dl or math.abs(dl) < math.abs(best_dl) then
+          best_id, best_dl = id, dl
+        end
       end
     end
   end
@@ -681,19 +676,9 @@ function M.screen_rect(id)
   return { row = pos.row - 1, col = pos.col - 1, width = card_w(), height = CARD_H }
 end
 
-local function any_running()
-  for _, node in pairs(state.nodes) do
-    if node.status == "running" then
-      return true
-    end
-  end
-
-  return false
-end
-
 local function session_winbar()
   local keys = config_loader.keys("graph")
-  local agent = state.session_agent() or "-"
+  local agent = state.format_agent(state.session_agent(), state.session_model())
   return string.format("  [%s]  %%=  %s view  %s read  %s prompt  %s diff  %s agent  %s new session  %s/%s switch  %s help  %s quit  ",
     agent, first_key(keys.view), first_key(keys.read), first_key(keys.prompt_branch), first_key(keys.review_diffs),
     first_key(keys.choose_agent), first_key(keys.new_session), first_key(keys.next_session), first_key(keys.previous_session),
@@ -712,14 +697,11 @@ local function current_session_index()
   return 1, sessions
 end
 
-local function session_label(session_id, info, active, distance)
+local function session_label(session_id, info)
   local seq = info.seq and tostring(info.seq) or session_id:sub(-4)
   local name = info.name or ("Session " .. seq)
-  local agent = info.agent or "choose model"
-  local rel = active and 0 or math.abs(distance or 0)
-  local prefix = string.format("%2d", rel)
-  local label = vim.fn.strcharpart(name .. " [" .. agent .. "]", 0, SESSION_SIDEBAR_W - 8)
-  return string.format("%s %s", prefix, label)
+  local agent = state.format_agent(info.agent, info.model)
+  return vim.fn.strcharpart(name .. " [" .. agent .. "]", 0, SESSION_SIDEBAR_W - 1)
 end
 
 local function render_sessions()
@@ -732,7 +714,7 @@ local function render_sessions()
 
   for i, sid in ipairs(sessions) do
     local info = state.sessions[sid] or {}
-    lines[#lines + 1] = session_label(sid, info, i == index, i - index)
+    lines[#lines + 1] = session_label(sid, info)
   end
 
   vim.bo[M.session_buf].modifiable = true
@@ -812,11 +794,6 @@ function M.session_changed(what)
 end
 
 local function cycle_session(step)
-  if any_running() then
-    vim.notify("exocortex: wait for running nodes before switching sessions", vim.log.levels.WARN)
-    return
-  end
-
   local sessions = state.list_sessions()
 
   if #sessions < 2 then
@@ -847,11 +824,6 @@ function M.prev_session()
 end
 
 function M.create_new_session()
-  if any_running() then
-    vim.notify("exocortex: wait for running nodes before switching sessions", vim.log.levels.WARN)
-    return
-  end
-
   require("exocortex").new_session()
 end
 
@@ -1118,8 +1090,8 @@ function M.open()
 
   local win = vim.api.nvim_get_current_win()
   vim.wo[win].wrap = false
-  vim.wo[win].number = false
-  vim.wo[win].relativenumber = false
+  vim.wo[win].number = true
+  vim.wo[win].relativenumber = true
   vim.wo[win].signcolumn = "no"
   vim.wo[win].cursorline = false
   vim.wo[win].sidescrolloff = 8
@@ -1152,8 +1124,8 @@ function M.restore_win(win)
   M.graph_win = win
   vim.api.nvim_win_set_buf(win, M.buf)
   vim.wo[win].wrap = false
-  vim.wo[win].number = false
-  vim.wo[win].relativenumber = false
+  vim.wo[win].number = true
+  vim.wo[win].relativenumber = true
   vim.wo[win].signcolumn = "no"
   vim.wo[win].cursorline = false
   vim.wo[win].sidescrolloff = 8

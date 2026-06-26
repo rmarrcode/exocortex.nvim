@@ -1432,6 +1432,7 @@ end
 -- delete-previous-word. Normal-mode <C-w> closes the tab; ,tx also works.
 set_terminal_buffer_keymaps = function(buf)
   map_terminal_shortcut(buf, { "<C-t>" }, new_terminal_tab, "New terminal tab")
+  vim.keymap.set("t", "<Esc>", "<C-\\><C-n>", { buffer = buf, silent = true, desc = "Exit terminal mode" })
 end
 
 vim.keymap.set({ "n", "t" }, "<F4>", toggle_bottom_terminal, {

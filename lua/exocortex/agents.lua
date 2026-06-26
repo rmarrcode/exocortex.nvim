@@ -93,14 +93,20 @@ M.adapters = {
   claude = {
     exe = "claude",
     env = { CLAUDE_CODE_SUBPROCESS_ENV_SCRUB = "0" },
-    cmd = function(prompt)
-      return {
+    cmd = function(prompt, model)
+      local args = {
         "claude",
-        "-p", prompt,
         "--output-format", "stream-json",
         "--verbose",
         "--permission-mode", "bypassPermissions",
       }
+      if model and model ~= "" then
+        table.insert(args, "--model")
+        table.insert(args, model)
+      end
+      table.insert(args, "-p")
+      table.insert(args, prompt)
+      return args
     end,
     parse = function(stdout)
       local texts = {}
@@ -129,15 +135,20 @@ M.adapters = {
 
   codex = {
     exe = "codex",
-    cmd = function(prompt)
-      return {
+    cmd = function(prompt, model)
+      local args = {
         "codex",
         "exec",
         "--json",
         "--sandbox",
-        "workspace-write",
-        prompt,
+        "danger-full-access",
       }
+      if model and model ~= "" then
+        table.insert(args, "--model")
+        table.insert(args, model)
+      end
+      table.insert(args, prompt)
+      return args
     end,
     parse = function(stdout)
       local last
@@ -160,12 +171,18 @@ M.adapters = {
 
   antigravity = {
     exe = "agy",
-    cmd = function(prompt)
-      return {
+    cmd = function(prompt, model)
+      local args = {
         "agy",
-        "--print", prompt,
         "--dangerously-skip-permissions",
       }
+      if model and model ~= "" then
+        table.insert(args, "--model")
+        table.insert(args, model)
+      end
+      table.insert(args, "--print")
+      table.insert(args, prompt)
+      return args
     end,
     parse = function(stdout)
       return vim.trim(stdout)
@@ -178,18 +195,20 @@ M.adapters = {
   aider = {
     exe = "aider",
     model = "ollama/codellama",
-    cmd = function(prompt)
+    cmd = function(prompt, model)
       local args = {
         "aider",
-        "--message", prompt,
         "--yes",
         "--no-auto-commits",
         "--no-pretty",
       }
-      local model = M.adapters.aider.model
-      if model and model ~= "" then
-        vim.list_extend(args, { "--model", model })
+      local active_model = (model and model ~= "") and model or M.adapters.aider.model
+      if active_model and active_model ~= "" then
+        table.insert(args, "--model")
+        table.insert(args, active_model)
       end
+      table.insert(args, "--message")
+      table.insert(args, prompt)
       return args
     end,
     parse = function(stdout)
@@ -211,7 +230,7 @@ function M.available()
   return names
 end
 
-function M.run(name, prompt, cwd, on_done)
+function M.run(name, model, prompt, cwd, on_done)
   local adapter = M.adapters[name]
 
   if not adapter then
@@ -219,7 +238,7 @@ function M.run(name, prompt, cwd, on_done)
     return
   end
 
-  vim.system(adapter.cmd(prompt), { text = true, cwd = cwd, env = adapter.env }, function(result)
+  vim.system(adapter.cmd(prompt, model), { text = true, cwd = cwd, env = adapter.env }, function(result)
     vim.schedule(function()
       if result.code ~= 0 then
         local err = format_run_error(name, result.code, result.stdout or "", result.stderr or "")

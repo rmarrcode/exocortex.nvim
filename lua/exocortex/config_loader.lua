@@ -7,6 +7,7 @@ M.defaults = {
   },
   exocortex = {
     agent = nil,
+    model = nil,
     context_chars = 4000,
     terminal_lines = 50,
   },

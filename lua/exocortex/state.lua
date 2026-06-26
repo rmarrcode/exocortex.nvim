@@ -277,13 +277,6 @@ function M.new_session()
 end
 
 function M.switch_session(session_id)
-  for _, node in pairs(M.nodes) do
-    if node.status == "running" and node.kind ~= "src" then
-      vim.notify("exocortex: wait for running nodes before switching sessions", vim.log.levels.WARN)
-      return false
-    end
-  end
-
   if not M.sessions[session_id] then
     vim.notify("exocortex: session not found: " .. session_id, vim.log.levels.ERROR)
     return false
@@ -311,6 +304,7 @@ function M.new_src_node()
     created = os.time(),
     session_id = M.current_session,
     session_agent = session.agent,
+    session_model = session.model,
     root_dir = M.root_dir,
   }
 
@@ -339,11 +333,13 @@ function M.new_node(parent_id, prompt, agent)
   local id = "n" .. M.next_id
   M.next_id = M.next_id + 1
 
+  local session = M.sessions[M.current_session] or {}
   local node = {
     id = id,
     parent = parent_id,
     prompt = prompt,
     agent = agent,
+    model = session and session.model or nil,
     status = "running",
     created = os.time(),
     session_id = M.current_session,
@@ -405,6 +401,11 @@ function M.session_agent()
   return s and s.agent
 end
 
+function M.session_model()
+  local s = M.sessions[M.current_session]
+  return s and s.model
+end
+
 function M.set_session_agent(agent)
   local s = M.sessions[M.current_session]
   if not s and M.current_session then
@@ -416,6 +417,30 @@ function M.set_session_agent(agent)
     s.agent = agent
     save_sessions_index()
   end
+end
+
+function M.set_session_model(model)
+  local s = M.sessions[M.current_session]
+  if not s and M.current_session then
+    s = { created = os.time(), seq = next_seq() }
+    M.sessions[M.current_session] = s
+  end
+
+  if s then
+    s.model = model
+    save_sessions_index()
+  end
+end
+
+function M.format_agent(agent, model)
+  agent = agent or "?"
+  model = model or ""
+
+  if model ~= "" then
+    return agent .. "/" .. model
+  end
+
+  return agent
 end
 
 return M

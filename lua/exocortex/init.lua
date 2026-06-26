@@ -218,6 +218,7 @@ end
 function M.run_prompt(parent_id, prompt)
   local root = state.root_dir
   local agent = state.session_agent() or M.config.agent
+  local model = state.session_model() or M.config.model
 
   if not root then
     vim.notify("exocortex: open the graph first (:Exocortex)", vim.log.levels.ERROR)
@@ -240,8 +241,11 @@ function M.run_prompt(parent_id, prompt)
     if fallback then
       vim.notify("exocortex: saved agent " .. agent .. " is no longer supported; using " .. fallback, vim.log.levels.WARN)
       agent = fallback
+      model = nil
       M.config.agent = fallback
+      M.config.model = nil
       state.set_session_agent(fallback)
+      state.set_session_model(nil)
     else
       agent = nil
     end
@@ -294,7 +298,7 @@ function M.run_prompt(parent_id, prompt)
       save_node(node)
       render_if_current(node)
 
-      agents.run(agent, build_prompt(parent_id, prompt), worktree, function(response, agent_err)
+      agents.run(agent, model, build_prompt(parent_id, prompt), worktree, function(response, agent_err)
         if agent_err then
           git.worktree_remove_async(root, worktree)
           fail_node(node, agent_err)
@@ -338,6 +342,13 @@ end
 -- Commands invoked from the graph
 -- ---------------------------------------------------------------------------
 
+local function apply_session_choice(agent_name, model_name)
+  M.config.agent = agent_name
+  M.config.model = model_name
+  state.set_session_agent(agent_name)
+  state.set_session_model(model_name)
+end
+
 local function session_agent_choices()
   local available = {}
   for _, name in ipairs(agents.available()) do
@@ -345,13 +356,31 @@ local function session_agent_choices()
   end
 
   local names = {}
-  for _, name in ipairs({ "claude", "antigravity", "codex", "aider" }) do
+  for _, name in ipairs({ "codex", "claude", "antigravity", "aider" }) do
     if available[name] then
       table.insert(names, name)
     end
   end
 
   return names
+end
+
+local function prompt_for_session_model(agent_name, on_choice)
+  vim.ui.input({
+    prompt = "exocortex model for " .. agent_name .. " > ",
+    default = state.session_model() or M.config.model or "",
+  }, function(choice)
+    if choice == nil then
+      return
+    end
+
+    choice = vim.trim(choice)
+    if choice == "" then
+      choice = nil
+    end
+
+    on_choice(choice)
+  end)
 end
 
 local function prompt_for_session_agent(on_choice)
@@ -363,14 +392,18 @@ local function prompt_for_session_agent(on_choice)
   end
 
   vim.ui.select(names, {
-    prompt = "exocortex: choose model for this session",
+    prompt = "exocortex: choose agent for this session",
     format_item = function(name) return name end,
   }, function(choice)
     if choice then
-      M.config.agent = choice
-      state.set_session_agent(choice)
-      vim.notify("exocortex: agent set to " .. choice, vim.log.levels.INFO)
-      on_choice(choice)
+      prompt_for_session_model(choice, function(model)
+        apply_session_choice(choice, model)
+        local suffix = model and (" / " .. model) or ""
+        vim.notify("exocortex: agent set to " .. choice .. suffix, vim.log.levels.INFO)
+        if on_choice then
+          on_choice(choice, model)
+        end
+      end)
     end
   end)
 end
@@ -383,30 +416,32 @@ function M.prompt(parent_id)
 
   local hint = parent_id and (" from " .. parent_id) or " (new root)"
 
-  local function do_input(agent_name)
-    vim.ui.input({ prompt = "exocortex" .. hint .. " [" .. agent_name .. "] > " }, function(input)
+  local function do_input(agent_name, model_name)
+    local suffix = model_name and (" [" .. agent_name .. "/" .. model_name .. "]") or (" [" .. agent_name .. "]")
+    vim.ui.input({ prompt = "exocortex" .. hint .. suffix .. " > " }, function(input)
       if input and vim.trim(input) ~= "" then
-        M.config.agent = agent_name
-        state.set_session_agent(agent_name)
+        apply_session_choice(agent_name, model_name)
         M.run_prompt(parent_id, vim.trim(input))
       end
     end)
   end
 
-  local current = state.session_agent()
+  local current = state.session_agent() or M.config.agent
+  local current_model = state.session_model() or M.config.model
 
-  if (state.is_empty() or state.has_only_src()) and not current then
+  if not current then
     prompt_for_session_agent(do_input)
     return
   end
 
-  if current then
-    do_input(current)
+  if not current_model then
+    prompt_for_session_model(current, function(model)
+      do_input(current, model)
+    end)
     return
   end
 
-  local names = agents.available()
-  do_input(names[1] or M.config.agent or "?")
+  do_input(current, current_model)
 end
 
 local function selected_node()
@@ -517,7 +552,7 @@ local function is_workspace_win(win)
   end
 
   local bt = vim.bo[buf].buftype
-  return bt == "" or bt == "terminal"
+  return bt == ""
 end
 
 local function capture_workspace_tab(tab)
@@ -720,20 +755,7 @@ function M.close_session()
 end
 
 function M.choose_agent()
-  local names = session_agent_choices()
-
-  if #names == 0 then
-    vim.notify("exocortex: no agent CLI found on PATH", vim.log.levels.ERROR)
-    return
-  end
-
-  vim.ui.select(names, { prompt = "exocortex agent" }, function(choice)
-    if choice then
-      M.config.agent = choice
-      state.set_session_agent(choice)
-      vim.notify("exocortex: agent set to " .. choice, vim.log.levels.INFO)
-    end
-  end)
+  prompt_for_session_agent(function() end)
 end
 
 -- ---------------------------------------------------------------------------
