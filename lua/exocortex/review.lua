@@ -189,8 +189,7 @@ local function function_to_top(win)
   end
 
   local buf = vim.api.nvim_win_get_buf(win)
-  local orig_cursor = vim.api.nvim_win_get_cursor(win)
-  local row0 = orig_cursor[1] - 1
+  local row0 = vim.api.nvim_win_get_cursor(win)[1] - 1
   local start_row = function_start_row(buf, row0)
 
   if start_row == nil then
@@ -199,8 +198,7 @@ local function function_to_top(win)
   end
 
   pcall(vim.api.nvim_win_set_cursor, win, { start_row + 1, 0 })
-  vim.cmd("normal! zt")
-  pcall(vim.api.nvim_win_set_cursor, win, orig_cursor)
+  vim.api.nvim_win_call(win, function() vim.cmd("normal! zt") end)
 end
 
 local function make_target_editable(buf)

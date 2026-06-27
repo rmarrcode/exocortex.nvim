@@ -18,6 +18,28 @@ local function smoothstep(t)
   return t * t * (3 - 2 * t)
 end
 
+local MAX_CHANGED_FILES = 25
+
+local function changed_files_preview(files)
+  if not files or #files == 0 then
+    return nil
+  end
+
+  local lines = {}
+  local limit = math.min(#files, MAX_CHANGED_FILES)
+
+  for i = 1, limit do
+    local f = files[i]
+    lines[#lines + 1] = string.format("%d. `%s` %s", i, f.status or "?", f.path or "?")
+  end
+
+  if #files > limit then
+    lines[#lines + 1] = string.format("... and %d more files", #files - limit)
+  end
+
+  return lines
+end
+
 local function animate(win, from, to, duration_ms)
   local steps = 8
   local step = 0
@@ -58,8 +80,9 @@ function M.open(node, from_rect, root_dir)
     table.insert(lines, "")
     table.insert(lines, "## changed files")
 
-    for i, f in ipairs(node.files) do
-      table.insert(lines, string.format("%d. `%s` %s", i, f.status, f.path))
+    local preview = changed_files_preview(node.files)
+    if preview then
+      vim.list_extend(lines, preview)
     end
   end
 

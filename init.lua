@@ -336,6 +336,126 @@ require("nvim-tree").setup({
     enable = true,
     debounce_delay = 100,
   },
+  on_attach = function(bufnr)
+    local api = require("nvim-tree.api")
+    api.config.mappings.default_on_attach(bufnr)
+
+    local function opts(desc)
+      return { buffer = bufnr, noremap = true, silent = true, nowait = true, desc = "NvimTree: " .. desc }
+    end
+
+    -- d moves files here so they vanish from the sidebar; p moves them out.
+    local cut_dir   = nil  -- temp dir holding cut files
+    local cut_names = {}   -- basenames of files inside cut_dir
+    local using_cut = false
+
+    local function clear_cut()
+      if cut_dir and vim.fn.isdirectory(cut_dir) == 1 then
+        vim.fn.delete(cut_dir, "rf")
+      end
+      cut_dir   = nil
+      cut_names = {}
+      using_cut = false
+    end
+
+    local function each_selected(fn)
+      local mode = vim.fn.mode()
+      local start_row, end_row
+
+      if mode == "v" or mode == "V" then
+        start_row = math.min(vim.fn.line("v"), vim.fn.line("."))
+        end_row   = math.max(vim.fn.line("v"), vim.fn.line("."))
+        vim.cmd("normal! \27")
+      else
+        start_row = vim.fn.line(".")
+        end_row   = start_row
+      end
+
+      local saved = vim.api.nvim_win_get_cursor(0)
+      for row = start_row, end_row do
+        vim.api.nvim_win_set_cursor(0, { row, 0 })
+        local node = api.tree.get_node_under_cursor()
+        if node and node.absolute_path and node.absolute_path ~= "" then
+          fn(node)
+        end
+      end
+      vim.api.nvim_win_set_cursor(0, saved)
+    end
+
+    -- y: copy into nvim-tree clipboard (non-destructive, no temp dir)
+    pcall(vim.keymap.del, "n", "y", { buffer = bufnr })
+    vim.keymap.set({ "n", "v" }, "y", function()
+      clear_cut()
+      each_selected(function(_) api.fs.copy.node() end)
+    end, opts("Yank (copy) file(s)"))
+
+    -- d: physically move files to a temp dir so they disappear from the
+    --    sidebar immediately. p moves them to the destination; leaving the
+    --    sidebar without pasting permanently deletes the temp dir.
+    pcall(vim.keymap.del, "n", "d", { buffer = bufnr })
+    vim.keymap.set({ "n", "v" }, "d", function()
+      clear_cut()
+      cut_dir   = vim.fn.tempname()
+      cut_names = {}
+      using_cut = true
+      vim.fn.mkdir(cut_dir, "p")
+
+      each_selected(function(node)
+        local name = vim.fn.fnamemodify(node.absolute_path, ":t")
+        local dest = cut_dir .. "/" .. name
+        local i = 1
+        while vim.fn.filereadable(dest) == 1 or vim.fn.isdirectory(dest) == 1 do
+          dest = cut_dir .. "/" .. name .. "_" .. i
+          i    = i + 1
+        end
+        if vim.fn.rename(node.absolute_path, dest) == 0 then
+          table.insert(cut_names, vim.fn.fnamemodify(dest, ":t"))
+        end
+      end)
+
+      api.tree.reload()
+    end, opts("Cut (move/delete) file(s)"))
+
+    -- p: if d was used, move from temp dir to cursor's directory;
+    --    otherwise fall through to nvim-tree's normal paste (for y)
+    pcall(vim.keymap.del, "n", "p", { buffer = bufnr })
+    vim.keymap.set("n", "p", function()
+      if not using_cut then
+        api.fs.paste()
+        return
+      end
+
+      local node = api.tree.get_node_under_cursor()
+      local dest_dir
+      if node and node.absolute_path ~= "" then
+        local is_dir = node.type == "directory"
+          or (node.fs_stat and node.fs_stat.type == "directory")
+        dest_dir = is_dir and node.absolute_path
+          or vim.fn.fnamemodify(node.absolute_path, ":h")
+      end
+
+      if not dest_dir then
+        vim.notify("NvimTree: cannot determine paste destination", vim.log.levels.WARN)
+        return
+      end
+
+      for _, name in ipairs(cut_names) do
+        vim.fn.rename(cut_dir .. "/" .. name, dest_dir .. "/" .. name)
+      end
+
+      pcall(vim.fn.delete, cut_dir, "d") -- remove now-empty temp dir
+      cut_dir   = nil
+      cut_names = {}
+      using_cut = false
+      api.tree.reload()
+    end, opts("Paste file(s)"))
+
+    -- Leaving the sidebar: permanently delete anything still in the temp dir
+    vim.api.nvim_create_autocmd("BufLeave", {
+      buffer = bufnr,
+      callback = clear_cut,
+    })
+  end,
 })
 
 vim.keymap.set("n", "<C-e>", ":NvimTreeToggle<CR>", {
@@ -351,10 +471,16 @@ require("telescope").setup({
   defaults = {
     mappings = {
       i = {
+        ["<Esc>"] = require("telescope.actions").close,
         ["<C-g>"] = function(prompt_bufnr)
           local text = require("telescope.actions.state").get_current_line()
           require("telescope.actions").close(prompt_bufnr)
           require("telescope.builtin").live_grep({ default_text = text })
+        end,
+        ["<C-s>"] = function(prompt_bufnr)
+          local text = require("telescope.actions.state").get_current_line()
+          require("telescope.actions").close(prompt_bufnr)
+          require("telescope.builtin").lsp_dynamic_workspace_symbols({ default_text = text })
         end,
       },
     },

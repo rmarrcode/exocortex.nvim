@@ -542,9 +542,29 @@ local function cursor_to(id)
   end
 
   local bidx = byte_index[rect.row + 1]
+  if not (bidx and bidx[rect.col + 2]) then
+    return
+  end
 
-  if bidx and bidx[rect.col + 2] then
-    vim.api.nvim_win_set_cursor(win, { rect.row + 1, bidx[rect.col + 2] })
+  vim.api.nvim_win_set_cursor(win, { rect.row + 1, bidx[rect.col + 2] })
+
+  -- Ensure the full card is visible horizontally (leftcol is 0-based display columns)
+  local win_width = vim.api.nvim_win_get_width(win)
+  local card_left  = rect.col - 1             -- 0-based left display column of card
+  local card_right = rect.col + card_w() - 2  -- 0-based right display column of card
+
+  local view = vim.fn.winsaveview()
+  local lc = view.leftcol
+
+  if card_right >= lc + win_width then
+    lc = card_right - win_width + 4
+  end
+  if card_left < lc then
+    lc = math.max(0, card_left - 2)
+  end
+
+  if lc ~= view.leftcol then
+    vim.fn.winrestview({ leftcol = lc })
   end
 end
 

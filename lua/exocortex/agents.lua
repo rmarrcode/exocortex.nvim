@@ -136,6 +136,10 @@ M.adapters = {
   codex = {
     exe = "codex",
     cmd = function(prompt, model)
+      local model_id
+      if model and model ~= "" then
+        model_id = model:match("^([^|]+)")
+      end
       local args = {
         "codex",
         "exec",
@@ -143,10 +147,12 @@ M.adapters = {
         "--sandbox",
         "danger-full-access",
       }
-      if model and model ~= "" then
+      if model_id and model_id ~= "" then
         table.insert(args, "--model")
-        table.insert(args, model)
+        table.insert(args, model_id)
       end
+      -- Codex exec does not accept a reasoning-effort flag; session UIs may
+      -- still encode one, but we deliberately ignore it here.
       table.insert(args, prompt)
       return args
     end,
@@ -172,13 +178,22 @@ M.adapters = {
   antigravity = {
     exe = "agy",
     cmd = function(prompt, model)
+      local model_id, effort
+      if model and model ~= "" then
+        model_id, effort = model:match("^([^|]+)|?(.*)$")
+        if effort == "" then effort = nil end
+      end
       local args = {
         "agy",
         "--dangerously-skip-permissions",
       }
-      if model and model ~= "" then
+      if model_id and model_id ~= "" then
         table.insert(args, "--model")
-        table.insert(args, model)
+        table.insert(args, model_id)
+      end
+      if effort then
+        table.insert(args, "--reasoning-effort")
+        table.insert(args, effort)
       end
       table.insert(args, "--print")
       table.insert(args, prompt)

@@ -1,7 +1,7 @@
 -- exocortex: talk to coding agents in a DAG. Each node is one prompt/response
--- turn; branching from a node forks both the conversation and the file tree
--- (every node's resulting tree is a hidden git commit, and each run happens
--- in a throwaway git worktree materialized from the parent's snapshot).
+-- turn. Branching keeps the conversation path, while each run starts from a
+-- fresh snapshot of the live checkout and stores its proposal as a hidden git
+-- commit.
 
 local state = require("exocortex.state")
 local git = require("exocortex.git")
@@ -89,20 +89,44 @@ local function get_terminal_context()
   return table.concat(parts, "\n\n")
 end
 
+local function literal_pattern(text)
+  return (text or ""):gsub("(%W)", "%%%1")
+end
+
+local function sanitize_context_paths(text, proposal_root)
+  if not text or text == "" then return text end
+
+  local sanitized = text
+
+  if state.root_dir and state.root_dir ~= "" then
+    sanitized = sanitized:gsub(literal_pattern(state.root_dir), "<live-checkout-forbidden>")
+  end
+
+  if proposal_root and proposal_root ~= "" then
+    sanitized = sanitized:gsub(literal_pattern(proposal_root), "<proposal-worktree>")
+  end
+
+  return sanitized
+end
+
 -- ---------------------------------------------------------------------------
 -- Prompt running
 -- ---------------------------------------------------------------------------
 
 -- Agents are stateless across nodes in v1: branching replays the path-to-root
 -- transcript as context, which works identically for every CLI.
-local function build_prompt(parent_id, prompt)
+local function build_prompt(parent_id, prompt, proposal_root)
   local parts = {
-    "You are running in an isolated proposal worktree. Modify only files under the current working directory.",
-    "Do not edit files through absolute paths outside this worktree. The user will review and explicitly accept proposed hunks later.",
+    "You are running in an isolated proposal worktree.",
+    "The only writable project root is: " .. (proposal_root or "<current working directory>"),
+    "Use relative paths, or absolute paths under that proposal root only.",
+    "Never edit the original checkout path from terminal history or prior context.",
+    "The user will review and explicitly accept proposed hunks later.",
   }
 
   if parent_id then
     table.insert(parts, "You are continuing an existing conversation. Earlier turns, oldest first:")
+    table.insert(parts, "The code files come from the current checkout snapshot, not from an earlier node snapshot.")
 
     for _, node in ipairs(state.path_to_root(parent_id)) do
       if node.kind == "src" then goto continue_build end
@@ -124,7 +148,7 @@ local function build_prompt(parent_id, prompt)
     table.insert(parts, prompt)
   end
 
-  local term = get_terminal_context()
+  local term = sanitize_context_paths(get_terminal_context(), proposal_root)
   if term then
     table.insert(parts, "\n\n--- terminals (last " .. M.config.terminal_lines .. " lines each) ---\n" .. term)
   end
@@ -151,10 +175,14 @@ local function session_suffix(node)
   return ""
 end
 
-local function fail_node(node, err)
+local function fail_node(node, err, response)
   node.status = "error"
   node.stat = (err or "unknown error"):gsub("\n.*", ""):sub(1, 80)
-  node.response = err
+  if response and response ~= "" then
+    node.response = err .. "\n\n--- agent response ---\n" .. response
+  else
+    node.response = err
+  end
   save_node(node)
   render_if_current(node)
 
@@ -215,6 +243,62 @@ local function finish_worktree_snapshot(node, root, base, ref_name, response, wo
   end)
 end
 
+local function format_changed_file_summary(files)
+  if not files or #files == 0 then return "" end
+
+  local parts = {}
+  local limit = math.min(#files, 8)
+
+  for i = 1, limit do
+    local file = files[i]
+    parts[#parts + 1] = (file.status or "?") .. " " .. (file.path or "?")
+  end
+
+  if #files > limit then
+    parts[#parts + 1] = string.format("...and %d more", #files - limit)
+  end
+
+  return table.concat(parts, ", ")
+end
+
+local function guard_live_worktree(node, root, live_start_sha, response, on_clean)
+  node.stat = "checking live worktree"
+  save_node(node)
+  render_if_current(node)
+
+  git.snapshot_async(root, nil, function(live_sha, live_err)
+    if not live_sha then
+      fail_node(node, "live-worktree guard: " .. (live_err or "?"), response)
+      return
+    end
+
+    git.changed_files_async(root, live_start_sha, live_sha, function(files, files_err)
+      if files_err then
+        fail_node(node, "live-worktree guard diff: " .. files_err, response)
+        return
+      end
+
+      if files and #files > 0 then
+        node.workspace_snapshot = live_sha
+        node.live_start_snapshot = live_start_sha
+        node.workspace_files = files
+
+        local detail = format_changed_file_summary(files)
+        local message = "agent modified the live worktree outside the proposal"
+        if detail ~= "" then
+          message = message .. ": " .. detail
+        end
+        message = message .. ". The node was stopped so those changes are not mistaken for a reviewable proposal."
+
+        fail_node(node, message, response)
+        return
+      end
+
+      on_clean()
+    end)
+  end)
+end
+
 function M.run_prompt(parent_id, prompt)
   local root = state.root_dir
   local agent = state.session_agent() or M.config.agent
@@ -263,7 +347,7 @@ function M.run_prompt(parent_id, prompt)
     return
   end
 
-  if parent and parent.status ~= "done" then
+  if parent and parent.status == "running" then
     vim.notify("exocortex: wait for the parent node to finish", vim.log.levels.WARN)
     return
   end
@@ -275,15 +359,16 @@ function M.run_prompt(parent_id, prompt)
   end
 
   local ref_name = state.ref_name(node.id)
-  node.stat = parent and "preparing worktree" or "snapshotting base"
+  node.stat = "snapshotting current code"
   if graph.bar_nodes then
     graph.bar_nodes[(node.session_id or "default") .. ":" .. node.id] = true
   end
   graph.select(node.id)
   graph.start_spinner()
 
-  local function start_agent(base)
+  local function start_agent(base, live_start_sha)
     node.base = base
+    node.live_start_snapshot = live_start_sha
     node.stat = "preparing worktree"
     save_node(node)
     render_if_current(node)
@@ -298,43 +383,40 @@ function M.run_prompt(parent_id, prompt)
       save_node(node)
       render_if_current(node)
 
-      agents.run(agent, model, build_prompt(parent_id, prompt), worktree, function(response, agent_err)
+      agents.run(agent, model, build_prompt(parent_id, prompt, worktree), worktree, function(response, agent_err)
         if agent_err then
           git.worktree_remove_async(root, worktree)
           fail_node(node, agent_err)
           return
         end
 
-        node.stat = "saving snapshot"
-        save_node(node)
-        render_if_current(node)
+        guard_live_worktree(node, root, live_start_sha, response, function()
+          node.stat = "saving snapshot"
+          save_node(node)
+          render_if_current(node)
 
-        git.snapshot_async(worktree, base, function(sha, snap_err)
-          git.worktree_remove_async(root, worktree)
+          git.snapshot_async(worktree, base, function(sha, snap_err)
+            git.worktree_remove_async(root, worktree)
 
-          if not sha then
-            fail_node(node, "snapshot: " .. (snap_err or "?"))
-            return
-          end
+            if not sha then
+              fail_node(node, "snapshot: " .. (snap_err or "?"), response)
+              return
+            end
 
-          finish_worktree_snapshot(node, root, base, ref_name, response, sha)
+            finish_worktree_snapshot(node, root, base, ref_name, response, sha)
+          end)
         end)
       end)
     end)
   end
 
-  if parent then
-    start_agent(parent.snapshot)
-    return
-  end
-
-  git.snapshot_async(root, nil, function(base, base_err)
-    if not base then
-      fail_node(node, "snapshot: " .. (base_err or "?"))
+  git.snapshot_async(root, nil, function(live_start_sha, live_err)
+    if not live_start_sha then
+      fail_node(node, "snapshot: " .. (live_err or "?"))
       return
     end
 
-    start_agent(base)
+    start_agent(live_start_sha, live_start_sha)
   end)
 end
 
@@ -365,21 +447,81 @@ local function session_agent_choices()
   return names
 end
 
+-- Model lists match what each CLI shows in its own interactive picker.
+-- Effort levels are encoded into the model string as "model|effort" and
+-- split back out by each adapter's cmd() function.
+local AGENT_MODELS = {
+  claude = {
+    { id = nil,                  label = "Default (recommended)  Sonnet 4.6 · Efficient for routine tasks" },
+    { id = "claude-sonnet-4-6",  label = "Sonnet                Sonnet 4.6 · Efficient for routine tasks" },
+    { id = "claude-opus-4-8",    label = "Opus                  Opus 4.8 · Best for everyday, complex tasks" },
+    { id = "claude-haiku-4-5",   label = "Haiku                 Haiku 4.5 · Fastest for quick answers" },
+  },
+  codex = {
+    { id = "gpt-5.5",      label = "gpt-5.5 (default)   Frontier model for complex coding, research, and real-world work" },
+    { id = "gpt-5.4",      label = "gpt-5.4             Strong model for everyday coding" },
+    { id = "gpt-5.4-mini", label = "gpt-5.4-mini        Small, fast, and cost-efficient model for simpler coding tasks" },
+  },
+  antigravity = {
+    { id = "gpt-5.5",      label = "gpt-5.5 (default)   Frontier model for complex coding, research, and real-world work" },
+    { id = "gpt-5.4",      label = "gpt-5.4             Strong model for everyday coding" },
+    { id = "gpt-5.4-mini", label = "gpt-5.4-mini        Small, fast, and cost-efficient model for simpler coding tasks" },
+  },
+  aider = {
+    { id = nil,                label = "(default)" },
+    { id = "ollama/codellama", label = "codellama (local)" },
+    { id = "ollama/llama3.2",  label = "llama3.2 (local)" },
+  },
+}
+
+-- Agents whose models support a reasoning / effort level as a second step.
+local AGENT_EFFORTS = {
+  codex = nil,
+  antigravity = {
+    { id = "low",        label = "Low         Fast responses with lighter reasoning" },
+    { id = "medium",     label = "Medium      Balances speed and reasoning depth for everyday tasks (default)" },
+    { id = "high",       label = "High        Greater reasoning depth for complex problems" },
+    { id = "extra-high", label = "Extra high  Extra high reasoning depth for complex problems" },
+  },
+}
+
+local CUSTOM_LABEL = "other (type model id)..."
+
 local function prompt_for_session_model(agent_name, on_choice)
-  vim.ui.input({
-    prompt = "exocortex model for " .. agent_name .. " > ",
-    default = state.session_model() or M.config.model or "",
-  }, function(choice)
-    if choice == nil then
+  local options = AGENT_MODELS[agent_name] or {}
+  local items = vim.list_extend({ unpack(options) }, { { id = nil, label = CUSTOM_LABEL } })
+
+  vim.ui.select(items, {
+    prompt = "exocortex: model for " .. agent_name,
+    format_item = function(m) return m.label end,
+  }, function(model_choice)
+    if model_choice == nil then return end
+
+    if model_choice.label == CUSTOM_LABEL then
+      vim.ui.input({
+        prompt = "exocortex model id > ",
+        default = state.session_model() or M.config.model or "",
+      }, function(input)
+        if input == nil then return end
+        local m = vim.trim(input)
+        on_choice(m ~= "" and m or nil)
+      end)
       return
     end
 
-    choice = vim.trim(choice)
-    if choice == "" then
-      choice = nil
+    local efforts = AGENT_EFFORTS[agent_name]
+    if efforts and model_choice.id ~= nil then
+      vim.ui.select(efforts, {
+        prompt = "exocortex: reasoning level for " .. model_choice.id,
+        format_item = function(e) return e.label end,
+      }, function(effort_choice)
+        if effort_choice == nil then return end
+        -- Encode as "model|effort" so the adapter can split them apart.
+        on_choice(model_choice.id .. "|" .. effort_choice.id)
+      end)
+    else
+      on_choice(model_choice.id)
     end
-
-    on_choice(choice)
   end)
 end
 
@@ -695,6 +837,11 @@ function M.review_selected()
   local node = selected_node()
 
   if node then
+    if node.workspace_snapshot and not node.snapshot then
+      vim.notify("exocortex: live worktree was modified; use D to inspect the leaked diff, then restore or keep it manually", vim.log.levels.WARN)
+      return
+    end
+
     review.start(node, state.root_dir)
   end
 end
@@ -706,12 +853,18 @@ function M.diffview_selected()
     return
   end
 
-  if not (node.base and node.snapshot) then
+  local snapshot = node.snapshot
+  if not snapshot and node.workspace_snapshot then
+    snapshot = node.workspace_snapshot
+    vim.notify("exocortex: showing leaked live-worktree diff; changes already touched the real checkout", vim.log.levels.WARN)
+  end
+
+  if not (node.base and snapshot) then
     vim.notify("exocortex: node has no snapshot yet", vim.log.levels.WARN)
     return
   end
 
-  vim.cmd(string.format("DiffviewOpen %s..%s", node.base, node.snapshot))
+  vim.cmd(string.format("DiffviewOpen %s..%s", node.base, snapshot))
 end
 
 function M.close_session()
