@@ -6,6 +6,7 @@
 local state = require("exocortex.state")
 local config_loader = require("exocortex.config_loader")
 local keymaps = require("exocortex.keymaps")
+local usage = require("exocortex.usage")
 
 local M = {}
 
@@ -14,6 +15,7 @@ local CARD_H = 4
 local BASE_HGAP = 6
 local BASE_VGAP = 1
 local SESSION_SIDEBAR_W = 28
+local USAGE_WIDGET_H = 4
 
 local function card_w()
   return state.is_obsidian_session and state.is_obsidian_session() and 24 or BASE_CARD_W
@@ -36,8 +38,10 @@ local SPINNER = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧" }
 
 M.buf = nil
 M.session_buf = nil
+M.usage_buf = nil
 M.graph_win = nil
 M.session_win = nil
+M.usage_win = nil
 M.return_tab = nil
 M.return_win = nil
 M.selected = nil
@@ -46,6 +50,9 @@ M.bar_nodes = {}
 M.bar_dismissed = {}
 
 function M.refresh_status_bar()
+  if update_usage_widget then
+    pcall(update_usage_widget)
+  end
   pcall(vim.cmd, "redrawtabline")
 end
 
@@ -55,6 +62,7 @@ local byte_index = {} -- per row: cell -> 0-based byte offset
 local spin_frame = 1
 local spin_timer = nil
 local flash_seq = 0
+local update_usage_widget
 
 M.unread = {} -- node id -> true when finished but not yet viewed
 
@@ -515,6 +523,10 @@ function M.render()
       card_extmarks(id, rect)
     end
   end
+
+  if update_usage_widget then
+    pcall(update_usage_widget)
+  end
 end
 
 -- ---------------------------------------------------------------------------
@@ -724,6 +736,73 @@ local function session_label(session_id, info)
   return vim.fn.strcharpart(name .. " [" .. agent .. "]", 0, SESSION_SIDEBAR_W - 1)
 end
 
+local function usage_lines()
+  return usage.format()
+end
+
+update_usage_widget = function()
+  if not (M.session_win and vim.api.nvim_win_is_valid(M.session_win)) then
+    if M.usage_win and vim.api.nvim_win_is_valid(M.usage_win) then
+      pcall(vim.api.nvim_win_close, M.usage_win, true)
+    end
+    M.usage_win = nil
+    M.usage_buf = nil
+    return
+  end
+
+  if not (M.usage_buf and vim.api.nvim_buf_is_valid(M.usage_buf)) then
+    M.usage_buf = find_named_buf("exocortex://usage") or vim.api.nvim_create_buf(false, true)
+    if vim.api.nvim_buf_get_name(M.usage_buf) == "" then
+      vim.api.nvim_buf_set_name(M.usage_buf, "exocortex://usage")
+    end
+    vim.bo[M.usage_buf].swapfile = false
+    vim.bo[M.usage_buf].bufhidden = "wipe"
+    vim.bo[M.usage_buf].filetype = "exocortex-usage"
+  end
+
+  local lines = usage_lines()
+  vim.bo[M.usage_buf].modifiable = true
+  vim.api.nvim_buf_set_lines(M.usage_buf, 0, -1, false, lines)
+  vim.bo[M.usage_buf].modifiable = false
+
+  local width = math.max(18, vim.api.nvim_win_get_width(M.session_win))
+  local height = math.min(USAGE_WIDGET_H, math.max(2, vim.api.nvim_win_get_height(M.session_win)))
+  local row = math.max(0, vim.api.nvim_win_get_height(M.session_win) - height)
+  local opts = {
+    relative = "win",
+    win = M.session_win,
+    row = row,
+    col = 0,
+    width = width,
+    height = height,
+    style = "minimal",
+    border = "single",
+    title = " usage ",
+    title_pos = "center",
+    zindex = 50,
+    focusable = false,
+  }
+
+  if not (M.usage_win and vim.api.nvim_win_is_valid(M.usage_win)) then
+    M.usage_win = vim.api.nvim_open_win(M.usage_buf, false, opts)
+  else
+    pcall(vim.api.nvim_win_set_buf, M.usage_win, M.usage_buf)
+    pcall(vim.api.nvim_win_set_config, M.usage_win, opts)
+  end
+
+  if M.usage_win and vim.api.nvim_win_is_valid(M.usage_win) then
+    vim.wo[M.usage_win].wrap = false
+    vim.wo[M.usage_win].linebreak = false
+    vim.wo[M.usage_win].number = false
+    vim.wo[M.usage_win].relativenumber = false
+    vim.wo[M.usage_win].signcolumn = "no"
+    vim.wo[M.usage_win].cursorline = false
+    vim.wo[M.usage_win].winfixwidth = true
+    vim.wo[M.usage_win].winfixheight = true
+    vim.wo[M.usage_win].winhl = "NormalFloat:ExocortexUsageMuted,FloatBorder:ExocortexUsageMuted,FloatTitle:ExocortexUsageTitle"
+  end
+end
+
 local function render_sessions()
   if not (M.session_buf and vim.api.nvim_buf_is_valid(M.session_buf)) then
     return
@@ -752,6 +831,10 @@ local function render_sessions()
   if M.session_win and vim.api.nvim_win_is_valid(M.session_win) then
     local target = math.max(1, index)
     pcall(vim.api.nvim_win_set_cursor, M.session_win, { target, 0 })
+  end
+
+  if update_usage_widget then
+    pcall(update_usage_widget)
   end
 end
 
@@ -793,6 +876,9 @@ local function ensure_session_sidebar()
   vim.wo[M.session_win].winbar = nil
 
   render_sessions()
+  if update_usage_widget then
+    pcall(update_usage_widget)
+  end
   vim.api.nvim_set_current_win(graph)
 end
 
@@ -801,6 +887,9 @@ function M.session_changed(what)
   M.render()
   ensure_session_sidebar()
   render_sessions()
+  if update_usage_widget then
+    pcall(update_usage_widget)
+  end
 
   local win = graph_win()
   if win then
@@ -954,9 +1043,11 @@ local function show_help()
     string.format("  %-18s skip/reject focused proposal hunk", first_key(diff_keys.skip)),
     string.format("  %-18s undo accept/skip", first_key(diff_keys.undo)),
     string.format("  %-18s focus editable right side", first_key(diff_keys.edit_right)),
-    string.format("  %-18s next / previous diff", pair(diff_keys.next, diff_keys.previous)),
+    string.format("  %-18s next / previous focused diff", pair(diff_keys.next, diff_keys.previous)),
+    string.format("  %-18s next / previous diff from cursor", pair(diff_keys.next_from_cursor, diff_keys.previous_from_cursor)),
     string.format("  %-18s next / previous changed file", pair(diff_keys.next_file, diff_keys.previous_file)),
-    string.format("  %-18s page down / up inside file", pair(diff_keys.page_down, diff_keys.page_up)),
+    string.format("  %-18s next page / previous page inside file", pair(diff_keys.page_down, diff_keys.page_up)),
+    string.format("  %-18s put current function at top", first_key(diff_keys.function_to_top)),
     string.format("  %-18s end review", first_key(diff_keys.close)),
     "",
     "  Agents run in isolated git worktrees. Snapshots are proposals stored as git refs.",

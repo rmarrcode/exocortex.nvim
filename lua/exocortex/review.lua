@@ -2,18 +2,16 @@
 -- Right window = your current file (editable). Each proposed diff gets a
 -- stable # marker; the real file changes only when you accept a focused hunk.
 --
---   a             accept current diff hunk
---   s             skip current diff hunk
---   u             undo accept/skip and show the proposal again
---   e             focus the editable right side
---   PgDn / n      next diff hunk
---   PgUp / p      previous diff hunk
---   ]             next changed file
---   [             previous changed file
---   J             page down inside the file
---   K             page up inside the file
---   f             put the current function at the top of the window
---   q             end review
+--   Ctrl-a        accept current diff hunk
+--   Ctrl-s        skip current diff hunk
+--   Ctrl-u        undo accept/skip and show the proposal again
+--   Ctrl-e        focus the editable right side
+--   Ctrl-; / Ctrl-p next / previous focused diff hunk
+--   Ctrl-j/k      next / previous diff hunk from cursor position
+--   Ctrl-l / Ctrl-h next / previous changed file
+--   ] / [         page down / up inside the file
+--   Ctrl-t        put the current function at the top of the window
+--   Ctrl-q        end review
 
 local git = require("exocortex.git")
 local config_loader = require("exocortex.config_loader")
@@ -32,6 +30,30 @@ local function first_key(lhses)
   return lhses or ""
 end
 
+local function pretty_key(lhses)
+  local key = first_key(lhses)
+
+  return (key
+    :gsub("<M%-(.-)>", function(inner)
+      if #inner == 1 then
+        return "Alt+" .. inner:upper()
+      end
+      return "Alt+" .. inner
+    end)
+    :gsub("<C%-(.-)>", function(inner)
+      if #inner == 1 then
+        return "Ctrl+" .. inner:upper()
+      end
+      return "Ctrl+" .. inner
+    end)
+    :gsub("<PageDown>", "PgDn")
+    :gsub("<PageUp>", "PgUp")
+    :gsub("<Down>", "Down")
+    :gsub("<Up>", "Up")
+    :gsub("<Left>", "Left")
+    :gsub("<Right>", "Right"))
+end
+
 local MARK_NS = vim.api.nvim_create_namespace("exocortex_review_marks")
 local TRACK_NS = vim.api.nvim_create_namespace("exocortex_review_tracks")
 
@@ -42,9 +64,23 @@ vim.api.nvim_set_hl(0, "ExocortexDiffSkipped", { fg = "#8b919c", default = true 
 
 local function guide()
   local keys = config_loader.keys("diff")
-  return string.format("  %s accept  %s skip  %s undo  %s edit-right  |  %s/%s diff  |  %s/%s page  |  %s/%s file  |  %s func  |  %s quit  ",
-    first_key(keys.accept), first_key(keys.skip), first_key(keys.undo), first_key(keys.edit_right), first_key(keys.next), first_key(keys.previous),
-    first_key(keys.page_down), first_key(keys.page_up), first_key(keys.previous_file), first_key(keys.next_file), first_key(keys.function_to_top), first_key(keys.close))
+  return string.format(
+    "  review keys: %s accept  %s skip  %s undo  %s edit  |  %s/%s hunk  %s/%s from-cursor  |  %s/%s file  |  %s/%s page  |  %s top  |  %s close  ",
+    pretty_key(keys.accept),
+    pretty_key(keys.skip),
+    pretty_key(keys.undo),
+    pretty_key(keys.edit_right),
+    pretty_key(keys.previous),
+    pretty_key(keys.next),
+    pretty_key(keys.previous_from_cursor),
+    pretty_key(keys.next_from_cursor),
+    pretty_key(keys.previous_file),
+    pretty_key(keys.next_file),
+    pretty_key(keys.page_up),
+    pretty_key(keys.page_down),
+    pretty_key(keys.function_to_top),
+    pretty_key(keys.close)
+  )
 end
 
 local function valid_win(win)
@@ -615,9 +651,11 @@ end
 local function page_scroll(dir)
   local win = target_win_current()
   if not win then return end
-  vim.api.nvim_set_current_win(win)
+
   local key = dir > 0 and "<C-f>" or "<C-b>"
-  vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(key, true, false, true), "n", false)
+  vim.api.nvim_win_call(win, function()
+    vim.cmd.normal({ args = { key }, bang = true })
+  end)
 end
 
 local function set_review_maps(buf)

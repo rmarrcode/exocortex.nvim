@@ -19,6 +19,7 @@ M.config = vim.tbl_deep_extend("force", {
   agent = nil,
   context_chars = 4000,
   terminal_lines = 50,
+  copy_ignored_files = true,
 }, config_loader.load().exocortex or {})
 
 local function get_terminal_label(buf)
@@ -123,6 +124,11 @@ local function build_prompt(parent_id, prompt, proposal_root)
     "Never edit the original checkout path from terminal history or prior context.",
     "The user will review and explicitly accept proposed hunks later.",
   }
+
+  if M.config.copy_ignored_files ~= false then
+    table.insert(parts, "Gitignored files from the live checkout are selectively overlaid into this worktree before you run: small text-like files are copied at their normal relative paths, while large or binary ignored directories may instead contain `EXOCORTEX_IGNORED_INDEX.txt` summary files.")
+    table.insert(parts, "Treat copied gitignored files and generated ignored-directory summaries as read-only reference material unless the user explicitly asks to modify them; ignored-file edits are not part of proposal review.")
+  end
 
   if parent_id then
     table.insert(parts, "You are continuing an existing conversation. Earlier turns, oldest first:")
@@ -379,33 +385,54 @@ function M.run_prompt(parent_id, prompt)
         return
       end
 
-      node.stat = "running"
+      local function run_agent_in_worktree()
+        node.stat = "running"
+        save_node(node)
+        render_if_current(node)
+
+        agents.run(agent, model, build_prompt(parent_id, prompt, worktree), worktree, function(response, agent_err)
+          if agent_err then
+            git.worktree_remove_async(root, worktree)
+            fail_node(node, agent_err)
+            return
+          end
+
+          guard_live_worktree(node, root, live_start_sha, response, function()
+            node.stat = "saving snapshot"
+            save_node(node)
+            render_if_current(node)
+
+            git.snapshot_async(worktree, base, function(sha, snap_err)
+              git.worktree_remove_async(root, worktree)
+
+              if not sha then
+                fail_node(node, "snapshot: " .. (snap_err or "?"), response)
+                return
+              end
+
+              finish_worktree_snapshot(node, root, base, ref_name, response, sha)
+            end)
+          end)
+        end)
+      end
+
+      if M.config.copy_ignored_files == false then
+        run_agent_in_worktree()
+        return
+      end
+
+      node.stat = "copying ignored files"
       save_node(node)
       render_if_current(node)
 
-      agents.run(agent, model, build_prompt(parent_id, prompt, worktree), worktree, function(response, agent_err)
-        if agent_err then
+      git.copy_ignored_files_async(root, worktree, function(copied, copy_err)
+        if copied == nil then
           git.worktree_remove_async(root, worktree)
-          fail_node(node, agent_err)
+          fail_node(node, "ignored-file overlay: " .. (copy_err or "?"))
           return
         end
 
-        guard_live_worktree(node, root, live_start_sha, response, function()
-          node.stat = "saving snapshot"
-          save_node(node)
-          render_if_current(node)
-
-          git.snapshot_async(worktree, base, function(sha, snap_err)
-            git.worktree_remove_async(root, worktree)
-
-            if not sha then
-              fail_node(node, "snapshot: " .. (snap_err or "?"), response)
-              return
-            end
-
-            finish_worktree_snapshot(node, root, base, ref_name, response, sha)
-          end)
-        end)
+        run_agent_in_worktree()
       end)
     end)
   end
@@ -985,6 +1012,9 @@ local function set_highlights()
   vim.api.nvim_set_hl(0, "ExocortexSelected", { fg = "#ffffff", bg = "#264f78", bold = true })
   vim.api.nvim_set_hl(0, "ExocortexSession", { fg = "#8b919c", bg = "#1e1e1e" })
   vim.api.nvim_set_hl(0, "ExocortexSessionActive", { fg = "#ffffff", bg = "#264f78", bold = true })
+  vim.api.nvim_set_hl(0, "ExocortexUsageTitle", { fg = "#ffffff", bg = "#1e1e1e", bold = true })
+  vim.api.nvim_set_hl(0, "ExocortexUsageMuted", { fg = "#8b919c", bg = "#1e1e1e" })
+  vim.api.nvim_set_hl(0, "ExocortexUsageValue", { fg = "#dcdcaa", bg = "#1e1e1e", bold = true })
   vim.api.nvim_set_hl(0, "ExocortexFlash", { fg = "#1e1e1e", bg = "#ffcc00", bold = true })
   vim.api.nvim_set_hl(0, "ExocortexSrc", { fg = "#4ec9b0", bg = "#1f1f1f" })
   vim.api.nvim_set_hl(0, "ExocortexSrcTitle", { fg = "#4ec9b0", bg = "#1f1f1f", bold = true })

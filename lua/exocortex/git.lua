@@ -34,6 +34,44 @@ local function run_async(dir, args, env, on_done)
   end)
 end
 
+local function run_raw_async(dir, args, env, on_done)
+  local cmd = { "git", "-C", dir }
+  vim.list_extend(cmd, args)
+  on_done = on_done or function() end
+
+  vim.system(cmd, { text = true, env = env }, function(result)
+    vim.schedule(function()
+      if result.code ~= 0 then
+        on_done(nil, vim.trim(result.stderr ~= "" and result.stderr or (result.stdout or "git failed")))
+        return
+      end
+
+      on_done(result.stdout or "")
+    end)
+  end)
+end
+
+local function split_nul(out)
+  local items = {}
+  local start = 1
+
+  while start <= #(out or "") do
+    local finish = out:find(string.char(0), start, true)
+    if not finish then
+      local tail = out:sub(start)
+      if tail ~= "" then table.insert(items, tail) end
+      break
+    end
+
+    if finish > start then
+      table.insert(items, out:sub(start, finish - 1))
+    end
+    start = finish + 1
+  end
+
+  return items
+end
+
 function M.repo_root(dir)
   return run(dir or assert(vim.uv.cwd()), { "rev-parse", "--show-toplevel" })
 end
@@ -140,6 +178,264 @@ end
 
 function M.worktree_remove_async(root, dir, on_done)
   run_async(root, { "worktree", "remove", "--force", dir }, nil, on_done)
+end
+
+local OVERLAY_COPY_CHUNK = 200
+local OVERLAY_MAX_FILE_BYTES = 256 * 1024
+local OVERLAY_SUMMARY_NAME = "EXOCORTEX_IGNORED_INDEX.txt"
+local OVERLAY_SUMMARY_SAMPLE = 32
+
+local TEXT_EXTENSIONS = {
+  [".c"] = true,
+  [".cc"] = true,
+  [".cfg"] = true,
+  [".conf"] = true,
+  [".cpp"] = true,
+  [".csv"] = true,
+  [".env"] = true,
+  [".h"] = true,
+  [".hpp"] = true,
+  [".ini"] = true,
+  [".ipynb"] = true,
+  [".json"] = true,
+  [".jsonl"] = true,
+  [".log"] = true,
+  [".lua"] = true,
+  [".md"] = true,
+  [".out"] = true,
+  [".py"] = true,
+  [".pyi"] = true,
+  [".r"] = true,
+  [".rst"] = true,
+  [".sh"] = true,
+  [".sql"] = true,
+  [".text"] = true,
+  [".tex"] = true,
+  [".toml"] = true,
+  [".tsv"] = true,
+  [".txt"] = true,
+  [".xml"] = true,
+  [".yaml"] = true,
+  [".yml"] = true,
+}
+
+local BINARY_EXTENSIONS = {
+  [".7z"] = true,
+  [".bin"] = true,
+  [".bmp"] = true,
+  [".ckpt"] = true,
+  [".gif"] = true,
+  [".jpeg"] = true,
+  [".jpg"] = true,
+  [".mp3"] = true,
+  [".mp4"] = true,
+  [".npy"] = true,
+  [".npz"] = true,
+  [".onnx"] = true,
+  [".parquet"] = true,
+  [".pdf"] = true,
+  [".pickle"] = true,
+  [".png"] = true,
+  [".pt"] = true,
+  [".pth"] = true,
+  [".tar"] = true,
+  [".tif"] = true,
+  [".tiff"] = true,
+  [".wav"] = true,
+  [".webp"] = true,
+  [".zip"] = true,
+}
+
+local TEXT_FILENAMES = {
+  [".gitignore"] = true,
+  [".python-version"] = true,
+  ["LICENSE"] = true,
+  ["Makefile"] = true,
+  ["meta.yaml"] = true,
+  ["pyproject.toml"] = true,
+  ["requirements.txt"] = true,
+}
+
+local function basename(path)
+  return path:match("([^/]+)$") or path
+end
+
+local function dirname(path)
+  return path:match("^(.+)/[^/]+$") or ""
+end
+
+local function path_ext(path)
+  local ext = path:match("%.[^./]+$")
+  return ext and ext:lower() or nil
+end
+
+local function is_probably_text(path)
+  local name = basename(path)
+  if TEXT_FILENAMES[name] then
+    return true
+  end
+
+  local ext = path_ext(path)
+  if ext and BINARY_EXTENSIONS[ext] then
+    return false
+  end
+
+  return ext ~= nil and TEXT_EXTENSIONS[ext] or false
+end
+
+local function ensure_dir(path)
+  if path and path ~= "" then
+    vim.fn.mkdir(path, "p")
+  end
+end
+
+local function add_summary(summary_by_dir, path, reason)
+  local dir = dirname(path)
+  local entry = summary_by_dir[dir]
+
+  if not entry then
+    entry = { count = 0, samples = {}, reasons = {} }
+    summary_by_dir[dir] = entry
+  end
+
+  entry.count = entry.count + 1
+  entry.reasons[reason] = (entry.reasons[reason] or 0) + 1
+
+  if #entry.samples < OVERLAY_SUMMARY_SAMPLE then
+    table.insert(entry.samples, basename(path))
+  end
+end
+
+local function write_summary_files(dest, summary_by_dir)
+  local dirs = {}
+  for dir in pairs(summary_by_dir) do
+    table.insert(dirs, dir)
+  end
+  table.sort(dirs)
+
+  for _, dir in ipairs(dirs) do
+    local entry = summary_by_dir[dir]
+    local target_dir = dir ~= "" and (dest .. "/" .. dir) or dest
+    ensure_dir(target_dir)
+
+    local lines = {
+      "This ignored directory was only partially mirrored into the Exocortex proposal worktree.",
+      "Small text-like files were copied directly; large or binary entries were summarized instead.",
+      string.format("Skipped entries: %d", entry.count),
+      "",
+      "Reason counts:",
+    }
+
+    local reasons = {}
+    for reason in pairs(entry.reasons) do
+      table.insert(reasons, reason)
+    end
+    table.sort(reasons)
+
+    for _, reason in ipairs(reasons) do
+      table.insert(lines, string.format("- %s: %d", reason, entry.reasons[reason]))
+    end
+
+    if #entry.samples > 0 then
+      table.sort(entry.samples)
+      table.insert(lines, "")
+      table.insert(lines, "Sample skipped entries:")
+      for _, sample in ipairs(entry.samples) do
+        table.insert(lines, "- " .. sample)
+      end
+    end
+
+    local f, err = io.open(target_dir .. "/" .. OVERLAY_SUMMARY_NAME, "w")
+    if not f then
+      return nil, err or "failed to write ignored summary"
+    end
+
+    f:write(table.concat(lines, "\n"))
+    f:write("\n")
+    f:close()
+  end
+
+  return true
+end
+
+local function copy_ignored_chunk(root, dest, files, index, on_done)
+  if index > #files then
+    on_done(#files)
+    return
+  end
+
+  local args = { "cp", "-a", "--parents", "-t", dest, "--" }
+  local copied = 0
+
+  while index <= #files and copied < OVERLAY_COPY_CHUNK do
+    table.insert(args, files[index])
+    index = index + 1
+    copied = copied + 1
+  end
+
+  vim.system(args, { text = true, cwd = root }, function(result)
+    vim.schedule(function()
+      if result.code ~= 0 then
+        on_done(nil, vim.trim(result.stderr ~= "" and result.stderr or (result.stdout or "copy failed")))
+        return
+      end
+
+      copy_ignored_chunk(root, dest, files, index, on_done)
+    end)
+  end)
+end
+
+function M.copy_ignored_files_async(root, dest, on_done)
+  on_done = on_done or function() end
+  local uv = vim.uv or vim.loop
+
+  run_raw_async(root, { "ls-files", "--others", "--ignored", "--exclude-standard", "-z" }, nil, function(out, err)
+    if err then
+      on_done(nil, err)
+      return
+    end
+
+    local files = split_nul(out)
+    if #files == 0 then
+      on_done(0)
+      return
+    end
+
+    local copy_files = {}
+    local summary_by_dir = {}
+
+    for _, path in ipairs(files) do
+      local full = root .. "/" .. path
+      local stat = uv.fs_stat(full)
+      local parent = dirname(path)
+      if parent ~= "" then
+        ensure_dir(dest .. "/" .. parent)
+      end
+
+      if not stat or stat.type ~= "file" then
+        add_summary(summary_by_dir, path, "unreadable")
+      elseif stat.size > OVERLAY_MAX_FILE_BYTES then
+        add_summary(summary_by_dir, path, "large")
+      elseif not is_probably_text(path) then
+        add_summary(summary_by_dir, path, "binary-or-unknown")
+      else
+        table.insert(copy_files, path)
+      end
+    end
+
+    local ok, write_err = write_summary_files(dest, summary_by_dir)
+    if not ok then
+      on_done(nil, write_err)
+      return
+    end
+
+    if #copy_files == 0 then
+      on_done(0)
+      return
+    end
+
+    copy_ignored_chunk(root, dest, copy_files, 1, on_done)
+  end)
 end
 
 local function parse_changed_files(out)

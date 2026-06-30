@@ -26,6 +26,8 @@ To open the AI graph from terminal mode, use operation `keys.editor.terminal_ope
 
 The AI graph view shows Exocortex sessions in the left sidebar and proposal nodes in the main graph. Nodes are git-backed proposal snapshots. Real files change only through diff review accepts or direct edits in the right review pane.
 
+By default, gitignored files are selectively mirrored into each temporary proposal worktree for read-only context. Small text-like files such as `mlruns/meta.yaml` are copied directly, while large or binary ignored directories get visible `EXOCORTEX_IGNORED_INDEX.txt` summaries instead of full copies; set `exocortex.copy_ignored_files = false` to skip that overlay.
+
 The `obsidian` session is always present. It is read-only, cannot be deleted, and is built from notes in `OBSIDIAN_DIR`. Its graph uses narrower card spacing so more nodes fit on screen.
 
 To move to a parent node, use operation `keys.graph.parent`. It is currently set to `h`.
@@ -70,25 +72,27 @@ The session sidebar has its own operations under `keys.sessions`. Switching is c
 
 The diff review view compares a node proposal on the left with the real editable file on the right. Every hunk is labeled as `proposed`, `accepted`, or `skipped/rejected`. Hunk state is retained per file while the review session is active, so accepted or skipped hunks remain visible when you leave a file and return to it.
 
-To accept the focused hunk, use operation `keys.diff.accept`. It is currently set to `a`.
+To accept the focused hunk, use operation `keys.diff.accept`. It is currently set to `<C-a>`.
 
-To skip and reject the focused hunk, use operation `keys.diff.skip`. It is currently set to `s`.
+To skip and reject the focused hunk, use operation `keys.diff.skip`. It is currently set to `<C-s>`.
 
-To undo an accept or skip, use operation `keys.diff.undo`. It is currently set to `u`.
+To undo an accept or skip, use operation `keys.diff.undo`. It is currently set to `<C-u>`.
 
-To focus the editable right side, use operation `keys.diff.edit_right`. It is currently set to `e`.
+To focus the editable right side, use operation `keys.diff.edit_right`. It is currently set to `<C-e>`.
 
-To move to the next or previous hunk by index, use operations `keys.diff.next` and `keys.diff.previous`. They are currently set to `n` and `p`.
+To move to the next or previous focused hunk by index, use operations `keys.diff.next` and `keys.diff.previous`. They are currently set to `<C-;>` and `<C-p>`.
 
-To move to the next or previous hunk from the cursor location, use operations `keys.diff.next_from_cursor` and `keys.diff.previous_from_cursor`. They are currently set to `l` and `o`.
+To move to the next or previous hunk from the cursor location, use operations `keys.diff.next_from_cursor` and `keys.diff.previous_from_cursor`. They are currently set to `<C-j>` and `<C-k>`.
 
-To move to the next or previous changed file, use operations `keys.diff.next_file` and `keys.diff.previous_file`. They are currently set to `]` and `[`.
+To move to the next or previous changed file, use operations `keys.diff.next_file` and `keys.diff.previous_file`. They are currently set to `<C-l>` and `<C-h>`.
 
-To page inside the right file, use operations `keys.diff.page_down` and `keys.diff.page_up`. They are currently set to `J` and `K`.
+To page inside the right file, use operations `keys.diff.page_down` and `keys.diff.page_up`. They are currently set to `]` and `[`.
 
-To move the current function to the top of the window, use operation `keys.diff.function_to_top`. It is currently set to `f`.
+To move the current function to the top of the window, use operation `keys.diff.function_to_top`. It is currently set to `<C-t>`.
 
-To end review, use operation `keys.diff.close`. It is currently set to `q`.
+To end review, use operation `keys.diff.close`. It is currently set to `<C-q>`.
+
+
 
 ## Debug View
 

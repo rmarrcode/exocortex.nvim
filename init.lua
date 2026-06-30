@@ -489,6 +489,8 @@ require("telescope").setup({
 
 local builtin = require("telescope.builtin")
 
+local with_editor_window
+
 local function run_telescope(picker, opts)
   local ok, err = pcall(picker, opts or {})
 
@@ -517,14 +519,14 @@ local function project_search()
   })
 end
 
-vim.keymap.set("n", "<C-p>", project_search, {
+vim.keymap.set("n", "<C-p>", function() with_editor_window(project_search) end, {
   silent = true,
   desc = "Search project files",
 })
-vim.keymap.set("n", "<leader>ff", builtin.find_files)
-vim.keymap.set("n", "<leader>fg", builtin.live_grep)
-vim.keymap.set("n", "<leader>fb", builtin.buffers)
-vim.keymap.set("n", "<leader>fh", builtin.help_tags)
+vim.keymap.set("n", "<leader>ff", function() with_editor_window(function() builtin.find_files() end) end)
+vim.keymap.set("n", "<leader>fg", function() with_editor_window(function() builtin.live_grep() end) end)
+vim.keymap.set("n", "<leader>fb", function() with_editor_window(function() builtin.buffers() end) end)
+vim.keymap.set("n", "<leader>fh", function() with_editor_window(function() builtin.help_tags() end) end)
 
 -- ============================================================================
 -- LSP
@@ -854,6 +856,8 @@ local function leave_window_tab(win, buf)
   end
 end
 
+local move_file_buffer_out_of_terminal_window
+
 local function refresh_window_headers()
   for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
     render_window_header(win)
@@ -863,6 +867,13 @@ end
 vim.api.nvim_create_autocmd({ "BufEnter", "BufModifiedSet", "TermOpen", "VimEnter", "WinEnter" }, {
   group = augroup,
   callback = refresh_window_headers,
+})
+
+vim.api.nvim_create_autocmd({ "BufWinEnter", "WinEnter" }, {
+  group = augroup,
+  callback = function()
+    vim.schedule(move_file_buffer_out_of_terminal_window)
+  end,
 })
 
 vim.api.nvim_create_autocmd("WinClosed", {
@@ -933,7 +944,7 @@ local function find_editor_window()
   end
 end
 
-local function with_editor_window(fn)
+with_editor_window = function(fn)
   vim.schedule(function()
     if vim.api.nvim_get_mode().mode == "t" then
       vim.cmd("stopinsert")
@@ -1388,6 +1399,46 @@ local function show_current_terminal()
   configure_terminal_window(terminal_state.win)
   update_terminal_winbar()
   vim.cmd("startinsert")
+end
+
+move_file_buffer_out_of_terminal_window = function()
+  if not (terminal_state.win and vim.api.nvim_win_is_valid(terminal_state.win)) then
+    return
+  end
+
+  local win = terminal_state.win
+  local buf = vim.api.nvim_win_get_buf(win)
+
+  if not vim.api.nvim_buf_is_valid(buf) then
+    return
+  end
+
+  if vim.bo[buf].buftype == "terminal" or vim.bo[buf].filetype == "NvimTree" or (_empty_buf and buf == _empty_buf) then
+    return
+  end
+
+  local target_win = find_editor_window()
+
+  if not target_win or not vim.api.nvim_win_is_valid(target_win) or target_win == win then
+    vim.api.nvim_set_current_win(win)
+    vim.cmd("aboveleft split")
+    target_win = vim.api.nvim_get_current_win()
+  end
+
+  vim.api.nvim_win_set_buf(target_win, buf)
+  render_window_header(target_win)
+
+  local replacement = terminal_state.current and terminal_state.buffers[terminal_state.current] or nil
+  if replacement and replacement ~= buf and vim.api.nvim_buf_is_valid(replacement) then
+    set_terminal_buffer_keymaps(replacement)
+    vim.api.nvim_win_set_buf(win, replacement)
+  else
+    vim.api.nvim_win_set_buf(win, get_empty_buf())
+  end
+
+  configure_terminal_window(win)
+  update_terminal_winbar()
+  vim.api.nvim_set_current_win(target_win)
 end
 
 vim.api.nvim_create_autocmd("WinClosed", {
