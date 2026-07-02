@@ -252,62 +252,6 @@ local function finish_worktree_snapshot(node, root, base, ref_name, response, wo
   end)
 end
 
-local function format_changed_file_summary(files)
-  if not files or #files == 0 then return "" end
-
-  local parts = {}
-  local limit = math.min(#files, 8)
-
-  for i = 1, limit do
-    local file = files[i]
-    parts[#parts + 1] = (file.status or "?") .. " " .. (file.path or "?")
-  end
-
-  if #files > limit then
-    parts[#parts + 1] = string.format("...and %d more", #files - limit)
-  end
-
-  return table.concat(parts, ", ")
-end
-
-local function guard_live_worktree(node, root, live_start_sha, response, on_clean)
-  node.stat = "checking live worktree"
-  save_node(node)
-  render_if_current(node)
-
-  git.snapshot_async(root, nil, function(live_sha, live_err)
-    if not live_sha then
-      fail_node(node, "live-worktree guard: " .. (live_err or "?"), response)
-      return
-    end
-
-    git.changed_files_async(root, live_start_sha, live_sha, function(files, files_err)
-      if files_err then
-        fail_node(node, "live-worktree guard diff: " .. files_err, response)
-        return
-      end
-
-      if files and #files > 0 then
-        node.workspace_snapshot = live_sha
-        node.live_start_snapshot = live_start_sha
-        node.workspace_files = files
-
-        local detail = format_changed_file_summary(files)
-        local message = "agent modified the live worktree outside the proposal"
-        if detail ~= "" then
-          message = message .. ": " .. detail
-        end
-        message = message .. ". The node was stopped so those changes are not mistaken for a reviewable proposal."
-
-        fail_node(node, message, response)
-        return
-      end
-
-      on_clean()
-    end)
-  end)
-end
-
 function M.run_prompt(parent_id, prompt)
   local root = state.root_dir
   local agent = state.session_agent() or M.config.agent
@@ -400,21 +344,19 @@ function M.run_prompt(parent_id, prompt)
             return
           end
 
-          guard_live_worktree(node, root, live_start_sha, response, function()
-            node.stat = "saving snapshot"
-            save_node(node)
-            render_if_current(node)
+          node.stat = "saving snapshot"
+          save_node(node)
+          render_if_current(node)
 
-            git.snapshot_async(worktree, base, function(sha, snap_err)
-              git.worktree_remove_async(root, worktree)
+          git.snapshot_async(worktree, base, function(sha, snap_err)
+            git.worktree_remove_async(root, worktree)
 
-              if not sha then
-                fail_node(node, "snapshot: " .. (snap_err or "?"), response)
-                return
-              end
+            if not sha then
+              fail_node(node, "snapshot: " .. (snap_err or "?"), response)
+              return
+            end
 
-              finish_worktree_snapshot(node, root, base, ref_name, response, sha)
-            end)
+            finish_worktree_snapshot(node, root, base, ref_name, response, sha)
           end)
         end)
       end
@@ -462,19 +404,12 @@ local function apply_session_choice(agent_name, model_name)
 end
 
 local function session_agent_choices()
-  local available = {}
-  for _, name in ipairs(agents.available()) do
-    available[name] = true
-  end
-
-  local names = {}
-  for _, name in ipairs({ "codex", "claude", "antigravity", "aider" }) do
-    if available[name] then
-      table.insert(names, name)
-    end
-  end
-
-  return names
+  return {
+    { name = "codex", label = "codex" },
+    { name = "antigravity", label = "agy" },
+    { name = "claude", label = "claude" },
+    { name = "aider", label = "aider" },
+  }
 end
 
 -- Model lists match what each CLI shows in its own interactive picker.
@@ -565,15 +500,15 @@ local function prompt_for_session_agent(on_choice)
 
   vim.ui.select(names, {
     prompt = "exocortex: choose agent for this session",
-    format_item = function(name) return name end,
+    format_item = function(item) return item.label end,
   }, function(choice)
     if choice then
-      prompt_for_session_model(choice, function(model)
-        apply_session_choice(choice, model)
+      prompt_for_session_model(choice.name, function(model)
+        apply_session_choice(choice.name, model)
         local suffix = model and (" / " .. model) or ""
-        vim.notify("exocortex: agent set to " .. choice .. suffix, vim.log.levels.INFO)
+        vim.notify("exocortex: agent set to " .. choice.label .. suffix, vim.log.levels.INFO)
         if on_choice then
-          on_choice(choice, model)
+          on_choice(choice.name, model)
         end
       end)
     end
@@ -661,22 +596,27 @@ function M.prompt(parent_id)
     open_prompt_editor(parent_id, agent_name, model_name)
   end
 
-  local current = state.session_agent() or M.config.agent
-  local current_model = state.session_model() or M.config.model
+  local current = state.session_agent()
 
-  if not current then
+  if not state.session_agent_selected() then
     prompt_for_session_agent(do_input)
     return
   end
 
-  if not current_model then
+  if not state.session_model_selected() then
+    if not current then
+      prompt_for_session_agent(do_input)
+      return
+    end
+
     prompt_for_session_model(current, function(model)
+      apply_session_choice(current, model)
       do_input(current, model)
     end)
     return
   end
 
-  do_input(current, current_model)
+  do_input(current, state.session_model())
 end
 
 local function selected_node()

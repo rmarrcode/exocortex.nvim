@@ -406,6 +406,16 @@ function M.session_model()
   return s and s.model
 end
 
+function M.session_agent_selected()
+  local s = M.sessions[M.current_session]
+  return s and s.agent_selected == true
+end
+
+function M.session_model_selected()
+  local s = M.sessions[M.current_session]
+  return s and s.model_selected == true
+end
+
 function M.set_session_agent(agent)
   local s = M.sessions[M.current_session]
   if not s and M.current_session then
@@ -415,6 +425,7 @@ function M.set_session_agent(agent)
 
   if s then
     s.agent = agent
+    s.agent_selected = true
     save_sessions_index()
   end
 end
@@ -428,6 +439,7 @@ function M.set_session_model(model)
 
   if s then
     s.model = model
+    s.model_selected = true
     save_sessions_index()
   end
 end
