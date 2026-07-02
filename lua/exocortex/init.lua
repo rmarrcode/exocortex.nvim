@@ -9,6 +9,7 @@ local agents = require("exocortex.agents")
 local graph = require("exocortex.graph")
 local view = require("exocortex.view")
 local review = require("exocortex.review")
+local copilot = require("exocortex.copilot")
 local obsidian = require("exocortex.obsidian")
 local config_loader = require("exocortex.config_loader")
 local keymaps = require("exocortex.keymaps")
@@ -17,6 +18,8 @@ local M = {}
 
 M.config = vim.tbl_deep_extend("force", {
   agent = nil,
+  model = nil,
+  copilot_model = nil,
   context_chars = 4000,
   terminal_lines = 50,
   copy_ignored_files = true,
@@ -577,22 +580,85 @@ local function prompt_for_session_agent(on_choice)
   end)
 end
 
+local function open_prompt_editor(parent_id, agent_name, model_name)
+  local suffix = model_name and (agent_name .. "/" .. model_name) or agent_name
+  local title = parent_id and (" exocortex from " .. parent_id .. " ") or " exocortex new root "
+  local footer = "  Ctrl-s submit  Ctrl-q/Esc cancel  "
+  local buf = vim.api.nvim_create_buf(false, true)
+
+  vim.bo[buf].bufhidden = "wipe"
+  vim.bo[buf].filetype = "markdown"
+  vim.bo[buf].swapfile = false
+
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "" })
+
+  local width = math.min(100, math.max(48, vim.o.columns - 12))
+  local height = math.min(18, math.max(8, vim.o.lines - 8))
+  local win = vim.api.nvim_open_win(buf, true, {
+    relative = "editor",
+    row = math.floor((vim.o.lines - height) / 2),
+    col = math.floor((vim.o.columns - width) / 2),
+    width = width,
+    height = height,
+    style = "minimal",
+    border = "rounded",
+    title = title .. "[" .. suffix .. "] ",
+    title_pos = "center",
+    footer = footer,
+    footer_pos = "right",
+  })
+
+  vim.wo[win].wrap = true
+  vim.wo[win].linebreak = true
+  vim.wo[win].number = true
+  vim.wo[win].relativenumber = true
+
+  local closed = false
+
+  local function close()
+    if closed then
+      return
+    end
+
+    closed = true
+    if vim.api.nvim_win_is_valid(win) then
+      vim.api.nvim_win_close(win, true)
+    elseif vim.api.nvim_buf_is_valid(buf) then
+      vim.api.nvim_buf_delete(buf, { force = true })
+    end
+  end
+
+  local function submit()
+    if closed or not vim.api.nvim_buf_is_valid(buf) then
+      return
+    end
+
+    local prompt = vim.trim(table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n"))
+    if prompt == "" then
+      vim.notify("exocortex: prompt is empty", vim.log.levels.WARN)
+      return
+    end
+
+    close()
+    apply_session_choice(agent_name, model_name)
+    M.run_prompt(parent_id, prompt)
+  end
+
+  keymaps.set({ "n", "i" }, "<C-s>", submit, { buffer = buf, silent = true, nowait = true, desc = "Submit prompt" })
+  keymaps.set({ "n", "i" }, "<C-q>", close, { buffer = buf, silent = true, nowait = true, desc = "Cancel prompt" })
+  keymaps.set("n", "<Esc>", close, { buffer = buf, silent = true, nowait = true, desc = "Cancel prompt" })
+
+  vim.cmd("startinsert")
+end
+
 function M.prompt(parent_id)
   if state.is_read_only_session() then
     vim.notify("exocortex: obsidian session is read-only", vim.log.levels.WARN)
     return
   end
 
-  local hint = parent_id and (" from " .. parent_id) or " (new root)"
-
   local function do_input(agent_name, model_name)
-    local suffix = model_name and (" [" .. agent_name .. "/" .. model_name .. "]") or (" [" .. agent_name .. "]")
-    vim.ui.input({ prompt = "exocortex" .. hint .. suffix .. " > " }, function(input)
-      if input and vim.trim(input) ~= "" then
-        apply_session_choice(agent_name, model_name)
-        M.run_prompt(parent_id, vim.trim(input))
-      end
-    end)
+    open_prompt_editor(parent_id, agent_name, model_name)
   end
 
   local current = state.session_agent() or M.config.agent
@@ -632,6 +698,15 @@ local function open_ai_view_from_terminal()
   end)
 end
 
+local function open_copilot_from_terminal()
+  vim.schedule(function()
+    if vim.api.nvim_get_mode().mode == "t" then
+      vim.cmd("stopinsert")
+    end
+    require("exocortex").open_copilot()
+  end)
+end
+
 local function set_terminal_keymaps(buf)
   local keys = config_loader.keys("editor")
   keymaps.set("t", keys.terminal_open_graph, open_ai_view_from_terminal, {
@@ -639,6 +714,12 @@ local function set_terminal_keymaps(buf)
     silent = true,
     nowait = true,
     desc = "Open AI view",
+  })
+  keymaps.set("t", keys.terminal_open_copilot, open_copilot_from_terminal, {
+    buffer = buf,
+    silent = true,
+    nowait = true,
+    desc = "Open Copilot settings",
   })
 end
 
@@ -938,6 +1019,10 @@ function M.choose_agent()
   prompt_for_session_agent(function() end)
 end
 
+function M.open_copilot()
+  copilot.open()
+end
+
 -- ---------------------------------------------------------------------------
 -- Entry points
 -- ---------------------------------------------------------------------------
@@ -1030,6 +1115,9 @@ function M.setup(opts)
   end
 
   M.config = vim.tbl_deep_extend("force", M.config, config_loader.load().exocortex or {}, opts)
+  if M.config.copilot_model ~= nil then
+    vim.g.copilot_model = M.config.copilot_model
+  end
 
   set_highlights()
 

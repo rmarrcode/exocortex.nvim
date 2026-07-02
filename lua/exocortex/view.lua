@@ -137,11 +137,24 @@ function M.open(node, from_rect, root_dir)
     keymaps.set("n", lhs, fn, { buffer = buf, silent = true, nowait = true })
   end
 
+  local function paste_register(direction)
+    local was_modifiable = vim.bo[buf].modifiable
+    local was_readonly = vim.bo[buf].readonly
+
+    vim.bo[buf].modifiable = true
+    vim.bo[buf].readonly = false
+    pcall(vim.cmd, "normal! " .. direction)
+    vim.bo[buf].modifiable = was_modifiable
+    vim.bo[buf].readonly = was_readonly
+  end
+
   map(keys.close, close)
   map(keys.return_to_code, function()
     close()
     require("exocortex.graph").return_to_code()
   end)
+  map("p", function() paste_register("p") end)
+  map("P", function() paste_register("P") end)
 
   local noop = function() end
   for _, lhs in ipairs({ "i", "I", "gi", "a", "A", "o", "O", "s", "S", "c", "C", "x", "X", "~", "J" }) do

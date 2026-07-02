@@ -3,15 +3,15 @@
 -- stable # marker; the real file changes only when you accept a focused hunk.
 --
 --   Ctrl-a        accept current diff hunk
---   Ctrl-s        skip current diff hunk
+--   Leader+s      skip current diff hunk
 --   Ctrl-u        undo accept/skip and show the proposal again
 --   Ctrl-e        focus the editable right side
---   Ctrl-; / Ctrl-p next / previous focused diff hunk
---   Ctrl-j/k      next / previous diff hunk from cursor position
+--   Ctrl-j / Ctrl-k next / previous focused diff hunk
+--   Ctrl-; / Ctrl-p next / previous diff hunk from cursor position
 --   Ctrl-l / Ctrl-h next / previous changed file
 --   ] / [         page down / up inside the file
 --   Ctrl-t        put the current function at the top of the window
---   Ctrl-q        end review
+--   Ctrl-q / Esc  end review
 
 local git = require("exocortex.git")
 local config_loader = require("exocortex.config_loader")
@@ -34,6 +34,7 @@ local function pretty_key(lhses)
   local key = first_key(lhses)
 
   return (key
+    :gsub("<leader>", "Leader+")
     :gsub("<M%-(.-)>", function(inner)
       if #inner == 1 then
         return "Alt+" .. inner:upper()
@@ -65,7 +66,7 @@ vim.api.nvim_set_hl(0, "ExocortexDiffSkipped", { fg = "#8b919c", default = true 
 local function guide()
   local keys = config_loader.keys("diff")
   return string.format(
-    "  review keys: %s accept  %s skip  %s undo  %s edit  |  %s/%s hunk  %s/%s from-cursor  |  %s/%s file  |  %s/%s page  |  %s top  |  %s close  ",
+    "  diff keys: %s accept  %s skip  %s undo  %s edit  |  %s/%s diff  %s/%s from-cursor  |  %s/%s file  |  %s/%s page  |  %s top  |  %s/%s close  ",
     pretty_key(keys.accept),
     pretty_key(keys.skip),
     pretty_key(keys.undo),
@@ -79,7 +80,8 @@ local function guide()
     pretty_key(keys.page_up),
     pretty_key(keys.page_down),
     pretty_key(keys.function_to_top),
-    pretty_key(keys.close)
+    pretty_key(keys.close),
+    pretty_key(type(keys.close) == "table" and keys.close[2] or keys.close)
   )
 end
 
@@ -176,6 +178,21 @@ local function top_view(win)
   end
 end
 
+local function reveal_view(win, row, line_count, force_top)
+  if not valid_win(win) then
+    return
+  end
+
+  pcall(vim.api.nvim_win_set_cursor, win, { row + 1, 0 })
+
+  local height = math.max(1, vim.api.nvim_win_get_height(win) - 3)
+  if force_top or line_count >= height then
+    top_view(win)
+  else
+    center_view(win)
+  end
+end
+
 local function is_function_node(node)
   if not node then
     return false
@@ -250,7 +267,10 @@ local function save_target()
 
   if vim.bo[s.right_buf].modified then
     vim.api.nvim_buf_call(s.right_buf, function()
-      pcall(vim.cmd, "silent! update")
+      local ok, err = pcall(vim.cmd, "silent update")
+      if not ok then
+        vim.notify("exocortex: failed to save accepted diff: " .. tostring(err), vim.log.levels.ERROR)
+      end
     end)
   end
 end
@@ -467,20 +487,48 @@ local function select_hunk(index)
 
   s.hunk_index = math.max(1, math.min(index, #s.hunks))
   local hunk = current_hunk(s)
+  local left_row, left_count
+  local right_row, right_count
 
   if valid_win(s.left_win) and s.left_buf and vim.api.nvim_buf_is_valid(s.left_buf) then
     local left_start0 = hunk.new_count > 0 and hunk.new_start - 1 or hunk.new_start
-    local left_row = display_row(s.left_buf, left_start0)
-    pcall(vim.api.nvim_win_set_cursor, s.left_win, { left_row + 1, 0 })
-    center_view(s.left_win)
+    left_row = display_row(s.left_buf, left_start0)
+    left_count = math.max(1, hunk.new_count or 0)
   end
 
   if valid_win(s.right_win) and s.right_buf and vim.api.nvim_buf_is_valid(s.right_buf) then
-    local right_start0 = hunk_range(hunk)
-    local right_row = display_row(s.right_buf, right_start0)
+    local right_start0, right_end0 = hunk_range(hunk)
+    right_row = display_row(s.right_buf, right_start0)
+    right_count = math.max(1, right_end0 - right_start0)
+  end
+
+  local left_large = left_count and valid_win(s.left_win)
+    and left_count >= math.max(1, vim.api.nvim_win_get_height(s.left_win) - 3)
+  local right_large = right_count and valid_win(s.right_win)
+    and right_count >= math.max(1, vim.api.nvim_win_get_height(s.right_win) - 3)
+  local force_top = left_large or right_large
+
+  if left_row then
+    reveal_view(s.left_win, left_row, left_count or 1, force_top)
+  end
+
+  if right_row then
+    reveal_view(s.right_win, right_row, right_count or 1, force_top)
+  end
+
+  -- In diff mode the second window reveal can move the first via scrollbind.
+  -- For large hunks, anchor the side that actually contains more changed lines
+  -- so full-page insertions stay visible before they are accepted.
+  if force_top and left_row and right_row then
+    if (left_count or 1) >= (right_count or 1) then
+      reveal_view(s.left_win, left_row, left_count or 1, true)
+    else
+      reveal_view(s.right_win, right_row, right_count or 1, true)
+    end
+  end
+
+  if valid_win(s.right_win) then
     vim.api.nvim_set_current_win(s.right_win)
-    pcall(vim.api.nvim_win_set_cursor, s.right_win, { right_row + 1, 0 })
-    center_view(s.right_win)
   end
 
   sync_diff()
@@ -713,7 +761,7 @@ function M.stop()
     end
   end
 
-  -- close the review split and restore the original window to what it showed before
+  -- close the review tab and restore the original window to what it showed before
   if valid_win(s.right_win) then
     pcall(vim.api.nvim_win_close, s.right_win, true)
   end
@@ -724,9 +772,19 @@ function M.stop()
       vim.wo[s.left_win].signcolumn = "auto"
       vim.wo[s.left_win].cursorline = false
     end)
-    if s.original_left_buf and vim.api.nvim_buf_is_valid(s.original_left_buf) then
-      pcall(vim.api.nvim_win_set_buf, s.left_win, s.original_left_buf)
-    end
+  end
+
+  if s.review_tab and vim.api.nvim_tabpage_is_valid(s.review_tab) then
+    pcall(vim.api.nvim_set_current_tabpage, s.review_tab)
+    pcall(vim.cmd, "tabclose")
+  end
+
+  if s.return_tab and vim.api.nvim_tabpage_is_valid(s.return_tab) then
+    pcall(vim.api.nvim_set_current_tabpage, s.return_tab)
+  end
+
+  if s.left_win and vim.api.nvim_win_is_valid(s.left_win) and s.original_left_buf and vim.api.nvim_buf_is_valid(s.original_left_buf) then
+    pcall(vim.api.nvim_win_set_buf, s.left_win, s.original_left_buf)
   end
 
   -- delete buffers the review opened that the user didn't already have loaded
@@ -748,16 +806,25 @@ local function ensure_windows()
 
   if not valid_win(s.left_win) then
     if valid_win(s.right_win) then
-      vim.api.nvim_win_close(s.right_win, true)
+      pcall(vim.api.nvim_win_close, s.right_win, true)
       s.right_win = nil
     end
-    s.left_win = find_editor_window()
-    if not s.left_win then
+
+    if s.review_tab and vim.api.nvim_tabpage_is_valid(s.review_tab) then
+      local wins = vim.api.nvim_tabpage_list_wins(s.review_tab)
+      s.left_win = wins[1]
+    end
+
+    if not valid_win(s.left_win) then
       vim.cmd("tabnew")
+      s.review_tab = vim.api.nvim_get_current_tabpage()
       s.left_win = vim.api.nvim_get_current_win()
     end
   end
 
+  if s.review_tab and vim.api.nvim_tabpage_is_valid(s.review_tab) then
+    vim.api.nvim_set_current_tabpage(s.review_tab)
+  end
   vim.api.nvim_set_current_win(s.left_win)
 
   if not valid_win(s.right_win) then
@@ -821,17 +888,17 @@ function M.show_file(index)
   vim.api.nvim_win_set_buf(s.left_win, proposal_buf)
   set_review_maps(proposal_buf)
 
-  local was_loaded = vim.fn.bufloaded(real_path) == 1
-  vim.api.nvim_set_current_win(s.right_win)
-  vim.cmd("edit " .. vim.fn.fnameescape(real_path))
-  s.right_buf = vim.api.nvim_get_current_buf()
+  local right_buf = vim.fn.bufadd(real_path)
+  local was_loaded = vim.api.nvim_buf_is_loaded(right_buf)
+  vim.fn.bufload(right_buf)
+  s.right_buf = right_buf
   if not was_loaded then
-    s.opened_bufs[s.right_buf] = true
+    s.opened_bufs[right_buf] = true
   end
-  vim.bo[s.right_buf].modifiable = true
-  vim.bo[s.right_buf].readonly = false
-  if ft then vim.bo[s.right_buf].filetype = ft end
-  set_review_maps(s.right_buf)
+  make_target_editable(right_buf)
+  if ft and vim.bo[right_buf].filetype == "" then vim.bo[right_buf].filetype = ft end
+  vim.api.nvim_win_set_buf(s.right_win, right_buf)
+  set_review_maps(right_buf)
 
   local current_lines = vim.api.nvim_buf_get_lines(s.right_buf, 0, -1, false)
   if file_state then
@@ -910,7 +977,11 @@ function M.start(node, root)
     mapped_bufs = {},
     file_states = {},
     opened_bufs = {},
+    review_tab = nil,
   }
+
+  vim.cmd("tabnew")
+  M.session.review_tab = vim.api.nvim_get_current_tabpage()
 
   M.show_file(1)
 end

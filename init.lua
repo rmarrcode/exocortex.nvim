@@ -75,7 +75,7 @@ vim.api.nvim_create_user_command("Messages", function()
   vim.wo[win].linebreak = true
   vim.api.nvim_win_set_cursor(win, { vim.api.nvim_buf_line_count(buf), 0 })
 
-  vim.keymap.set("n", "q", "<cmd>close<CR>", { buffer = buf, silent = true, desc = "Close messages" })
+  vim.keymap.set("n", { "q", "<C-q>" }, "<cmd>close<CR>", { buffer = buf, silent = true, desc = "Close messages" })
   vim.keymap.set("n", "Y", function()
     local content = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
     vim.fn.setreg("+", content)
@@ -158,13 +158,50 @@ lazy.setup({
   { "mg979/vim-visual-multi", lazy = false },
   { "sindrets/diffview.nvim", lazy = false },
   { "johnseth97/codex.nvim", lazy = false },
+  {
+    "nvim-treesitter/nvim-treesitter",
+    branch = "main",
+    lazy = false,
+    build = ":TSUpdate",
+    config = function()
+      local ts = require("nvim-treesitter")
+      ts.install({ "latex", "markdown", "markdown_inline" })
+
+      vim.api.nvim_create_autocmd("FileType", {
+        group = vim.api.nvim_create_augroup("user-treesitter", { clear = true }),
+        pattern = { "latex", "markdown" },
+        callback = function()
+          pcall(vim.treesitter.start)
+        end,
+      })
+    end,
+  },
+  { "jbyuki/nabla.nvim", ft = { "markdown" } },
+  {
+    "MeanderingProgrammer/render-markdown.nvim",
+    ft = { "markdown" },
+    dependencies = { "nvim-treesitter/nvim-treesitter", "nvim-mini/mini.nvim", "jbyuki/nabla.nvim" },
+    config = function()
+      require("render-markdown").setup({
+        latex = { enabled = false },
+        win_options = { conceallevel = { rendered = 2 } },
+        on = {
+          render = function()
+            require("nabla").enable_virt({ autogen = true })
+          end,
+          clear = function()
+            require("nabla").disable_virt()
+          end,
+        },
+      })
+    end,
+  },
 }, {
   root = vim.fn.stdpath("data") .. "/lazy",
   lockfile = vim.fn.stdpath("config") .. "/lazy-lock.json",
   change_detection = { notify = false },
   install = { missing = true },
 })
-
 -- ============================================================================
 -- BASIC SETTINGS
 -- ============================================================================
@@ -268,6 +305,8 @@ local function apply_vscode_dark_highlights()
   vim.api.nvim_set_hl(0, "TabLine", { fg = colors.fg, bg = colors.tab_inactive })
   vim.api.nvim_set_hl(0, "TabLineSel", { fg = "#ffffff", bg = colors.tab_active, bold = true })
   vim.api.nvim_set_hl(0, "TabLineFill", { bg = colors.panel })
+  vim.api.nvim_set_hl(0, "EditorTabUnsaved", { fg = "#1e1e1e", bg = "#ffcc00", bold = true })
+  vim.api.nvim_set_hl(0, "EditorHeaderUnsaved", { fg = "#1e1e1e", bg = "#ffcc00", bold = true })
   vim.api.nvim_set_hl(0, "WinBar", { fg = "#ffffff", bg = colors.winbar, bold = true })
   vim.api.nvim_set_hl(0, "WinBarNC", { fg = colors.fg, bg = colors.winbar_nc })
   vim.api.nvim_set_hl(0, "WinSeparator", { fg = colors.gutter, bg = colors.bg })
@@ -300,20 +339,6 @@ apply_vscode_dark_highlights()
 vim.api.nvim_create_autocmd("ColorScheme", {
   group = augroup,
   callback = apply_vscode_dark_highlights,
-})
-
--- ============================================================================
--- SAVE FILE
--- ============================================================================
-
-vim.keymap.set("n", "<C-s>", ":w<CR>", {
-  noremap = true,
-  silent = true,
-})
-
-vim.keymap.set("i", "<C-s>", "<Esc>:w<CR>a", {
-  noremap = true,
-  silent = true,
 })
 
 -- ============================================================================
@@ -715,11 +740,14 @@ local function render_editor_tabs(win, current_buf)
 
     name = name:gsub("%%", "%%%%")
 
-    if vim.bo[buf].modified then
-      name = name .. " +"
+    local modified = vim.bo[buf].modified
+    if modified then
+      name = "UNSAVED " .. name
     end
 
-    local hl = buf == current_buf and "%#TabLineSel#" or "%#TabLine#"
+    local hl = modified and "%#EditorTabUnsaved#"
+      or buf == current_buf and "%#TabLineSel#"
+      or "%#TabLine#"
     table.insert(parts, string.format("%%%d@v:lua.EditorWinTabClick@%s %s %%X", buf, hl, name))
   end
 
@@ -786,7 +814,7 @@ local function render_window_header(win)
   local flags = {}
 
   if bo.modified then
-    table.insert(flags, "+")
+    table.insert(flags, "UNSAVED")
   end
 
   if bo.readonly then
@@ -794,7 +822,8 @@ local function render_window_header(win)
   end
 
   local suffix = #flags > 0 and (" [" .. table.concat(flags, ",") .. "]") or ""
-  vim.wo[win].winbar = "  " .. name .. suffix .. "  "
+  local hl = bo.modified and "%#EditorHeaderUnsaved#" or "%#WinBar#"
+  vim.wo[win].winbar = hl .. "  " .. name .. suffix .. "  %*"
 end
 
 function _G.EditorWinTabClick(bufnr)
@@ -864,7 +893,7 @@ local function refresh_window_headers()
   end
 end
 
-vim.api.nvim_create_autocmd({ "BufEnter", "BufModifiedSet", "TermOpen", "VimEnter", "WinEnter" }, {
+vim.api.nvim_create_autocmd({ "BufEnter", "BufModifiedSet", "BufWritePost", "TermOpen", "VimEnter", "WinEnter" }, {
   group = augroup,
   callback = refresh_window_headers,
 })
@@ -1224,6 +1253,18 @@ local function move_current_buffer_to_next_window()
 
   open_buffer_in_right_split(buf)
   leave_window_tab(current_win, buf)
+end
+
+local function move_current_buffer_to_new_right_split()
+  local buf = current_window_buffer()
+
+  if not buf then
+    return
+  end
+
+  local source_win = vim.api.nvim_get_current_win()
+  open_buffer_in_right_split(buf)
+  leave_window_tab(source_win, buf)
 end
 
 vim.keymap.set("n", "<leader>v", ":vsplit<CR>", {
@@ -1745,12 +1786,135 @@ local inspect_debug_expression
 
 vim.g.dapui_show_variable_values = true
 
-dapui_util.format_value = function(value_start, value)
-  if vim.g.dapui_show_variable_values then
-    return dapui_format_value(value_start, value)
+local function tensor_shape_from_value(value)
+  if type(value) ~= "string" then
+    return nil
   end
 
-  return { "<hidden>" }
+  local text = vim.trim(value)
+  if not (text:match("^tensor%(") or text:match("^Tensor%(") or text:match("^torch%.Tensor%(")) then
+    return nil
+  end
+
+  local open = text:find("%[")
+  if not open then
+    return nil
+  end
+
+  local function trim(s)
+    return vim.trim(s or "")
+  end
+
+  local function parse_list(s, i)
+    local items = {}
+    local item_start = i + 1
+    local depth = 0
+    i = i + 1
+
+    while i <= #s do
+      local ch = s:sub(i, i)
+
+      if ch == "[" then
+        depth = depth + 1
+      elseif ch == "]" then
+        if depth == 0 then
+          local item = trim(s:sub(item_start, i - 1))
+          if item ~= "" then
+            items[#items + 1] = item
+          end
+          return items, i + 1
+        end
+        depth = depth - 1
+      elseif ch == "," and depth == 0 then
+        local item = trim(s:sub(item_start, i - 1))
+        if item ~= "" then
+          items[#items + 1] = item
+        end
+        item_start = i + 1
+      end
+
+      i = i + 1
+    end
+  end
+
+  local shape_from_repr
+
+  local function shape_of_list(items)
+    if #items == 0 then
+      return { 0 }
+    end
+
+    local child_shape = nil
+    for _, item in ipairs(items) do
+      if item:sub(1, 1) ~= "[" then
+        return { #items }
+      end
+
+      local child = shape_from_repr(item)
+      if not child then
+        return { #items }
+      end
+
+      if not child_shape then
+        child_shape = child
+      else
+        if #child_shape ~= #child then
+          return { #items }
+        end
+        for idx = 1, #child_shape do
+          if child_shape[idx] ~= child[idx] then
+            return { #items }
+          end
+        end
+      end
+    end
+
+    local shape = { #items }
+    if child_shape then
+      for _, dim in ipairs(child_shape) do
+        shape[#shape + 1] = dim
+      end
+    end
+    return shape
+  end
+
+  shape_from_repr = function(s)
+    local items = parse_list(s, 1)
+    if not items then
+      return nil
+    end
+    return shape_of_list(items)
+  end
+
+  local shape = shape_from_repr(text:sub(open))
+  if not shape or #shape == 0 then
+    return nil
+  end
+
+  return "shape=(" .. table.concat(shape, ", ") .. ")"
+end
+
+local function annotate_tensor_value(value)
+  local shape = tensor_shape_from_value(value)
+  if not shape then
+    return nil
+  end
+
+  local lines = dapui_format_value(0, value)
+  if type(lines) ~= "table" or #lines == 0 then
+    return nil
+  end
+
+  lines[1] = shape .. " " .. lines[1]
+  return lines
+end
+
+dapui_util.format_value = function(value_start, value)
+  if not vim.g.dapui_show_variable_values then
+    return { "<hidden>" }
+  end
+
+  return annotate_tensor_value(value) or dapui_format_value(value_start, value)
 end
 
 
@@ -1935,7 +2099,7 @@ dapui.setup({
   floating = {
     border = "rounded",
     mappings = {
-      close = { "q", "<Esc>" },
+      close = { "<C-q>", "q", "<Esc>" },
     },
   },
 })
@@ -2065,8 +2229,9 @@ local function focus_debug_source(path, line)
 
   local target_win = nil
   local current_win = vim.api.nvim_get_current_win()
+  local current_is_source = is_debug_source_window(current_win)
 
-  if is_debug_source_window(current_win) then
+  if current_is_source then
     target_win = current_win
   else
     for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
@@ -2082,9 +2247,12 @@ local function focus_debug_source(path, line)
   end
 
   vim.api.nvim_win_set_buf(target_win, bufnr)
-  vim.api.nvim_set_current_win(target_win)
-  vim.api.nvim_win_set_cursor(target_win, { math.max(line or 1, 1), 0 })
-  vim.cmd("normal! zz")
+
+  if current_is_source then
+    vim.api.nvim_set_current_win(target_win)
+    vim.api.nvim_win_set_cursor(target_win, { math.max(line or 1, 1), 0 })
+    vim.cmd("normal! zz")
+  end
 end
 
 local function set_debug_source(path, label)
@@ -2248,8 +2416,8 @@ local function debug_hint_keys()
     string.format(" %-18s Step out", debug_key_label(keys.step_out)),
     string.format(" %-18s Stop", debug_key_label(keys.stop)),
     string.format(" %-18s Close UI", debug_key_label(keys.close_ui)),
-    string.format(" %-18s Cursor up", debug_key_label(keys.debug_nav_up)),
-    string.format(" %-18s Cursor down", debug_key_label(keys.debug_nav_down)),
+    string.format(" %-18s Page up", debug_key_label(keys.debug_nav_up)),
+    string.format(" %-18s Page down", debug_key_label(keys.debug_nav_down)),
     string.format(" %-18s Cursor left", debug_key_label(keys.debug_nav_left)),
     string.format(" %-18s Cursor right", debug_key_label(keys.debug_nav_right)),
     string.format(" %-18s Show UI", debug_key_label(keys.show_ui)),
@@ -2503,13 +2671,19 @@ dap.listeners.after.event_stopped["jump_to_source"] = function(session, body)
       vim.fn.bufload(bufnr)
 
       local target_win = nil
+      local current_win = vim.api.nvim_get_current_win()
+      local current_is_source = is_debug_source_window(current_win)
 
-      for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
-        if vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_config(win).relative == "" then
-          local wbuf = vim.api.nvim_win_get_buf(win)
-          if vim.bo[wbuf].buftype == "" and vim.bo[wbuf].filetype ~= "NvimTree" then
-            target_win = win
-            break
+      if current_is_source then
+        target_win = current_win
+      else
+        for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+          if vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_config(win).relative == "" then
+            local wbuf = vim.api.nvim_win_get_buf(win)
+            if vim.bo[wbuf].buftype == "" and vim.bo[wbuf].filetype ~= "NvimTree" then
+              target_win = win
+              break
+            end
           end
         end
       end
@@ -2519,9 +2693,11 @@ dap.listeners.after.event_stopped["jump_to_source"] = function(session, body)
       end
 
       vim.api.nvim_win_set_buf(target_win, bufnr)
-      vim.api.nvim_set_current_win(target_win)
-      vim.api.nvim_win_set_cursor(target_win, { line, 0 })
-      vim.cmd("normal! zz")
+      if current_is_source then
+        vim.api.nvim_set_current_win(target_win)
+        vim.api.nvim_win_set_cursor(target_win, { line, 0 })
+        vim.cmd("normal! zz")
+      end
 
       -- Clear any previous stop markers, then mark the new stopped line.
       clear_dap_stopped_marks()
@@ -2632,7 +2808,7 @@ local function open_debug_output(title, text)
   })
   vim.wo[win].wrap = false
 
-  vim.keymap.set("n", "q", function()
+  vim.keymap.set("n", { "q", "<C-q>" }, function()
     if vim.api.nvim_win_is_valid(win) then
       vim.api.nvim_win_close(win, true)
     end
@@ -3329,6 +3505,39 @@ require("codex").setup({
   autoinstall = false,
 })
 
+local function paste_register_into_codex_terminal()
+  local buf = vim.api.nvim_get_current_buf()
+  local job_id = vim.b[buf].terminal_job_id
+
+  if not job_id then
+    vim.notify("Codex paste: no terminal job for this buffer", vim.log.levels.WARN)
+    return
+  end
+
+  local text = vim.fn.getreg("\"")
+  text = text:gsub("[\r\n]+$", "")
+
+  if text == "" then
+    return
+  end
+
+  vim.api.nvim_chan_send(job_id, text)
+  vim.cmd("startinsert")
+end
+
+vim.api.nvim_create_autocmd({ "FileType", "TermOpen" }, {
+  group = augroup,
+  pattern = "codex",
+  callback = function(args)
+    vim.keymap.set("n", { "p" }, paste_register_into_codex_terminal, {
+      buffer = args.buf,
+      silent = true,
+      nowait = true,
+      desc = "Paste register into Codex terminal",
+    })
+  end,
+})
+
 -- ============================================================================
 -- GIT DIFF REVIEW
 -- ============================================================================
@@ -3458,6 +3667,18 @@ exocortex_keymaps.set({ "n", "t" }, exocortex_keys.open_graph, function()
 end, {
   silent = true,
   desc = "Open agent DAG",
+})
+
+exocortex_keymaps.set({ "n", "t" }, exocortex_keys.open_copilot, function()
+  vim.schedule(function()
+    if vim.api.nvim_get_mode().mode == "t" then
+      vim.cmd("stopinsert")
+    end
+    require("exocortex").open_copilot()
+  end)
+end, {
+  silent = true,
+  desc = "Open Copilot settings",
 })
 
 -- Ctrl+Shift+A then i: open the graph and start a fresh session. Depending

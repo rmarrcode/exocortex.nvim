@@ -10,6 +10,8 @@ The code editor view is the normal workspace: file tree on the side, terminal on
 
 To open the AI graph, use operation `keys.editor.open_graph`. It is currently set to `<C-a>i` and `<C-a><Tab>`.
 
+To open the Copilot settings screen, use operation `keys.editor.open_copilot`. It is currently set to `<C-a>p`.
+
 To open the AI graph and create a fresh session, use operation `keys.editor.new_session`. It is currently set to `<C-S-a>i`, `<C-S-a>I`, `<C-S-a><C-S-i>`, `<C-S-a><C-i>`, and `<C-S-a><Tab>`.
 
 To reload Exocortex modules without reloading the whole Neovim config, use operation `keys.editor.reload_plugin`. It is currently set to `<F2>` and runs `:ExocortexReload`.
@@ -21,6 +23,8 @@ To open the same file in a right split, use operation `keys.editor.open_same_fil
 To move the enclosing function to the top of the current window, use operation `keys.editor.function_to_top`. It is currently set to `f` in normal editor buffers.
 
 To open the AI graph from terminal mode, use operation `keys.editor.terminal_open_graph`. It is currently set to `<C-a>i` and `<C-a><Tab>`.
+
+To open the Copilot settings screen from terminal mode, use operation `keys.editor.terminal_open_copilot`. It is currently set to `<C-a>p`.
 
 ## AI Graph View
 
@@ -70,19 +74,19 @@ The session sidebar has its own operations under `keys.sessions`. Switching is c
 
 ## Diff View
 
-The diff review view compares a node proposal on the left with the real editable file on the right. Every hunk is labeled as `proposed`, `accepted`, or `skipped/rejected`. Hunk state is retained per file while the review session is active, so accepted or skipped hunks remain visible when you leave a file and return to it.
+The diff review view opens in its own review tab, separate from your normal editing windows. The left pane is the proposal, the right pane is the review target, and the top bar shows the active controls. Every hunk is labeled as `proposed`, `accepted`, or `skipped/rejected`. Hunk state is retained per file while the review session is active, so accepted or skipped hunks remain visible when you leave a file and return to it.
 
 To accept the focused hunk, use operation `keys.diff.accept`. It is currently set to `<C-a>`.
 
-To skip and reject the focused hunk, use operation `keys.diff.skip`. It is currently set to `<C-s>`.
+To skip and reject the focused hunk, use operation `keys.diff.skip`. It is currently set to `<leader>s`.
 
 To undo an accept or skip, use operation `keys.diff.undo`. It is currently set to `<C-u>`.
 
 To focus the editable right side, use operation `keys.diff.edit_right`. It is currently set to `<C-e>`.
 
-To move to the next or previous focused hunk by index, use operations `keys.diff.next` and `keys.diff.previous`. They are currently set to `<C-;>` and `<C-p>`.
+To move to the next or previous focused hunk by index, use operations `keys.diff.next` and `keys.diff.previous`. They are currently set to `<C-j>` and `<C-k>`.
 
-To move to the next or previous hunk from the cursor location, use operations `keys.diff.next_from_cursor` and `keys.diff.previous_from_cursor`. They are currently set to `<C-j>` and `<C-k>`.
+To move to the next or previous hunk from the cursor location, use operations `keys.diff.next_from_cursor` and `keys.diff.previous_from_cursor`. They are currently set to `<C-;>` and `<C-p>`.
 
 To move to the next or previous changed file, use operations `keys.diff.next_file` and `keys.diff.previous_file`. They are currently set to `<C-l>` and `<C-h>`.
 
