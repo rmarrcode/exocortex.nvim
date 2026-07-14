@@ -119,14 +119,34 @@ end
 
 -- Agents are stateless across nodes in v1: branching replays the path-to-root
 -- transcript as context, which works identically for every CLI.
-local function build_prompt(parent_id, prompt, proposal_root)
+local PROMPT_INTENT_DIFF = "diff"
+local PROMPT_INTENT_READ = "read"
+
+local function normalize_prompt_intent(intent)
+  return intent == PROMPT_INTENT_READ and PROMPT_INTENT_READ or PROMPT_INTENT_DIFF
+end
+
+local function build_prompt(parent_id, prompt, proposal_root, intent)
+  intent = normalize_prompt_intent(intent)
+
   local parts = {
     "You are running in an isolated proposal worktree.",
-    "The only writable project root is: " .. (proposal_root or "<current working directory>"),
+    "The project root for this run is: " .. (proposal_root or "<current working directory>"),
     "Use relative paths, or absolute paths under that proposal root only.",
     "Never edit the original checkout path from terminal history or prior context.",
-    "The user will review and explicitly accept proposed hunks later.",
   }
+
+  if intent == PROMPT_INTENT_READ then
+    table.insert(parts, "Submission mode: READABLE RESPONSE.")
+    table.insert(parts, "Do not create, edit, delete, rename, format, or otherwise modify files.")
+    table.insert(parts, "You may inspect files and run read-only commands, but your final output should be a Markdown response meant to be read.")
+    table.insert(parts, "If code changes would be useful, describe them instead of implementing them.")
+  else
+    table.insert(parts, "Submission mode: DIFF PROPOSAL.")
+    table.insert(parts, "Make the requested code/config changes in the proposal worktree.")
+    table.insert(parts, "The resulting file modifications are the primary output and will be reviewed as diffs.")
+    table.insert(parts, "The user will review and explicitly accept proposed hunks later.")
+  end
 
   if M.config.copy_ignored_files ~= false then
     table.insert(parts, "Gitignored files from the live checkout are selectively overlaid into this worktree before you run: small text-like files are copied at their normal relative paths, while large or binary ignored directories may instead contain `EXOCORTEX_IGNORED_INDEX.txt` summary files.")
@@ -184,6 +204,27 @@ local function session_suffix(node)
   return ""
 end
 
+local function mark_node_done(node)
+  graph.unread[node.id] = true
+  if graph.bar_nodes then
+    graph.bar_nodes[(node.session_id or "default") .. ":" .. node.id] = true
+  end
+  save_node(node)
+  render_if_current(node)
+  if graph.refresh_status_bar then graph.refresh_status_bar() end
+  pcall(obsidian.on_done, node)
+
+  if graph.flash_code_win then
+    graph.flash_code_win("exocortex: " .. node.id .. session_suffix(node) .. " done")
+  end
+
+  if graph.flash_tabline then
+    graph.flash_tabline()
+  end
+
+  vim.notify("exocortex: " .. node.id .. session_suffix(node) .. " done (" .. node.stat .. ")", vim.log.levels.INFO)
+end
+
 local function fail_node(node, err, response)
   node.status = "error"
   node.stat = (err or "unknown error"):gsub("\n.*", ""):sub(1, 80)
@@ -219,26 +260,19 @@ local function finish_node(node, root, base, ref_name, response, sha, files)
         vim.notify("exocortex: failed to pin " .. node.id .. ": " .. ref_err, vim.log.levels.WARN)
       end
 
-      graph.unread[node.id] = true
-      if graph.bar_nodes then
-        graph.bar_nodes[(node.session_id or "default") .. ":" .. node.id] = true
-      end
-      save_node(node)
-      render_if_current(node)
-      if graph.refresh_status_bar then graph.refresh_status_bar() end
-      pcall(obsidian.on_done, node)
-
-      if graph.flash_code_win then
-        graph.flash_code_win("exocortex: " .. node.id .. session_suffix(node) .. " done")
-      end
-
-      if graph.flash_tabline then
-        graph.flash_tabline()
-      end
-
-      vim.notify("exocortex: " .. node.id .. session_suffix(node) .. " done (" .. node.stat .. ")", vim.log.levels.INFO)
+      mark_node_done(node)
     end)
   end)
+end
+
+local function finish_response_node(node, response)
+  node.response = response
+  node.snapshot = nil
+  node.workspace_snapshot = nil
+  node.files = {}
+  node.stat = "read response"
+  node.status = "done"
+  mark_node_done(node)
 end
 
 local function finish_worktree_snapshot(node, root, base, ref_name, response, worktree_sha)
@@ -252,10 +286,15 @@ local function finish_worktree_snapshot(node, root, base, ref_name, response, wo
   end)
 end
 
-function M.run_prompt(parent_id, prompt)
+local unavailable_agent_message
+
+function M.run_prompt(parent_id, prompt, opts)
+  opts = opts or {}
+
   local root = state.root_dir
   local agent = state.session_agent() or M.config.agent
   local model = state.session_model() or M.config.model
+  local intent = normalize_prompt_intent(opts.intent)
 
   if not root then
     vim.notify("exocortex: open the graph first (:Exocortex)", vim.log.levels.ERROR)
@@ -289,7 +328,7 @@ function M.run_prompt(parent_id, prompt)
   end
 
   if not agent then
-    vim.notify("exocortex: no agent CLI found (looked for: claude, agy, codex, aider)", vim.log.levels.ERROR)
+    vim.notify(unavailable_agent_message(), vim.log.levels.ERROR)
     return
   end
 
@@ -312,6 +351,7 @@ function M.run_prompt(parent_id, prompt)
   end
 
   local ref_name = state.ref_name(node.id)
+  node.intent = intent
   node.stat = "snapshotting current code"
   if graph.bar_nodes then
     graph.bar_nodes[(node.session_id or "default") .. ":" .. node.id] = true
@@ -333,14 +373,25 @@ function M.run_prompt(parent_id, prompt)
       end
 
       local function run_agent_in_worktree()
-        node.stat = "running"
+        node.stat = intent == PROMPT_INTENT_READ and "running for read response" or "running"
         save_node(node)
         render_if_current(node)
 
-        agents.run(agent, model, build_prompt(parent_id, prompt, worktree), worktree, function(response, agent_err)
+        agents.run(agent, model, build_prompt(parent_id, prompt, worktree, intent), worktree, function(response, agent_err)
           if agent_err then
             git.worktree_remove_async(root, worktree)
             fail_node(node, agent_err)
+            return
+          end
+
+          if intent == PROMPT_INTENT_READ then
+            node.stat = "saving response"
+            save_node(node)
+            render_if_current(node)
+
+            git.worktree_remove_async(root, worktree, function()
+              finish_response_node(node, response)
+            end)
             return
           end
 
@@ -452,6 +503,18 @@ local AGENT_EFFORTS = {
 
 local CUSTOM_LABEL = "other (type model id)..."
 
+local function claude_installed()
+  return vim.fn.executable("claude") == 1
+end
+
+unavailable_agent_message = function()
+  if claude_installed() and not vim.tbl_contains(agents.available(), "claude") then
+    return "exocortex: claude is installed but not authenticated; run `claude auth login` or switch agents"
+  end
+
+  return "exocortex: no agent CLI found (looked for: claude, agy, codex, aider)"
+end
+
 local function prompt_for_session_model(agent_name, on_choice)
   local options = AGENT_MODELS[agent_name] or {}
   local items = vim.list_extend({ unpack(options) }, { { id = nil, label = CUSTOM_LABEL } })
@@ -491,10 +554,20 @@ local function prompt_for_session_model(agent_name, on_choice)
 end
 
 local function prompt_for_session_agent(on_choice)
-  local names = session_agent_choices()
+  local available = {}
+  for _, name in ipairs(agents.available()) do
+    available[name] = true
+  end
+
+  local names = {}
+  for _, item in ipairs(session_agent_choices()) do
+    if available[item.name] then
+      table.insert(names, item)
+    end
+  end
 
   if #names == 0 then
-    vim.notify("exocortex: no agent CLI found (looked for: claude, agy, codex, aider)", vim.log.levels.ERROR)
+    vim.notify(unavailable_agent_message(), vim.log.levels.ERROR)
     return
   end
 
@@ -518,7 +591,7 @@ end
 local function open_prompt_editor(parent_id, agent_name, model_name)
   local suffix = model_name and (agent_name .. "/" .. model_name) or agent_name
   local title = parent_id and (" exocortex from " .. parent_id .. " ") or " exocortex new root "
-  local footer = "  Ctrl-s submit  Ctrl-q/Esc cancel  "
+  local footer = "  Ctrl-d diffs  Ctrl-r read  Ctrl-q/Esc cancel  "
   local buf = vim.api.nvim_create_buf(false, true)
 
   vim.bo[buf].bufhidden = "wipe"
@@ -550,11 +623,19 @@ local function open_prompt_editor(parent_id, agent_name, model_name)
 
   local closed = false
 
+  local function leave_insert_mode()
+    local mode = vim.api.nvim_get_mode().mode
+    if mode:sub(1, 1) == "i" or mode:sub(1, 1) == "R" then
+      pcall(vim.cmd, "stopinsert")
+    end
+  end
+
   local function close()
     if closed then
       return
     end
 
+    leave_insert_mode()
     closed = true
     if vim.api.nvim_win_is_valid(win) then
       vim.api.nvim_win_close(win, true)
@@ -563,7 +644,7 @@ local function open_prompt_editor(parent_id, agent_name, model_name)
     end
   end
 
-  local function submit()
+  local function submit(intent)
     if closed or not vim.api.nvim_buf_is_valid(buf) then
       return
     end
@@ -576,10 +657,13 @@ local function open_prompt_editor(parent_id, agent_name, model_name)
 
     close()
     apply_session_choice(agent_name, model_name)
-    M.run_prompt(parent_id, prompt)
+    M.run_prompt(parent_id, prompt, { intent = intent })
+    graph.open()
   end
 
-  keymaps.set({ "n", "i" }, "<C-s>", submit, { buffer = buf, silent = true, nowait = true, desc = "Submit prompt" })
+  keymaps.set({ "n", "i" }, "<C-d>", function() submit(PROMPT_INTENT_DIFF) end, { buffer = buf, silent = true, nowait = true, desc = "Submit prompt for diffs" })
+  keymaps.set({ "n", "i" }, "<C-r>", function() submit(PROMPT_INTENT_READ) end, { buffer = buf, silent = true, nowait = true, desc = "Submit prompt for readable response" })
+  keymaps.set({ "n", "i" }, "<C-a>", function() submit(PROMPT_INTENT_DIFF) end, { buffer = buf, silent = true, nowait = true, desc = "Submit prompt for diffs" })
   keymaps.set({ "n", "i" }, "<C-q>", close, { buffer = buf, silent = true, nowait = true, desc = "Cancel prompt" })
   keymaps.set("n", "<Esc>", close, { buffer = buf, silent = true, nowait = true, desc = "Cancel prompt" })
 
@@ -627,6 +711,52 @@ local function selected_node()
   end
 
   return node
+end
+
+local function resolve_selected_node(node, predicate, fallback_action, missing_message)
+  if predicate(node) then
+    return node
+  end
+
+  if node.status == "running" then
+    local parent = node.parent and state.nodes[node.parent] or nil
+
+    while parent do
+      if predicate(parent) then
+        vim.notify(
+          string.format("exocortex: %s %s while %s is running", fallback_action, parent.id, node.id),
+          vim.log.levels.INFO
+        )
+        return parent
+      end
+
+      parent = parent.parent and state.nodes[parent.parent] or nil
+    end
+  end
+
+  vim.notify(missing_message, vim.log.levels.WARN)
+end
+
+local function selected_node_for_action(predicate, fallback_action, missing_message)
+  local node = selected_node()
+
+  if not node then
+    return nil
+  end
+
+  return resolve_selected_node(node, predicate, fallback_action, missing_message)
+end
+
+local function has_response(node)
+  return node.response and node.response ~= ""
+end
+
+local function has_review_snapshot(node)
+  return node.snapshot ~= nil
+end
+
+local function has_diff_snapshot(node)
+  return node.base and (node.snapshot or node.workspace_snapshot)
 end
 
 local function open_ai_view_from_terminal()
@@ -830,11 +960,8 @@ local function open_response_tab(buf)
 end
 
 function M.read_selected()
-  local node = selected_node()
-  if not node then return end
-
-  if not node.response or node.response == "" then
-    vim.notify("exocortex: node has no response yet", vim.log.levels.WARN)
+  local node = selected_node_for_action(has_response, "opening read view for", "exocortex: node has no response yet")
+  if not node then
     return
   end
 
@@ -865,6 +992,21 @@ function M.read_selected()
   keymaps.set("n", read_keys.close, close_read_view, { buffer = buf, silent = true, nowait = true })
   keymaps.set("n", read_keys.return_to_code, close_read_view, { buffer = buf, silent = true, nowait = true })
 
+  local graph_keys = config_loader.keys("graph")
+  keymaps.set("n", graph_keys.prompt_branch, function()
+    close_read_view()
+    M.prompt(node.id)
+  end, { buffer = buf, silent = true, nowait = true, desc = "Prompt from this node" })
+  keymaps.set("n", graph_keys.prompt_root, function()
+    close_read_view()
+    M.prompt(nil)
+  end, { buffer = buf, silent = true, nowait = true, desc = "Prompt from a fresh root" })
+
+  local noop = function() end
+  for _, lhs in ipairs({ "i", "I", "gi", "a", "A", "o", "O", "s", "S", "c", "C", "x", "X", "~", "J", "D" }) do
+    keymaps.set("n", lhs, noop, { buffer = buf, silent = true, nowait = true })
+  end
+
   open_response_tab(buf)
 
   vim.wo[0].wrap = true
@@ -890,12 +1032,17 @@ function M.review_selected()
       return
     end
 
+    node = resolve_selected_node(node, has_review_snapshot, "opening review for", "exocortex: node has no snapshot yet")
+    if not node then
+      return
+    end
+
     review.start(node, state.root_dir)
   end
 end
 
 function M.diffview_selected()
-  local node = selected_node()
+  local node = selected_node_for_action(has_diff_snapshot, "opening diff for", "exocortex: node has no snapshot yet")
 
   if not node then
     return

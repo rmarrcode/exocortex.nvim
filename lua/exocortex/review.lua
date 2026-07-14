@@ -130,13 +130,13 @@ end
 local function proposal_winbar(s)
   local f = s.files[s.index]
   local h = current_hunk(s)
-  local target = h and string.format("proposal #%d/%d %s", h.index, #s.hunks, status_label(h)) or "no diffs"
+  local target = h and string.format("#%d/%d %s", h.index, #s.hunks, status_label(h)) or "no diffs"
   return string.format("  [%d/%d]  %s  [%s]  %s  %%=%s", s.index, #s.files, f.path, f.status, target, guide())
 end
 
 local function target_winbar(s)
   local h = current_hunk(s)
-  local target = h and string.format("target #%d/%d %s", h.index, #s.hunks, status_label(h)) or "target"
+  local target = h and string.format("#%d/%d target", h.index, #s.hunks) or "target"
   return "  editable file  " .. target .. "  %=" .. guide()
 end
 
@@ -439,7 +439,7 @@ local function mark_hunks()
   for _, hunk in ipairs(s.hunks or {}) do
     local current = hunk.index == s.hunk_index
     local hl = marker_hl(hunk, current)
-    local label = string.format("  #%d/%d %s%s", hunk.index, total, status_label(hunk), current and " current" or "")
+    local label = string.format("  #%d/%d %s", hunk.index, total, status_label(hunk))
     local left_start0 = hunk.new_count > 0 and hunk.new_start - 1 or hunk.new_start
     local left_row = display_row(s.left_buf, left_start0)
 
@@ -455,7 +455,7 @@ local function mark_hunks()
       local right_start0 = hunk_range(hunk)
       local right_row = display_row(s.right_buf, right_start0)
       vim.api.nvim_buf_set_extmark(s.right_buf, MARK_NS, right_row, 0, {
-        virt_text = { { string.format("  #%d/%d target %s", hunk.index, total, status_label(hunk)), hl } },
+        virt_text = { { string.format("  #%d/%d target", hunk.index, total), hl } },
         virt_text_pos = "eol",
         priority = current and 140 or 120,
       })

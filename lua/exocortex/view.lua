@@ -44,8 +44,28 @@ local function animate(win, from, to, duration_ms)
   local steps = 8
   local step = 0
   local timer = vim.uv.new_timer()
+  local closed = false
 
-  timer:start(0, math.floor(duration_ms / steps), vim.schedule_wrap(function()
+  local function close_timer()
+    if closed then
+      return
+    end
+
+    closed = true
+    pcall(function()
+      timer:stop()
+    end)
+    pcall(function()
+      if not timer:is_closing() then
+        timer:close()
+      end
+    end)
+  end
+
+  timer:start(0, math.max(1, math.floor(duration_ms / steps)), vim.schedule_wrap(function()
+    if closed then
+      return
+    end
     step = step + 1
     local t = smoothstep(step / steps)
 
@@ -60,8 +80,7 @@ local function animate(win, from, to, duration_ms)
     end
 
     if step >= steps then
-      timer:stop()
-      timer:close()
+      close_timer()
     end
   end))
 end

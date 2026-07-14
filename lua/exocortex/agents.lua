@@ -13,6 +13,18 @@ local LIMIT_PATTERNS = {
   "try again later",
 }
 
+local AUTH_PATTERNS = {
+  "authentication_failed",
+  "authentication failed",
+  "unauthenticated",
+  "not logged in",
+}
+
+local claude_auth_cache = {
+  checked_at = 0,
+  logged_in = false,
+}
+
 local function collect_json_text(raw)
   local texts = {}
 
@@ -48,6 +60,46 @@ local function classify_limit_error(text)
   return false
 end
 
+local function classify_auth_error(text)
+  local lowered = (text or ""):lower()
+
+  for _, pattern in ipairs(AUTH_PATTERNS) do
+    if lowered:find(pattern, 1, true) then
+      return true
+    end
+  end
+
+  return false
+end
+
+local function claude_logged_in()
+  if vim.fn.executable("claude") ~= 1 then
+    return false
+  end
+
+  local now = vim.uv.now()
+  if claude_auth_cache.checked_at ~= 0 and now - claude_auth_cache.checked_at < 15000 then
+    return claude_auth_cache.logged_in
+  end
+
+  local result = vim.system({ "claude", "auth", "status" }, { text = true }):wait()
+  local stdout = result.stdout or ""
+  local logged_in = false
+
+  if stdout ~= "" then
+    local ok, data = pcall(vim.json.decode, stdout)
+    if ok and type(data) == "table" then
+      logged_in = data.loggedIn == true
+    else
+      logged_in = stdout:find([["loggedIn"%s*:%s*true]]) ~= nil
+    end
+  end
+
+  claude_auth_cache.checked_at = now
+  claude_auth_cache.logged_in = logged_in
+  return logged_in
+end
+
 local function format_run_error(name, code, stdout, stderr)
   local parts = {}
 
@@ -81,6 +133,14 @@ local function format_run_error(name, code, stdout, stderr)
   if classify_limit_error(detail) then
     return string.format(
       "%s hit a usage limit and stopped. Wait for the provider limit to reset or switch agents. %s",
+      name,
+      detail
+    )
+  end
+
+  if classify_auth_error(detail) then
+    return string.format(
+      "%s is not authenticated. Run `claude auth login` or switch agents. %s",
       name,
       detail
     )
@@ -236,7 +296,7 @@ function M.available()
   local names = {}
 
   for name, adapter in pairs(M.adapters) do
-    if vim.fn.executable(adapter.exe) == 1 then
+    if vim.fn.executable(adapter.exe) == 1 and (name ~= "claude" or claude_logged_in()) then
       table.insert(names, name)
     end
   end
@@ -250,6 +310,11 @@ function M.run(name, model, prompt, cwd, on_done)
 
   if not adapter then
     on_done(nil, "unknown agent: " .. name)
+    return
+  end
+
+  if name == "claude" and not claude_logged_in() then
+    on_done(nil, "claude is not authenticated. Run `claude auth login` first.")
     return
   end
 

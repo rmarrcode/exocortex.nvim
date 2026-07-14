@@ -5,6 +5,12 @@ vim.g.mapleader = ","
 -- Notification and command-line message history so errors can be copied.
 local _notify_history = {}
 local _base_notify = vim.notify
+local new_terminal_tab
+local render_window_header
+local find_editor_window
+local is_file_buffer
+local move_buffers_to_editor_window
+local last_editor_window = nil
 
 local function message_level_prefix(level)
   return level == vim.log.levels.ERROR and "[E] "
@@ -75,7 +81,8 @@ vim.api.nvim_create_user_command("Messages", function()
   vim.wo[win].linebreak = true
   vim.api.nvim_win_set_cursor(win, { vim.api.nvim_buf_line_count(buf), 0 })
 
-  vim.keymap.set("n", { "q", "<C-q>" }, "<cmd>close<CR>", { buffer = buf, silent = true, desc = "Close messages" })
+  vim.keymap.set({ "n" }, "q", "<cmd>close<CR>", { buffer = buf, silent = true, desc = "Close messages" })
+  vim.keymap.set({ "n" }, "<C-q>", "<cmd>close<CR>", { buffer = buf, silent = true, desc = "Close messages" })
   vim.keymap.set("n", "Y", function()
     local content = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
     vim.fn.setreg("+", content)
@@ -165,11 +172,11 @@ lazy.setup({
     build = ":TSUpdate",
     config = function()
       local ts = require("nvim-treesitter")
-      ts.install({ "latex", "markdown", "markdown_inline" })
+      ts.install({ "latex", "markdown", "markdown_inline", "yaml" })
 
       vim.api.nvim_create_autocmd("FileType", {
         group = vim.api.nvim_create_augroup("user-treesitter", { clear = true }),
-        pattern = { "latex", "markdown" },
+        pattern = { "latex", "markdown", "yaml" },
         callback = function()
           pcall(vim.treesitter.start)
         end,
@@ -296,8 +303,12 @@ local function apply_vscode_dark_highlights()
   vim.api.nvim_set_hl(0, "LineNr", { fg = colors.muted, bg = colors.bg })
   vim.api.nvim_set_hl(0, "CursorLineNr", { fg = colors.accent, bg = colors.bg, bold = true })
   vim.api.nvim_set_hl(0, "Visual", { bg = colors.selection })
-  vim.api.nvim_set_hl(0, "NormalFloat", { fg = colors.fg, bg = colors.panel })
-  vim.api.nvim_set_hl(0, "FloatBorder", { fg = colors.gutter, bg = colors.panel })
+  vim.api.nvim_set_hl(0, "NormalFloat", { fg = colors.fg, bg = colors.bg })
+  vim.api.nvim_set_hl(0, "FloatBorder", { fg = colors.gutter, bg = colors.bg })
+  vim.api.nvim_set_hl(0, "FloatTitle", { fg = colors.fg, bg = colors.bg, bold = true })
+  vim.api.nvim_set_hl(0, "LspReferenceText", { bg = "NONE" })
+  vim.api.nvim_set_hl(0, "LspReferenceRead", { bg = "NONE" })
+  vim.api.nvim_set_hl(0, "LspReferenceWrite", { bg = "NONE" })
   vim.api.nvim_set_hl(0, "Pmenu", { fg = colors.fg, bg = colors.panel })
   vim.api.nvim_set_hl(0, "PmenuSel", { fg = colors.fg, bg = colors.selection })
   vim.api.nvim_set_hl(0, "StatusLine", { fg = colors.fg, bg = colors.panel })
@@ -329,6 +340,13 @@ local function apply_vscode_dark_highlights()
   vim.api.nvim_set_hl(0, "DapUIFloatBorder", { fg = colors.accent, bg = colors.panel })
   vim.api.nvim_set_hl(0, "DapUIWinSelect", { fg = colors.accent, bg = colors.panel, bold = true })
   vim.api.nvim_set_hl(0, "DapUIBreakpointsCurrentLine", { fg = colors.orange, bg = colors.panel, bold = true })
+  vim.api.nvim_set_hl(0, "yamlMappingKey", { fg = colors.accent })
+  vim.api.nvim_set_hl(0, "yamlBlockMappingKey", { fg = colors.accent })
+  vim.api.nvim_set_hl(0, "yamlBlockMappingDelimiter", { fg = colors.muted })
+  vim.api.nvim_set_hl(0, "yamlKeyValueDelimiter", { fg = colors.muted })
+  vim.api.nvim_set_hl(0, "@property.yaml", { fg = colors.accent })
+  vim.api.nvim_set_hl(0, "@punctuation.delimiter.yaml", { fg = colors.muted })
+  vim.api.nvim_set_hl(0, "@punctuation.special.yaml", { fg = colors.muted })
   vim.api.nvim_set_hl(0, "ExocortexStatusRunning", { fg = "#dcdcaa", bg = colors.tab_inactive, bold = true })
   vim.api.nvim_set_hl(0, "ExocortexStatusDone",    { fg = "#6a9955", bg = colors.tab_inactive })
   vim.api.nvim_set_hl(0, "ExocortexStatusError",   { fg = "#f44747", bg = colors.tab_inactive })
@@ -383,18 +401,34 @@ require("nvim-tree").setup({
       using_cut = false
     end
 
-    local function each_selected(fn)
+    local function selected_row_range()
       local mode = vim.fn.mode()
-      local start_row, end_row
+      local start_row
+      local end_row
 
-      if mode == "v" or mode == "V" then
-        start_row = math.min(vim.fn.line("v"), vim.fn.line("."))
-        end_row   = math.max(vim.fn.line("v"), vim.fn.line("."))
+      if mode == "v" or mode == "V" or mode == "\22" then
+        start_row = vim.fn.line("v")
+        end_row = vim.fn.line(".")
         vim.cmd("normal! \27")
       else
-        start_row = vim.fn.line(".")
-        end_row   = start_row
+        start_row = vim.fn.getpos("'<")[2]
+        end_row = vim.fn.getpos("'>")[2]
       end
+
+      if start_row <= 0 or end_row <= 0 then
+        start_row = vim.fn.line(".")
+        end_row = start_row
+      else
+        local a, b = start_row, end_row
+        start_row = math.min(a, b)
+        end_row = math.max(a, b)
+      end
+
+      return start_row, end_row
+    end
+
+    local function each_selected(fn)
+      local start_row, end_row = selected_row_range()
 
       local saved = vim.api.nvim_win_get_cursor(0)
       for row = start_row, end_row do
@@ -405,6 +439,62 @@ require("nvim-tree").setup({
         end
       end
       vim.api.nvim_win_set_cursor(0, saved)
+    end
+
+    local function selected_nodes()
+      local nodes = {}
+      local seen = {}
+
+      each_selected(function(node)
+        if not seen[node.absolute_path] then
+          seen[node.absolute_path] = true
+          nodes[#nodes + 1] = node
+        end
+      end)
+      return nodes
+    end
+
+    local function move_selected_to_open_window()
+      local target = find_editor_window and find_editor_window() or nil
+      if not target then
+        vim.notify("NvimTree: no editor window available", vim.log.levels.WARN)
+        return
+      end
+
+      local buffers = {}
+      local nodes = selected_nodes()
+
+      for _, node in ipairs(nodes) do
+        local path = node and node.absolute_path
+        if not path or path == "" then
+          goto continue_move
+        end
+
+        if node.type == "directory" then
+          goto continue_move
+        end
+
+        local buf = vim.fn.bufadd(path)
+        if buf < 0 then
+          goto continue_move
+        end
+
+        pcall(vim.fn.bufload, buf)
+        buffers[#buffers + 1] = buf
+        ::continue_move::
+      end
+
+      if #buffers == 0 then
+        vim.notify("NvimTree: no files selected", vim.log.levels.WARN)
+        return
+      end
+
+      if move_buffers_to_editor_window then
+        move_buffers_to_editor_window(target, buffers)
+      else
+        vim.api.nvim_set_current_win(target)
+        vim.api.nvim_win_set_buf(target, buffers[1])
+      end
     end
 
     -- y: copy into nvim-tree clipboard (non-destructive, no temp dir)
@@ -475,6 +565,27 @@ require("nvim-tree").setup({
       api.tree.reload()
     end, opts("Paste file(s)"))
 
+    vim.keymap.set({ "n", "v" }, "<D-C-Right>", move_selected_to_open_window, opts("Move file(s) to open window"))
+    vim.keymap.set({ "n", "v" }, "<C-D-Right>", move_selected_to_open_window, opts("Move file(s) to open window"))
+    vim.keymap.set({ "n", "v" }, "<C-Right>", move_selected_to_open_window, opts("Move file(s) to open window"))
+
+    pcall(vim.keymap.del, "n", "t", { buffer = bufnr })
+    vim.keymap.set("n", "t", function()
+      local node = api.tree.get_node_under_cursor()
+      if not node or not node.absolute_path or node.absolute_path == "" then
+        return
+      end
+
+      local is_dir = node.type == "directory" or (node.fs_stat and node.fs_stat.type == "directory")
+      if not is_dir then
+        return
+      end
+
+      if new_terminal_tab then
+        new_terminal_tab(node.absolute_path)
+      end
+    end, opts("Open terminal in directory"))
+
     -- Leaving the sidebar: permanently delete anything still in the temp dir
     vim.api.nvim_create_autocmd("BufLeave", {
       buffer = bufnr,
@@ -527,26 +638,26 @@ local function run_telescope(picker, opts)
 end
 
 local function project_search()
-  local cwd = vim.uv.cwd() or vim.fn.getcwd()
-
-  if vim.fn.isdirectory(cwd .. "/.git") == 1 then
-    -- git ls-files cannot combine --others (untracked) with --recurse-submodules,
-    -- and telescope rejects the pair outright.
-    run_telescope(builtin.git_files, {
-      show_untracked = true,
-    })
-    return
-  end
-
   run_telescope(builtin.find_files, {
     hidden = true,
-    no_ignore = false,
+    no_ignore = true,
+  })
+end
+
+local function project_grep()
+  run_telescope(builtin.live_grep, {
+    hidden = true,
+    no_ignore = true,
   })
 end
 
 vim.keymap.set("n", "<C-p>", function() with_editor_window(project_search) end, {
   silent = true,
   desc = "Search project files",
+})
+vim.keymap.set("n", "<C-f>", function() with_editor_window(project_grep) end, {
+  silent = true,
+  desc = "Search project text",
 })
 vim.keymap.set("n", "<leader>ff", function() with_editor_window(function() builtin.find_files() end) end)
 vim.keymap.set("n", "<leader>fg", function() with_editor_window(function() builtin.live_grep() end) end)
@@ -694,7 +805,7 @@ local function get_empty_buf()
   return _empty_buf
 end
 
-local function is_file_buffer(buf)
+is_file_buffer = function(buf)
   return vim.api.nvim_buf_is_valid(buf)
     and vim.bo[buf].buflisted
     and vim.bo[buf].buftype == ""
@@ -755,7 +866,7 @@ local function render_editor_tabs(win, current_buf)
   return table.concat(parts, "")
 end
 
-local function render_window_header(win)
+render_window_header = function(win)
   if not vim.api.nvim_win_is_valid(win) then
     return
   end
@@ -885,6 +996,99 @@ local function leave_window_tab(win, buf)
   end
 end
 
+function _G.ExocortexLeaveWindowTab(win, buf)
+  leave_window_tab(win, buf)
+end
+
+local function register_window_tab(win, buf)
+  if not (vim.api.nvim_win_is_valid(win) and is_file_buffer(buf)) then
+    return
+  end
+
+  local tabs = window_tab_list(win)
+
+  for _, known in ipairs(tabs) do
+    if known == buf then
+      return
+    end
+  end
+
+  table.insert(tabs, buf)
+  window_tabs[win] = tabs
+end
+
+local function tab_list_has(tabs, buf)
+  for _, known in ipairs(tabs) do
+    if known == buf then
+      return true
+    end
+  end
+
+  return false
+end
+
+move_buffers_to_editor_window = function(target_win, buffers)
+  if not vim.api.nvim_win_is_valid(target_win) then
+    return
+  end
+
+  local target_tabs = window_tab_list(target_win)
+  local target_buf = vim.api.nvim_win_get_buf(target_win)
+
+  if is_file_buffer(target_buf) and not tab_list_has(target_tabs, target_buf) then
+    table.insert(target_tabs, target_buf)
+  end
+
+  local first_buf
+
+  for _, buf in ipairs(buffers) do
+    if is_file_buffer(buf) then
+      local source_wins = {}
+      local source_seen = {}
+
+      local function add_source_win(win)
+        if not source_seen[win] then
+          source_seen[win] = true
+          table.insert(source_wins, win)
+        end
+      end
+
+      for win, tabs in pairs(window_tabs) do
+        if win ~= target_win and vim.api.nvim_win_is_valid(win) and tab_list_has(tabs, buf) then
+          add_source_win(win)
+        end
+      end
+
+      local visible_win = vim.fn.bufwinid(buf)
+      if visible_win > 0 and visible_win ~= target_win and vim.api.nvim_win_is_valid(visible_win) then
+        add_source_win(visible_win)
+      end
+
+      for _, win in ipairs(source_wins) do
+        leave_window_tab(win, buf)
+      end
+
+      if not tab_list_has(target_tabs, buf) then
+        table.insert(target_tabs, buf)
+      end
+
+      first_buf = first_buf or buf
+    end
+  end
+
+  window_tabs[target_win] = target_tabs
+
+  if first_buf then
+    vim.api.nvim_set_current_win(target_win)
+    vim.api.nvim_win_set_buf(target_win, first_buf)
+    render_window_header(target_win)
+  end
+end
+
+function _G.ExocortexRegisterWindowTab(win, buf)
+  register_window_tab(win, buf)
+end
+
 local move_file_buffer_out_of_terminal_window
 
 local function refresh_window_headers()
@@ -945,21 +1149,26 @@ local function ctrl_shift_tab_lhses()
   }
 end
 
-local function find_editor_window()
-  local current_win = vim.api.nvim_get_current_win()
-
-  local function is_editor_window(win)
+find_editor_window = function()
+  local function is_editor_window_local(win)
     local buf = vim.api.nvim_win_get_buf(win)
-
     return vim.bo[buf].buftype ~= "terminal" and vim.bo[buf].filetype ~= "NvimTree"
   end
 
-  if is_editor_window(current_win) then
+  if last_editor_window and vim.api.nvim_win_is_valid(last_editor_window) and is_editor_window_local(last_editor_window) then
+    return last_editor_window
+  end
+
+  local current_win = vim.api.nvim_get_current_win()
+
+  if is_editor_window_local(current_win) then
+    last_editor_window = current_win
     return current_win
   end
 
   for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
-    if is_editor_window(win) then
+    if is_editor_window_local(win) then
+      last_editor_window = win
       return win
     end
   end
@@ -968,8 +1177,17 @@ local function find_editor_window()
     local buf = vim.api.nvim_win_get_buf(win)
 
     if vim.bo[buf].buftype ~= "terminal" then
+      last_editor_window = win
       return win
     end
+  end
+end
+
+do
+  local win = vim.api.nvim_get_current_win()
+  local buf = vim.api.nvim_win_get_buf(win)
+  if vim.bo[buf].buftype ~= "terminal" and vim.bo[buf].filetype ~= "NvimTree" then
+    last_editor_window = win
   end
 end
 
@@ -1183,6 +1401,63 @@ local function is_editor_window(win)
   return vim.bo[buf].buftype ~= "terminal" and vim.bo[buf].filetype ~= "NvimTree"
 end
 
+vim.api.nvim_create_autocmd({ "BufEnter", "WinEnter" }, {
+  group = augroup,
+  callback = function()
+    local win = vim.api.nvim_get_current_win()
+    local buf = vim.api.nvim_win_get_buf(win)
+
+    if vim.bo[buf].buftype ~= "terminal" and vim.bo[buf].filetype ~= "NvimTree" then
+      last_editor_window = win
+    end
+  end,
+})
+
+vim.api.nvim_create_autocmd("FileType", {
+  group = augroup,
+  pattern = { "yaml", "yml" },
+  callback = function(args)
+    vim.bo[args.buf].expandtab = true
+    vim.bo[args.buf].shiftwidth = 2
+    vim.bo[args.buf].softtabstop = 2
+    vim.bo[args.buf].tabstop = 2
+
+    for _, win in ipairs(vim.fn.win_findbuf(args.buf)) do
+      if vim.api.nvim_win_is_valid(win) then
+        vim.wo[win].cursorline = false
+        vim.wo[win].conceallevel = 0
+        vim.wo[win].concealcursor = ""
+      end
+    end
+  end,
+})
+
+local function leftmost_editor_window()
+  local best_win
+  local best_row
+  local best_col
+
+  for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+    if is_editor_window(win) then
+      local pos = vim.fn.win_screenpos(win)
+      local row = pos[1] or 0
+      local col = pos[2] or 0
+
+      if not best_win or col < best_col or (col == best_col and row < best_row) then
+        best_win = win
+        best_row = row
+        best_col = col
+      end
+    end
+  end
+
+  return best_win
+end
+
+function _G.ExocortexLeftmostEditorWindow()
+  return leftmost_editor_window()
+end
+
 local function open_buffer_in_right_split(buf)
   vim.cmd("vsplit")
   vim.api.nvim_win_set_buf(vim.api.nvim_get_current_win(), buf)
@@ -1308,7 +1583,7 @@ local terminal_state = {
 }
 
 local set_terminal_buffer_keymaps
-local new_terminal_tab
+
 
 local function map_terminal_shortcut(buf, lhses, rhs, desc)
   for _, lhs in ipairs(lhses) do
@@ -1541,9 +1816,20 @@ local function toggle_bottom_terminal()
   show_current_terminal()
 end
 
-new_terminal_tab = function()
+new_terminal_tab = function(cwd)
   local win = ensure_terminal_window()
   vim.api.nvim_set_current_win(win)
+
+  local restore_cwd
+  if cwd and cwd ~= "" then
+    restore_cwd = vim.fn.getcwd()
+    if vim.fn.fnamemodify(restore_cwd, ":p") ~= vim.fn.fnamemodify(cwd, ":p") then
+      vim.cmd("lcd " .. vim.fn.fnameescape(cwd))
+    else
+      restore_cwd = nil
+    end
+  end
+
   vim.cmd("terminal")
 
   local buf = vim.api.nvim_get_current_buf()
@@ -1554,6 +1840,11 @@ new_terminal_tab = function()
 
   configure_terminal_window(win)
   update_terminal_winbar()
+
+  if restore_cwd then
+    pcall(vim.cmd, "lcd " .. vim.fn.fnameescape(restore_cwd))
+  end
+
   vim.cmd("startinsert")
 end
 

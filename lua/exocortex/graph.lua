@@ -464,10 +464,14 @@ local function card_extmarks(id, rect)
   end
 end
 
+local ensure_session_sidebar
+
 function M.render()
   if not (M.buf and vim.api.nvim_buf_is_valid(M.buf)) then
     return
   end
+
+  ensure_session_sidebar()
 
   local placed = compute_layout()
   local max_depth, max_lane = 0, 0
@@ -838,7 +842,7 @@ local function render_sessions()
   end
 end
 
-local function ensure_session_sidebar()
+ensure_session_sidebar = function()
   if not (M.buf and vim.api.nvim_buf_is_valid(M.buf)) then
     return
   end
@@ -858,10 +862,24 @@ local function ensure_session_sidebar()
     vim.bo[M.session_buf].filetype = "exocortex-sessions"
   end
 
+  local restore_tab = vim.api.nvim_get_current_tabpage()
+  local restore_win = vim.api.nvim_get_current_win()
+
   if not (M.session_win and vim.api.nvim_win_is_valid(M.session_win)) then
-    vim.api.nvim_set_current_win(graph)
+    local ok = pcall(vim.api.nvim_set_current_win, graph)
+    if not ok then
+      return
+    end
+
     vim.cmd("leftabove vsplit")
     M.session_win = vim.api.nvim_get_current_win()
+
+    if vim.api.nvim_tabpage_is_valid(restore_tab) then
+      pcall(vim.api.nvim_set_current_tabpage, restore_tab)
+    end
+    if vim.api.nvim_win_is_valid(restore_win) then
+      pcall(vim.api.nvim_set_current_win, restore_win)
+    end
   end
 
   vim.api.nvim_win_set_buf(M.session_win, M.session_buf)
@@ -879,7 +897,12 @@ local function ensure_session_sidebar()
   if update_usage_widget then
     pcall(update_usage_widget)
   end
-  vim.api.nvim_set_current_win(graph)
+  if vim.api.nvim_win_is_valid(restore_win) and vim.api.nvim_get_current_win() ~= restore_win then
+    if vim.api.nvim_tabpage_is_valid(restore_tab) then
+      pcall(vim.api.nvim_set_current_tabpage, restore_tab)
+    end
+    pcall(vim.api.nvim_set_current_win, restore_win)
+  end
 end
 
 function M.session_changed(what)
