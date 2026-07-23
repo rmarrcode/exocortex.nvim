@@ -78,7 +78,7 @@ M.defaults = {
       page_down = "]",
       page_up = "[",
       function_to_top = "<C-t>",
-      close = { "<C-q>", "<Esc>" },
+      close = { "<C-q>" },
     },
     debug = {
       start_continue = { "<F5>", "<leader>dc" },

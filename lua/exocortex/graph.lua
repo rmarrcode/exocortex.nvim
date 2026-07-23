@@ -34,6 +34,14 @@ local function first_key(lhses)
   return lhses or ""
 end
 
+local function mode_label(intent)
+  if intent == "read" then
+    return "read mode"
+  elseif intent == "agent" then
+    return "agent mode"
+  end
+end
+
 local SPINNER = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧" }
 
 M.buf = nil
@@ -339,8 +347,13 @@ local function draw_card(grid, node, rect, selected)
 
   local icon, detail = status_line(node)
   local badge = M.unread[node.id] and "●" or " "
+  local agent = state.format_agent(node.agent, node.model)
+  local mode = mode_label(node.intent)
+  if mode then
+    agent = agent .. " · " .. mode
+  end
   put(grid, rect.row,     rect.col, tl .. hz .. " " .. fit(node.prompt, card_w() - 6) .. badge .. hz .. tr)
-  put(grid, rect.row + 1, rect.col, vt .. " " .. fit(state.format_agent(node.agent, node.model) .. " · " .. icon, card_w() - 4) .. " " .. vt)
+  put(grid, rect.row + 1, rect.col, vt .. " " .. fit(agent .. " · " .. icon, card_w() - 4) .. " " .. vt)
   put(grid, rect.row + 2, rect.col, vt .. " " .. fit(detail, card_w() - 4) .. " " .. vt)
   put(grid, rect.row + 3, rect.col, bl .. string.rep(hz, card_w() - 2) .. br)
 end

@@ -121,9 +121,16 @@ end
 -- transcript as context, which works identically for every CLI.
 local PROMPT_INTENT_DIFF = "diff"
 local PROMPT_INTENT_READ = "read"
+local PROMPT_INTENT_AGENT = "agent"
 
 local function normalize_prompt_intent(intent)
-  return intent == PROMPT_INTENT_READ and PROMPT_INTENT_READ or PROMPT_INTENT_DIFF
+  if intent == PROMPT_INTENT_READ then
+    return PROMPT_INTENT_READ
+  end
+  if intent == PROMPT_INTENT_AGENT then
+    return PROMPT_INTENT_AGENT
+  end
+  return PROMPT_INTENT_DIFF
 end
 
 local function build_prompt(parent_id, prompt, proposal_root, intent)
@@ -141,6 +148,13 @@ local function build_prompt(parent_id, prompt, proposal_root, intent)
     table.insert(parts, "Do not create, edit, delete, rename, format, or otherwise modify files.")
     table.insert(parts, "You may inspect files and run read-only commands, but your final output should be a Markdown response meant to be read.")
     table.insert(parts, "If code changes would be useful, describe them instead of implementing them.")
+  elseif intent == PROMPT_INTENT_AGENT then
+    table.insert(parts, "Submission mode: AGENT WORKTREE RUN.")
+    table.insert(parts, "You may inspect files, run shell commands, execute helper scripts, run tests, and edit files inside the proposal worktree.")
+    table.insert(parts, "Treat the proposal worktree as the sandbox; do not touch the live checkout path.")
+    table.insert(parts, "Prefer direct one-off shell commands over creating helper scripts, bootstrap scripts, or disposable files.")
+    table.insert(parts, "Do not add or rewrite install scripts, wrappers, or dependency bootstrap code unless the user explicitly asks for a persistent change.")
+    table.insert(parts, "When you finish, summarize the commands you ran. Only include code changes if they were directly necessary to complete the requested command run. Keep the final response concise and reviewable.")
   else
     table.insert(parts, "Submission mode: DIFF PROPOSAL.")
     table.insert(parts, "Make the requested code/config changes in the proposal worktree.")
@@ -591,7 +605,7 @@ end
 local function open_prompt_editor(parent_id, agent_name, model_name)
   local suffix = model_name and (agent_name .. "/" .. model_name) or agent_name
   local title = parent_id and (" exocortex from " .. parent_id .. " ") or " exocortex new root "
-  local footer = "  Ctrl-d diffs  Ctrl-r read  Ctrl-q/Esc cancel  "
+  local footer = "  Ctrl-d diff  Ctrl-r read  Ctrl-a agent  Ctrl-q/Esc cancel  "
   local buf = vim.api.nvim_create_buf(false, true)
 
   vim.bo[buf].bufhidden = "wipe"
@@ -663,7 +677,7 @@ local function open_prompt_editor(parent_id, agent_name, model_name)
 
   keymaps.set({ "n", "i" }, "<C-d>", function() submit(PROMPT_INTENT_DIFF) end, { buffer = buf, silent = true, nowait = true, desc = "Submit prompt for diffs" })
   keymaps.set({ "n", "i" }, "<C-r>", function() submit(PROMPT_INTENT_READ) end, { buffer = buf, silent = true, nowait = true, desc = "Submit prompt for readable response" })
-  keymaps.set({ "n", "i" }, "<C-a>", function() submit(PROMPT_INTENT_DIFF) end, { buffer = buf, silent = true, nowait = true, desc = "Submit prompt for diffs" })
+  keymaps.set({ "n", "i" }, "<C-a>", function() submit(PROMPT_INTENT_AGENT) end, { buffer = buf, silent = true, nowait = true, desc = "Submit prompt for agent mode" })
   keymaps.set({ "n", "i" }, "<C-q>", close, { buffer = buf, silent = true, nowait = true, desc = "Cancel prompt" })
   keymaps.set("n", "<Esc>", close, { buffer = buf, silent = true, nowait = true, desc = "Cancel prompt" })
 

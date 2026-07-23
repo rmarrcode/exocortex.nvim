@@ -11,7 +11,7 @@
 --   Ctrl-l / Ctrl-h next / previous changed file
 --   ] / [         page down / up inside the file
 --   Ctrl-t        put the current function at the top of the window
---   Ctrl-q / Esc  end review
+--   Ctrl-q        end review
 
 local git = require("exocortex.git")
 local config_loader = require("exocortex.config_loader")

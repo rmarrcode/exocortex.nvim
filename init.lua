@@ -172,11 +172,11 @@ lazy.setup({
     build = ":TSUpdate",
     config = function()
       local ts = require("nvim-treesitter")
-      ts.install({ "latex", "markdown", "markdown_inline", "yaml" })
+      ts.install({ "bash", "json", "latex", "markdown", "markdown_inline", "yaml" })
 
       vim.api.nvim_create_autocmd("FileType", {
         group = vim.api.nvim_create_augroup("user-treesitter", { clear = true }),
-        pattern = { "latex", "markdown", "yaml" },
+        pattern = { "bash", "json", "jsonc", "latex", "markdown", "sh", "yaml", "zsh" },
         callback = function()
           pcall(vim.treesitter.start)
         end,
@@ -222,6 +222,7 @@ vim.o.relativenumber = true
 vim.o.termguicolors = true
 vim.o.mouse = "a"
 vim.o.hidden = true
+vim.opt.clipboard = "unnamedplus"
 vim.o.showtabline = 2 -- always show (used for AI node status bar)
 vim.o.tabline = "%!v:lua.ExocortexTabLine()"
 vim.o.splitright = true
@@ -234,6 +235,7 @@ vim.o.cursorline = true
 vim.o.signcolumn = "yes"
 vim.o.virtualedit = "block"
 vim.opt.fillchars:append({ eob = " " })
+vim.g.sh_no_error = 1
 
 vim.keymap.set({ "n", "x", "o" }, "<Space>", "<Nop>", {
   silent = true,
@@ -344,9 +346,24 @@ local function apply_vscode_dark_highlights()
   vim.api.nvim_set_hl(0, "yamlBlockMappingKey", { fg = colors.accent })
   vim.api.nvim_set_hl(0, "yamlBlockMappingDelimiter", { fg = colors.muted })
   vim.api.nvim_set_hl(0, "yamlKeyValueDelimiter", { fg = colors.muted })
+  vim.api.nvim_set_hl(0, "jsonKeyword", { fg = colors.accent })
+  vim.api.nvim_set_hl(0, "jsonKeywordMatch", { fg = colors.muted })
+  vim.api.nvim_set_hl(0, "jsonQuote", { fg = colors.muted })
+  vim.api.nvim_set_hl(0, "@property.json", { fg = colors.accent })
+  vim.api.nvim_set_hl(0, "@property.jsonc", { fg = colors.accent })
+  vim.api.nvim_set_hl(0, "@punctuation.delimiter.json", { fg = colors.muted })
+  vim.api.nvim_set_hl(0, "@punctuation.delimiter.jsonc", { fg = colors.muted })
   vim.api.nvim_set_hl(0, "@property.yaml", { fg = colors.accent })
   vim.api.nvim_set_hl(0, "@punctuation.delimiter.yaml", { fg = colors.muted })
   vim.api.nvim_set_hl(0, "@punctuation.special.yaml", { fg = colors.muted })
+  vim.api.nvim_set_hl(0, "@function.call.bash", { fg = colors.fg })
+  vim.api.nvim_set_hl(0, "@operator.bash", { fg = colors.muted })
+  vim.api.nvim_set_hl(0, "@punctuation.special.bash", { fg = colors.muted })
+  vim.api.nvim_set_hl(0, "@variable.bash", { fg = colors.accent })
+  vim.api.nvim_set_hl(0, "shDeref", { fg = colors.accent })
+  vim.api.nvim_set_hl(0, "shDerefSimple", { fg = colors.accent })
+  vim.api.nvim_set_hl(0, "shDerefVar", { fg = colors.accent })
+  vim.api.nvim_set_hl(0, "shOption", { fg = colors.muted })
   vim.api.nvim_set_hl(0, "ExocortexStatusRunning", { fg = "#dcdcaa", bg = colors.tab_inactive, bold = true })
   vim.api.nvim_set_hl(0, "ExocortexStatusDone",    { fg = "#6a9955", bg = colors.tab_inactive })
   vim.api.nvim_set_hl(0, "ExocortexStatusError",   { fg = "#f44747", bg = colors.tab_inactive })
@@ -360,6 +377,129 @@ vim.api.nvim_create_autocmd("ColorScheme", {
 })
 
 -- ============================================================================
+-- JSON
+-- ============================================================================
+
+local function format_json_buffer(bufnr, opts)
+  bufnr = bufnr or vim.api.nvim_get_current_buf()
+  opts = opts or {}
+
+  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  local text = table.concat(lines, "\n")
+
+  if vim.trim(text) == "" then
+    return true
+  end
+
+  local commands = {}
+  local filetype = vim.bo[bufnr].filetype
+
+  if vim.fn.executable("prettier") == 1 then
+    table.insert(commands, { "prettier", "--parser", filetype == "jsonc" and "jsonc" or "json" })
+  end
+
+  if filetype == "json" and vim.fn.executable("jq") == 1 then
+    table.insert(commands, { "jq", "." })
+  end
+
+  if filetype == "json" then
+    if vim.fn.executable("python3") == 1 then
+      table.insert(commands, { "python3", "-m", "json.tool" })
+    elseif vim.fn.executable("python") == 1 then
+      table.insert(commands, { "python", "-m", "json.tool" })
+    end
+  end
+
+  local last_error = filetype == "jsonc" and "no JSONC formatter found: install prettier" or "no JSON formatter found: install jq, python3, or prettier"
+
+  for _, command in ipairs(commands) do
+    local output = vim.fn.system(command, text)
+
+    if vim.v.shell_error == 0 and vim.trim(output) ~= "" then
+      local view = vim.fn.winsaveview()
+      vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, vim.split(vim.trim(output), "\n", { plain = true }))
+      vim.fn.winrestview(view)
+      return true
+    end
+
+    last_error = vim.trim(output)
+  end
+
+  if not opts.silent then
+    vim.notify(last_error, vim.log.levels.ERROR)
+  end
+
+  return false
+end
+
+vim.api.nvim_create_user_command("JsonFormat", format_json_buffer, {
+  desc = "Pretty-print the current JSON buffer",
+})
+
+vim.api.nvim_create_autocmd("FileType", {
+  group = augroup,
+  pattern = { "json", "jsonc" },
+  callback = function(args)
+    vim.bo[args.buf].shiftwidth = 2
+    vim.bo[args.buf].tabstop = 2
+    vim.bo[args.buf].softtabstop = 2
+    vim.bo[args.buf].expandtab = true
+    vim.wo.conceallevel = 0
+    vim.wo.wrap = false
+
+    if vim.fn.executable("prettier") == 1 then
+      local parser = vim.bo[args.buf].filetype == "jsonc" and "jsonc" or "json"
+      vim.bo[args.buf].formatprg = "prettier --parser " .. parser
+      vim.bo[args.buf].equalprg = "prettier --parser " .. parser
+    elseif vim.bo[args.buf].filetype == "json" and vim.fn.executable("jq") == 1 then
+      vim.bo[args.buf].formatprg = "jq ."
+      vim.bo[args.buf].equalprg = "jq ."
+    end
+
+    vim.keymap.set("n", "<leader>jf", function()
+      format_json_buffer(args.buf)
+    end, {
+      buffer = args.buf,
+      silent = true,
+      desc = "Pretty-print JSON",
+    })
+  end,
+})
+
+vim.api.nvim_create_autocmd("BufWritePre", {
+  group = augroup,
+  pattern = { "*.json", "*.jsonc" },
+  callback = function(args)
+    format_json_buffer(args.buf, { silent = true })
+  end,
+})
+
+-- ============================================================================
+-- SHELL SCRIPTS
+-- ============================================================================
+
+vim.api.nvim_create_autocmd("FileType", {
+  group = augroup,
+  pattern = { "sh", "bash", "zsh" },
+  callback = function(args)
+    vim.bo[args.buf].shiftwidth = 2
+    vim.bo[args.buf].tabstop = 2
+    vim.bo[args.buf].softtabstop = 2
+    vim.bo[args.buf].expandtab = true
+    vim.bo[args.buf].textwidth = 0
+    vim.bo[args.buf].formatoptions = vim.bo[args.buf].formatoptions:gsub("[t]", "")
+    vim.wo.conceallevel = 0
+    vim.wo.concealcursor = ""
+    vim.wo.wrap = false
+
+    if vim.fn.executable("shfmt") == 1 then
+      vim.bo[args.buf].formatprg = "shfmt -i 2 -ci -sr -"
+      vim.bo[args.buf].equalprg = "shfmt -i 2 -ci -sr -"
+    end
+  end,
+})
+
+-- ============================================================================
 -- NVIM TREE
 -- ============================================================================
 
@@ -367,6 +507,13 @@ require("nvim-tree").setup({
   view = {
     side = "left",
     adaptive_size = true,
+  },
+  renderer = {
+    hidden_display = function(hidden_stats)
+      if hidden_stats and hidden_stats.limited_dir then
+        return "(showing first 15 entries; more omitted)"
+      end
+    end,
   },
   git = {
     enable = true,
@@ -379,6 +526,11 @@ require("nvim-tree").setup({
     enable = true,
     debounce_delay = 100,
   },
+  actions = {
+    expand_all = {
+      max_folder_discovery = 15,
+    },
+  },
   on_attach = function(bufnr)
     local api = require("nvim-tree.api")
     api.config.mappings.default_on_attach(bufnr)
@@ -387,7 +539,110 @@ require("nvim-tree").setup({
       return { buffer = bufnr, noremap = true, silent = true, nowait = true, desc = "NvimTree: " .. desc }
     end
 
-    -- d moves files here so they vanish from the sidebar; p moves them out.
+    local dir_entry_limit = 15
+
+    local function is_dir_node(node)
+      return node and (node.type == "directory" or (node.fs_stat and node.fs_stat.type == "directory"))
+    end
+
+    local function read_dir_head(path, limit)
+      local handle = path and vim.uv.fs_scandir(path)
+      if not handle then
+        return nil, false
+      end
+
+      local names = {}
+      while true do
+        local name = vim.uv.fs_scandir_next(handle)
+        if not name then
+          break
+        end
+
+        if #names >= limit then
+          return names, true
+        end
+
+        names[#names + 1] = name
+      end
+
+      return names, false
+    end
+
+    local function draw_limited_dir(node, names)
+      local ok_core, core = pcall(require, "nvim-tree.core")
+      local ok_factory, node_factory = pcall(require, "nvim-tree.node.factory")
+      local ok_utils, tree_utils = pcall(require, "nvim-tree.utils")
+      if not (ok_core and ok_factory and ok_utils) then
+        api.node.open.edit(node)
+        return
+      end
+
+      local explorer = core.get_explorer()
+      if not explorer then
+        api.node.open.edit(node)
+        return
+      end
+
+      if node.nodes then
+        for _, child in ipairs(node.nodes) do
+          if child.destroy then
+            child:destroy()
+          end
+        end
+      end
+
+      local parent_path = node.link_to or node.absolute_path
+      node.nodes = {}
+      node.has_children = false
+      node.hidden_stats = { limited_dir = 1 }
+
+      for _, name in ipairs(names) do
+        local abs = tree_utils.path_join({ parent_path, name })
+        local stat = vim.uv.fs_lstat(abs)
+        local child = node_factory.create({
+          explorer = explorer,
+          parent = node,
+          absolute_path = abs,
+          name = name,
+          fs_stat = stat,
+        })
+        if child then
+          node.nodes[#node.nodes + 1] = child
+        end
+      end
+
+      table.sort(node.nodes, function(a, b)
+        if a.type ~= b.type then
+          return a.type == "directory"
+        end
+        return a.name:lower() < b.name:lower()
+      end)
+
+      node.open = true
+      explorer.renderer:draw()
+      vim.notify(
+        string.format("NvimTree: showing first %d entries for large directory", dir_entry_limit),
+        vim.log.levels.INFO
+      )
+    end
+
+    local function open_with_dir_limit()
+      local node = api.tree.get_node_under_cursor()
+      if not is_dir_node(node) or node.open then
+        api.node.open.edit(node)
+        return
+      end
+
+      local names, overflow = read_dir_head(node.link_to or node.absolute_path, dir_entry_limit)
+      if not names or not overflow then
+        api.node.open.edit(node)
+        return
+      end
+
+      draw_limited_dir(node, names)
+    end
+
+    -- Deletion requires a visual-block selection followed by dd.
     local cut_dir   = nil  -- temp dir holding cut files
     local cut_names = {}   -- basenames of files inside cut_dir
     local using_cut = false
@@ -497,6 +752,34 @@ require("nvim-tree").setup({
       end
     end
 
+    local function delete_selected_nodes()
+      if vim.fn.mode() ~= "\22" then
+        vim.notify("NvimTree: use visual block selection (Ctrl-V) before dd", vim.log.levels.WARN)
+        return
+      end
+
+      local nodes = selected_nodes()
+      local deleted = 0
+
+      for _, node in ipairs(nodes) do
+        local path = node and node.absolute_path
+        if path and path ~= "" then
+          local is_dir = node.type == "directory" or (node.fs_stat and node.fs_stat.type == "directory")
+          local ok = vim.fn.delete(path, is_dir and "rf" or "") == 0
+          if ok then
+            deleted = deleted + 1
+          end
+        end
+      end
+
+      clear_cut()
+      api.tree.reload()
+
+      if deleted == 0 then
+        vim.notify("NvimTree: no files selected", vim.log.levels.WARN)
+      end
+    end
+
     -- y: copy into nvim-tree clipboard (non-destructive, no temp dir)
     pcall(vim.keymap.del, "n", "y", { buffer = bufnr })
     vim.keymap.set({ "n", "v" }, "y", function()
@@ -504,35 +787,13 @@ require("nvim-tree").setup({
       each_selected(function(_) api.fs.copy.node() end)
     end, opts("Yank (copy) file(s)"))
 
-    -- d: physically move files to a temp dir so they disappear from the
-    --    sidebar immediately. p moves them to the destination; leaving the
-    --    sidebar without pasting permanently deletes the temp dir.
     pcall(vim.keymap.del, "n", "d", { buffer = bufnr })
-    vim.keymap.set({ "n", "v" }, "d", function()
-      clear_cut()
-      cut_dir   = vim.fn.tempname()
-      cut_names = {}
-      using_cut = true
-      vim.fn.mkdir(cut_dir, "p")
+    vim.keymap.set("x", "dd", delete_selected_nodes, opts("Delete selected file(s)"))
+    vim.keymap.set("n", "dd", function()
+      vim.notify("NvimTree: use visual block selection (Ctrl-V) then dd to delete files", vim.log.levels.WARN)
+    end, opts("Delete selected file(s)"))
 
-      each_selected(function(node)
-        local name = vim.fn.fnamemodify(node.absolute_path, ":t")
-        local dest = cut_dir .. "/" .. name
-        local i = 1
-        while vim.fn.filereadable(dest) == 1 or vim.fn.isdirectory(dest) == 1 do
-          dest = cut_dir .. "/" .. name .. "_" .. i
-          i    = i + 1
-        end
-        if vim.fn.rename(node.absolute_path, dest) == 0 then
-          table.insert(cut_names, vim.fn.fnamemodify(dest, ":t"))
-        end
-      end)
-
-      api.tree.reload()
-    end, opts("Cut (move/delete) file(s)"))
-
-    -- p: if d was used, move from temp dir to cursor's directory;
-    --    otherwise fall through to nvim-tree's normal paste (for y)
+    -- p pastes copied files, or moves temp-cut files if that legacy state exists.
     pcall(vim.keymap.del, "n", "p", { buffer = bufnr })
     vim.keymap.set("n", "p", function()
       if not using_cut then
@@ -568,6 +829,10 @@ require("nvim-tree").setup({
     vim.keymap.set({ "n", "v" }, "<D-C-Right>", move_selected_to_open_window, opts("Move file(s) to open window"))
     vim.keymap.set({ "n", "v" }, "<C-D-Right>", move_selected_to_open_window, opts("Move file(s) to open window"))
     vim.keymap.set({ "n", "v" }, "<C-Right>", move_selected_to_open_window, opts("Move file(s) to open window"))
+
+    vim.keymap.set("n", "<CR>", open_with_dir_limit, opts("Open"))
+    vim.keymap.set("n", "o", open_with_dir_limit, opts("Open"))
+    vim.keymap.set("n", "<2-LeftMouse>", open_with_dir_limit, opts("Open"))
 
     pcall(vim.keymap.del, "n", "t", { buffer = bufnr })
     vim.keymap.set("n", "t", function()
@@ -637,17 +902,108 @@ local function run_telescope(picker, opts)
   vim.notify("Telescope failed: " .. tostring(err), vim.log.levels.ERROR)
 end
 
+local search_root_markers = {
+  ".git",
+  "pyproject.toml",
+  "package.json",
+  "Cargo.toml",
+  "go.mod",
+  "Makefile",
+  "README.md",
+}
+
+local search_exclude_globs = {
+  "!**/.git/**",
+  "!**/node_modules/**",
+  "!**/.venv/**",
+  "!**/venv/**",
+  "!**/__pycache__/**",
+  "!**/.mypy_cache/**",
+  "!**/.pytest_cache/**",
+  "!**/.ruff_cache/**",
+  "!**/dist/**",
+  "!**/build/**",
+  "!**/target/**",
+  "!**/dataset/**",
+  "!**/datasets/**",
+  "!**/data/**",
+  "!**/mlruns/**",
+}
+
+local function current_search_start()
+  local name = vim.api.nvim_buf_get_name(0)
+  if name ~= "" then
+    return vim.fn.fnamemodify(name, ":p:h")
+  end
+  return vim.uv.cwd() or vim.fn.getcwd()
+end
+
+local function project_root_for_search()
+  local start = current_search_start()
+  local root = vim.fs.root(start, search_root_markers)
+  return root or start
+end
+
+local function search_root_is_too_broad(root)
+  local normalized = vim.fn.fnamemodify(root, ":p")
+  local home = vim.fn.fnamemodify(vim.fn.expand("~"), ":p")
+  return normalized == "/" or normalized == home
+end
+
+local function rg_file_command()
+  local cmd = { "rg", "--files", "--hidden", "--color", "never" }
+
+  for _, glob in ipairs(search_exclude_globs) do
+    cmd[#cmd + 1] = "--glob"
+    cmd[#cmd + 1] = glob
+  end
+
+  return cmd
+end
+
 local function project_search()
+  local root = project_root_for_search()
+
+  if search_root_is_too_broad(root) then
+    vim.notify("Telescope: refusing to scan " .. root .. "; open a project file or cd into a project", vim.log.levels.WARN)
+    return
+  end
+
+  if vim.fn.executable("rg") == 1 then
+    run_telescope(builtin.find_files, {
+      cwd = root,
+      find_command = rg_file_command(),
+      prompt_title = "Project files: " .. vim.fn.fnamemodify(root, ":~"),
+    })
+    return
+  end
+
   run_telescope(builtin.find_files, {
-    hidden = true,
-    no_ignore = true,
+    cwd = root,
+    hidden = false,
+    prompt_title = "Project files: " .. vim.fn.fnamemodify(root, ":~"),
   })
 end
 
 local function project_grep()
+  local root = project_root_for_search()
+
+  if search_root_is_too_broad(root) then
+    vim.notify("Telescope: refusing to scan " .. root .. "; open a project file or cd into a project", vim.log.levels.WARN)
+    return
+  end
+
   run_telescope(builtin.live_grep, {
+    cwd = root,
     hidden = true,
-    no_ignore = true,
+    additional_args = function()
+      local args = {}
+      for _, glob in ipairs(search_exclude_globs) do
+        args[#args + 1] = "--glob"
+        args[#args + 1] = glob
+      end
+      return args
+    end,
   })
 end
 
@@ -678,9 +1034,6 @@ local function lsp_client_supports(bufnr, method)
   return false
 end
 
--- F12 = VSCode's "Go to Definition": definition first (jumps to a class or
--- function body across files), implementation only as a fallback — pyright
--- advertises implementation support but returns nothing useful for classes.
 local function jump_to_definition()
   local bufnr = vim.api.nvim_get_current_buf()
 
@@ -697,9 +1050,151 @@ local function jump_to_definition()
   vim.notify("No LSP definition provider attached to this buffer", vim.log.levels.WARN)
 end
 
-vim.keymap.set("n", "<F12>", jump_to_definition, {
+local f12_reference_cycle = {
+  key = nil,
+  index = 0,
+  locations = {},
+}
+
+local function location_path(location)
+  local uri = location.uri or location.targetUri
+  return uri and vim.uri_to_fname(uri) or ""
+end
+
+local function location_range(location)
+  return location.range or location.targetSelectionRange or location.targetRange or {}
+end
+
+local function location_start(location)
+  local range = location_range(location)
+  return range.start or { line = 0, character = 0 }
+end
+
+local function location_key(location)
+  local start = location_start(location)
+  return table.concat({ location_path(location), start.line or 0, start.character or 0 }, ":")
+end
+
+local function sort_locations(locations)
+  table.sort(locations, function(a, b)
+    local a_path = location_path(a)
+    local b_path = location_path(b)
+
+    if a_path ~= b_path then
+      return a_path < b_path
+    end
+
+    local a_start = location_start(a)
+    local b_start = location_start(b)
+
+    if a_start.line ~= b_start.line then
+      return (a_start.line or 0) < (b_start.line or 0)
+    end
+
+    return (a_start.character or 0) < (b_start.character or 0)
+  end)
+end
+
+local function location_is_after_cursor(location)
+  local cursor = vim.api.nvim_win_get_cursor(0)
+  local cursor_path = vim.api.nvim_buf_get_name(0)
+  local start = location_start(location)
+  local path = location_path(location)
+
+  if path ~= cursor_path then
+    return path > cursor_path
+  end
+
+  if (start.line or 0) ~= cursor[1] - 1 then
+    return (start.line or 0) > cursor[1] - 1
+  end
+
+  return (start.character or 0) > cursor[2]
+end
+
+local function symbol_cycle_key(bufnr)
+  local cursor = vim.api.nvim_win_get_cursor(0)
+  return table.concat({ bufnr, vim.fn.expand("<cword>"), cursor[1] }, ":")
+end
+
+local function collect_reference_locations(bufnr)
+  if not lsp_client_supports(bufnr, "textDocument/references") then
+    return {}
+  end
+
+  local ok_params, params = pcall(vim.lsp.util.make_position_params)
+  if not ok_params then
+    params = vim.lsp.util.make_position_params(0, "utf-16")
+  end
+  params.context = { includeDeclaration = false }
+
+  local responses = vim.lsp.buf_request_sync(bufnr, "textDocument/references", params, 1200)
+  local locations = {}
+  local seen = {}
+
+  for client_id, response in pairs(responses or {}) do
+    local client = vim.lsp.get_client_by_id(client_id)
+
+    for _, location in ipairs(response.result or {}) do
+      local key = location_key(location)
+
+      if not seen[key] then
+        seen[key] = true
+        table.insert(locations, {
+          uri = location.uri,
+          range = location.range,
+          targetUri = location.targetUri,
+          targetSelectionRange = location.targetSelectionRange,
+          targetRange = location.targetRange,
+          offset_encoding = client and client.offset_encoding or "utf-16",
+        })
+      end
+    end
+  end
+
+  sort_locations(locations)
+  return locations
+end
+
+-- F12 cycles through usage sites for the symbol under the cursor. If the LSP
+-- cannot provide references, it keeps the normal go-to-definition fallback.
+local function cycle_symbol_references_or_definition()
+  local bufnr = vim.api.nvim_get_current_buf()
+  local locations = collect_reference_locations(bufnr)
+
+  if #locations == 0 then
+    f12_reference_cycle = { key = nil, index = 0, locations = {} }
+    jump_to_definition()
+    return
+  end
+
+  local cycle_key = symbol_cycle_key(bufnr)
+
+  if f12_reference_cycle.key ~= cycle_key then
+    f12_reference_cycle = {
+      key = cycle_key,
+      index = 0,
+      locations = locations,
+    }
+
+    for index, location in ipairs(locations) do
+      if location_is_after_cursor(location) then
+        f12_reference_cycle.index = index - 1
+        break
+      end
+    end
+  else
+    f12_reference_cycle.locations = locations
+  end
+
+  f12_reference_cycle.index = (f12_reference_cycle.index % #f12_reference_cycle.locations) + 1
+  local location = f12_reference_cycle.locations[f12_reference_cycle.index]
+  vim.lsp.util.jump_to_location(location, location.offset_encoding or "utf-16", true)
+end
+
+vim.keymap.set("n", "<F12>", cycle_symbol_references_or_definition, {
   silent = true,
-  desc = "Go to definition",
+  desc = "Cycle symbol references",
 })
 
 vim.api.nvim_create_autocmd("LspAttach", {
@@ -710,7 +1205,7 @@ vim.api.nvim_create_autocmd("LspAttach", {
     vim.keymap.set("n", "gd", vim.lsp.buf.definition, vim.tbl_extend("force", opts, { desc = "Go to definition" }))
     vim.keymap.set("n", "gr", vim.lsp.buf.references, vim.tbl_extend("force", opts, { desc = "List references" }))
     vim.keymap.set("n", "K", vim.lsp.buf.hover, vim.tbl_extend("force", opts, { desc = "Hover documentation" }))
-    vim.keymap.set("n", "<F12>", jump_to_definition, vim.tbl_extend("force", opts, { desc = "Go to definition" }))
+    vim.keymap.set("n", "<F12>", cycle_symbol_references_or_definition, vim.tbl_extend("force", opts, { desc = "Cycle symbol references" }))
   end,
 })
 
@@ -783,6 +1278,7 @@ setup_server_if_available("rust_analyzer", "rust-analyzer")
 setup_server_if_available("gopls", "gopls")
 setup_server_if_available("clangd", "clangd")
 setup_server_if_available("bashls", "bash-language-server")
+setup_server_if_available("jsonls", "vscode-json-language-server")
 
 -- Per-window editor tabs (VSCode editor groups): every editor window keeps
 -- its own tab strip in the winbar, listing the file buffers that have been
@@ -2733,8 +3229,6 @@ set_debug_mode_keymaps = function(enabled)
 
   local keys = require("exocortex.config_loader").keys("debug")
   local maps = {
-    { keys.debug_nav_up, "<Up>" },
-    { keys.debug_nav_down, "<Down>" },
     { keys.debug_nav_left, "<Left>" },
     { keys.debug_nav_right, "<Right>" },
   }

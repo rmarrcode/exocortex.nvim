@@ -14,6 +14,14 @@ local function first_key(lhses)
   return lhses or ""
 end
 
+local function mode_label(intent)
+  if intent == "read" then
+    return "read mode"
+  elseif intent == "agent" then
+    return "agent mode"
+  end
+end
+
 local function smoothstep(t)
   return t * t * (3 - 2 * t)
 end
@@ -88,7 +96,12 @@ end
 function M.open(node, from_rect, root_dir)
   local lines = { "# " .. (node.prompt or ""):gsub("\n", " "), "" }
 
-  table.insert(lines, string.format("_%s · %s · %s_", state.format_agent(node.agent, node.model), node.status, node.stat or ""))
+  local agent = state.format_agent(node.agent, node.model)
+  local mode = mode_label(node.intent)
+  if mode then
+    agent = agent .. " · " .. mode
+  end
+  table.insert(lines, string.format("_%s · %s · %s_", agent, node.status, node.stat or ""))
   table.insert(lines, "")
 
   for _, line in ipairs(vim.split(node.response or "(no response yet)", "\n")) do

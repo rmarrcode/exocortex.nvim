@@ -54,7 +54,7 @@ To prompt from the selected node, use operation `keys.graph.prompt_branch`. It i
 
 To prompt from a fresh root, use operation `keys.graph.prompt_root`. It is currently set to `P`.
 
-Inside the prompt editor, submit with `<C-d>` when you want the agent to produce reviewable diffs. Submit with `<C-r>` when you want a read-only Markdown response meant to be read.
+Inside the prompt editor, submit with `<C-d>` when you want the agent to produce reviewable diffs. Submit with `<C-r>` when you want a read-only Markdown response meant to be read. Submit with `<C-a>` for agent mode, which runs commands in the proposal worktree and should report what it ran without creating throwaway scripts.
 
 To choose the session agent, use operation `keys.graph.choose_agent`. It is currently set to `a`.
 
