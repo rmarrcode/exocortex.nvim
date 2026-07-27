@@ -3381,11 +3381,9 @@ local function focus_debug_source(path, line)
 
   vim.api.nvim_win_set_buf(target_win, bufnr)
 
-  if current_is_source then
-    vim.api.nvim_set_current_win(target_win)
-    vim.api.nvim_win_set_cursor(target_win, { math.max(line or 1, 1), 0 })
-    vim.cmd("normal! zz")
-  end
+  vim.api.nvim_set_current_win(target_win)
+  pcall(vim.api.nvim_win_set_cursor, target_win, { math.max(line or 1, 1), 0 })
+  vim.cmd("normal! zz")
 end
 
 local function set_debug_source(path, label)
@@ -3466,6 +3464,36 @@ local function hide_debug_distractions()
   end
 end
 
+local function collapse_to_one_debug_source_window()
+  local keep_win = nil
+  local current_win = vim.api.nvim_get_current_win()
+
+  if is_debug_source_window(current_win) then
+    keep_win = current_win
+  else
+    for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+      if is_debug_source_window(win) then
+        keep_win = win
+        break
+      end
+    end
+  end
+
+  if not keep_win then
+    return
+  end
+
+  for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+    if win ~= keep_win and is_debug_source_window(win) then
+      pcall(vim.api.nvim_win_close, win, false)
+    end
+  end
+
+  if vim.api.nvim_win_is_valid(keep_win) then
+    vim.api.nvim_set_current_win(keep_win)
+  end
+end
+
 local function restore_debug_distractions()
   local restore_tree = dap_restore_nvim_tree
   local restore_terminal = dap_restore_bottom_terminal
@@ -3486,6 +3514,7 @@ local function dapui_open_keep_layout()
   if not dap_saved_layout then
     dap_saved_layout = vim.fn.winrestcmd()
     hide_debug_distractions()
+    collapse_to_one_debug_source_window()
   end
 
   set_debug_mode_keymaps(true)
@@ -3787,6 +3816,7 @@ local dap_label_ns = vim.api.nvim_create_namespace("dap_stopped_label")
 local dap_flash_ns = vim.api.nvim_create_namespace("dap_stopped_flash")
 local dap_last_buf = nil
 local debug_current_frame_id = nil
+local docker_debug_status = nil
 
 local function clear_dap_stopped_marks()
   if dap_last_buf and vim.api.nvim_buf_is_valid(dap_last_buf) then
@@ -3871,7 +3901,23 @@ dap.listeners.after.event_stopped["jump_to_source"] = function(session, body)
 
       vim.schedule(function()
         local bufnr = vim.fn.bufadd(path)
-        vim.fn.bufload(bufnr)
+        local loaded_ok = pcall(vim.fn.bufload, bufnr)
+        if not loaded_ok then
+          vim.notify("DAP: could not load stopped source buffer: " .. path, vim.log.levels.WARN)
+          return
+        end
+        if not vim.api.nvim_buf_is_valid(bufnr) then
+          return
+        end
+
+        local line_count = vim.api.nvim_buf_line_count(bufnr)
+        if line_count < 1 then
+          return
+        end
+
+        local safe_line = tonumber(line) or 1
+        safe_line = math.max(1, math.min(safe_line, line_count))
+        local mark_row = safe_line - 1
 
         local target_win = nil
         local current_win = vim.api.nvim_get_current_win()
@@ -3896,11 +3942,9 @@ dap.listeners.after.event_stopped["jump_to_source"] = function(session, body)
         end
 
         vim.api.nvim_win_set_buf(target_win, bufnr)
-        if current_is_source then
-          vim.api.nvim_set_current_win(target_win)
-          vim.api.nvim_win_set_cursor(target_win, { line, 0 })
-          vim.cmd("normal! zz")
-        end
+        vim.api.nvim_set_current_win(target_win)
+        pcall(vim.api.nvim_win_set_cursor, target_win, { safe_line, 0 })
+        vim.cmd("normal! zz")
 
         -- Clear any previous stop markers, then mark the new stopped line.
         clear_dap_stopped_marks()
@@ -3925,7 +3969,7 @@ dap.listeners.after.event_stopped["jump_to_source"] = function(session, body)
         set_debug_location({
           func = (func and func ~= "") and func or "?",
           file = vim.fn.fnamemodify(path, ":t"),
-          line = line,
+          line = safe_line,
           reason = reason,
           exception = exception_summary,
         })
@@ -3935,14 +3979,14 @@ dap.listeners.after.event_stopped["jump_to_source"] = function(session, body)
         end
 
         -- Persistent end-of-line label (stays until continue/terminate).
-        vim.api.nvim_buf_set_extmark(bufnr, dap_label_ns, line - 1, 0, {
+        pcall(vim.api.nvim_buf_set_extmark, bufnr, dap_label_ns, mark_row, 0, {
           virt_text     = { { label, "DiagnosticWarn" } },
           virt_text_pos = "eol",
           priority      = 200,
         })
 
         -- Bright flash that fades after 500 ms, leaving the sign's linehl.
-        vim.api.nvim_buf_set_extmark(bufnr, dap_flash_ns, line - 1, 0, {
+        pcall(vim.api.nvim_buf_set_extmark, bufnr, dap_flash_ns, mark_row, 0, {
           line_hl_group = "DapStoppedFlash",
           priority      = 210,
         })
@@ -3973,6 +4017,28 @@ local function on_dap_continue()
 end
 
 dap.listeners.before.event_continued.clear_stopped = on_dap_continue
+
+dap.listeners.before.event_continued.human_debug_status = function()
+  docker_debug_status.dap_state = "running"
+end
+
+dap.listeners.after.event_stopped.human_debug_status = function(_, body)
+  local reason = body and body.reason or "stopped"
+  docker_debug_status.dap_state = "stopped: " .. reason
+end
+
+dap.listeners.after.event_initialized.human_debug_status = function()
+  docker_debug_status.dap_state = "attached"
+end
+
+dap.listeners.before.event_exited.human_debug_status = function(_, body)
+  local code = body and body.exitCode
+  docker_debug_status.dap_state = code and ("exited: " .. tostring(code)) or "exited"
+end
+
+dap.listeners.before.event_terminated.human_debug_status = function()
+  docker_debug_status.dap_state = "terminated"
+end
 
 local function show_debugger_ui()
   dapui_open_keep_layout()
@@ -4500,9 +4566,269 @@ local function run_training_debug_explicit(cfg)
 end
 
 local docker_debug_jobs = {}
+local attach_human_triton_model = nil
+docker_debug_status = {
+  buf = nil,
+  win = nil,
+  timer = nil,
+  triton_timer = nil,
+  log_file = nil,
+  dap_state = "not attached",
+  cfg = nil,
+  triton_auto_attach_started = false,
+}
+
+local function latest_matching_line(lines, pattern, plain)
+  for i = #(lines or {}), 1, -1 do
+    local line = lines[i]
+    if line and line:find(pattern, 1, plain == nil and true or plain) then
+      return line
+    end
+  end
+  return nil
+end
+
+local function classify_human_debug_log(lines)
+  local text = table.concat(lines or {}, "\n")
+
+  if text:find("Error: unrecognized switch %-u") then
+    return "failed: debugpy command line is invalid (-u passed to debugpy)"
+  end
+  if text:find("port is already allocated", 1, true) then
+    return "failed: localhost:5678 is already allocated by another container/process"
+  end
+  if text:find("Error on attach", 1, true) or text:find("Timed out waiting for debug server", 1, true) then
+    return "failed: DAP/debugpy attach handshake timed out"
+  end
+  if text:find("Unable to set the pipeline", 1, true) or text:find("NVDSINFER_TRITON_ERROR", 1, true) then
+    return "pipeline error after debugger attach; see Triton/GStreamer errors below"
+  end
+  if text:find("[human_triton_debug] execute:", 1, true) then
+    return "Triton model.py is executing inference"
+  end
+  if text:find("[human_triton_debug] debugger attached", 1, true) then
+    return "Triton model.py debugger attached"
+  end
+  if text:find("[human_triton_debug] waiting for debugger attach", 1, true) then
+    return "Triton model.py is waiting for :DebugHumanTritonModel"
+  end
+  if text:find("[human_triton_debug] debugpy listening", 1, true) then
+    return "Triton model.py debugpy listening on localhost:5679"
+  end
+  if text:find("[run_human_deepstream] done", 1, true) then
+    return "pipeline finished"
+  end
+  if text:find("End of stream", 1, true) then
+    return "DeepStream reached end of stream"
+  end
+  if text:find("[human_debug] running at ", 1, true) then
+    return "Python is running; latest repo frame is shown below"
+  end
+  if text:find("Main Loop Running", 1, true) then
+    return "DeepStream main loop is running"
+  end
+  if text:find("[human_debug] entering core_cv_service_sx.branches.human.entrypoint", 1, true) then
+    return "entered human entrypoint"
+  end
+  if text:find("[human_debug] debugpy client attached", 1, true) then
+    return "debugger attached; stopped before human entrypoint"
+  end
+  if text:find("[human_debug] debugpy listening", 1, true) then
+    return "debugpy listening; waiting for Neovim attach"
+  end
+  if text:find("Note: Debugging will proceed", 1, true) or text:find("Debugger warning", 1, true) then
+    return "debugpy ready/attached; Python is running"
+  end
+  if text:find("| human_detection_ensemble     | 1       | READY", 1, true) then
+    return "Triton models READY; starting debugpy"
+  end
+  if text:find("loading: human_detection", 1, true) or text:find("Started HTTPService", 1, true) then
+    return "starting Triton/DeepStream services"
+  end
+  if text:find("Container .* Created") or text:find("Creating", 1, true) then
+    return "Docker container is starting"
+  end
+  if text:find("convert: creating temporary MKV", 1, true) or text:find("converting ", 1, true) then
+    return "converting debug image input to temporary MKV"
+  end
+  if text:find("Building", 1, true) or text:find("build: checking", 1, true) then
+    return "Docker image build/cache check is running"
+  end
+  if text:find("build: skipped", 1, true) then
+    return "build skipped; preparing debug input"
+  end
+  if text:find("debug: enabled", 1, true) then
+    return "debug wrapper started"
+  end
+
+  return "waiting for debug wrapper output"
+end
+
+local function stop_human_debug_status()
+  if docker_debug_status.timer then
+    docker_debug_status.timer:stop()
+    docker_debug_status.timer:close()
+    docker_debug_status.timer = nil
+  end
+end
+
+local function stop_human_triton_auto_attach_watcher()
+  if docker_debug_status.triton_timer then
+    docker_debug_status.triton_timer:stop()
+    docker_debug_status.triton_timer:close()
+    docker_debug_status.triton_timer = nil
+  end
+end
+
+local function maybe_auto_attach_human_triton(lines)
+  local cfg = docker_debug_status.cfg
+  local d = (cfg and cfg.debug) or {}
+  local should_auto_attach_triton = d.auto_attach_triton ~= "0" and d.triton_auto_attach ~= "0"
+  if not should_auto_attach_triton
+      or docker_debug_status.triton_auto_attach_started
+      or not attach_human_triton_model then
+    return false
+  end
+
+  if not latest_matching_line(lines, "[human_triton_debug] waiting for debugger attach", true)
+      and not latest_matching_line(lines, "[human_triton_debug] debugpy listening", true) then
+    return false
+  end
+
+  docker_debug_status.triton_auto_attach_started = true
+  docker_debug_status.dap_state = "auto-attaching Triton model.py"
+  stop_human_triton_auto_attach_watcher()
+  vim.schedule(function()
+    attach_human_triton_model(cfg, {
+      previous_session = dap.session(),
+      quiet = true,
+      wait_for_port = false,
+    })
+  end)
+  return true
+end
+
+local function start_human_triton_auto_attach_watcher(log_file)
+  stop_human_triton_auto_attach_watcher()
+  docker_debug_status.triton_timer = vim.uv.new_timer()
+  docker_debug_status.triton_timer:start(0, 500, vim.schedule_wrap(function()
+    if docker_debug_status.triton_auto_attach_started then
+      stop_human_triton_auto_attach_watcher()
+      return
+    end
+
+    if vim.fn.filereadable(log_file) ~= 1 then
+      return
+    end
+
+    local ok, lines = pcall(vim.fn.readfile, log_file, "", 500)
+    if ok then
+      maybe_auto_attach_human_triton(lines)
+    end
+  end))
+end
+
+local function open_human_debug_status(log_file)
+  docker_debug_status.log_file = log_file
+  docker_debug_status.dap_state = docker_debug_status.dap_state or "starting"
+
+  if not docker_debug_status.buf or not vim.api.nvim_buf_is_valid(docker_debug_status.buf) then
+    docker_debug_status.buf = vim.api.nvim_create_buf(false, true)
+    vim.bo[docker_debug_status.buf].bufhidden = "wipe"
+    vim.bo[docker_debug_status.buf].filetype = "log"
+    vim.api.nvim_buf_set_name(docker_debug_status.buf, "human-deepstream-debug-status")
+  end
+
+  local buf = docker_debug_status.buf
+  vim.bo[buf].modifiable = true
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, {
+    "Human DeepStream debug status",
+    "DAP: " .. docker_debug_status.dap_state,
+    "phase: starting",
+    "log: " .. log_file,
+    "",
+    "Waiting for first log lines...",
+  })
+  vim.bo[buf].modifiable = false
+
+  if not docker_debug_status.win or not vim.api.nvim_win_is_valid(docker_debug_status.win) then
+    vim.cmd("botright vertical 70split")
+    docker_debug_status.win = vim.api.nvim_get_current_win()
+    vim.api.nvim_win_set_buf(docker_debug_status.win, buf)
+    local width = math.min(90, math.max(55, math.floor(vim.o.columns * 0.36)))
+    pcall(vim.api.nvim_win_set_width, docker_debug_status.win, width)
+    pcall(vim.api.nvim_set_option_value, "wrap", false, { win = docker_debug_status.win })
+  end
+
+  stop_human_debug_status()
+  docker_debug_status.timer = vim.uv.new_timer()
+  docker_debug_status.timer:start(0, 1000, vim.schedule_wrap(function()
+    if not vim.api.nvim_buf_is_valid(buf) then
+      stop_human_debug_status()
+      return
+    end
+
+    local lines = {}
+    if vim.fn.filereadable(log_file) == 1 then
+      local ok, read_lines = pcall(vim.fn.readfile, log_file, "", 500)
+      if ok then
+        lines = read_lines
+      end
+    end
+
+    local tail = {}
+    local start = math.max(1, #lines - 80)
+    for i = start, #lines do
+      tail[#tail + 1] = lines[i]
+    end
+
+    local latest_triton = latest_matching_line(lines, "[human_triton_debug] execute:", true)
+    local latest_repo_frame = latest_matching_line(lines, "[human_debug] nearest repo frame: ", true)
+    local latest_frame = latest_repo_frame or latest_matching_line(lines, "[human_debug] running at ", true) or "not reported yet"
+    local latest_entry = latest_matching_line(lines, "[human_debug] entering ", true)
+    local latest_context = latest_frame
+    if latest_frame == "not reported yet" and latest_entry then
+      latest_context = latest_entry
+    end
+    if latest_triton then
+      latest_context = latest_triton
+    end
+
+    maybe_auto_attach_human_triton(lines)
+
+    local display = {
+      "Human DeepStream debug status",
+      "DAP: " .. (docker_debug_status.dap_state or "unknown"),
+      "phase: " .. classify_human_debug_log(lines),
+      "latest: " .. latest_context,
+      "log: " .. log_file,
+      "",
+      "Recent log:",
+    }
+    vim.list_extend(display, tail)
+
+    local wrote = pcall(function()
+      vim.bo[buf].modifiable = true
+      vim.api.nvim_buf_set_lines(buf, 0, -1, false, display)
+      vim.bo[buf].modifiable = false
+    end)
+
+    if wrote and docker_debug_status.win and vim.api.nvim_win_is_valid(docker_debug_status.win) then
+      local win_buf = vim.api.nvim_win_get_buf(docker_debug_status.win)
+      if win_buf == buf and vim.api.nvim_buf_is_valid(buf) then
+        local line_count = vim.api.nvim_buf_line_count(buf)
+        if line_count > 0 then
+          pcall(vim.api.nvim_win_set_cursor, docker_debug_status.win, { line_count, 0 })
+        end
+      end
+    end
+  end))
+end
 
 local function run_docker_debug_attach(cfg)
   local d = cfg.debug or {}
+  docker_debug_status.cfg = cfg
+  docker_debug_status.triton_auto_attach_started = false
   local base = cfg._dir or vim.fn.getcwd()
   local cwd = d.cwd and resolve_config_path(base, d.cwd) or base
   local host = d.host or "127.0.0.1"
@@ -4527,12 +4853,24 @@ local function run_docker_debug_attach(cfg)
   pending_debug_source = nil
   vim.notify("DAP: debugging " .. vim.fn.fnamemodify(local_root, ":~:.") .. " -> " .. remote_root, vim.log.levels.INFO, { title = name })
 
+  local adapter_name = "human_deepstream_debugpy_" .. tostring(port)
+  dap.adapters[adapter_name] = {
+    type = "server",
+    host = host,
+    port = port,
+    options = {
+      initialize_timeout_sec = 120,
+    },
+  }
+
   local function attach()
+    docker_debug_status.dap_state = "attaching to " .. host .. ":" .. tostring(port)
     dap.run({
-      type = "python",
+      type = adapter_name,
       request = "attach",
       name = name,
-      connect = { host = host, port = port },
+      stopOnEntry = true,
+      redirectOutput = true,
       pathMappings = {
         { localRoot = local_root, remoteRoot = remote_root },
       },
@@ -4541,19 +4879,32 @@ local function run_docker_debug_attach(cfg)
     })
   end
 
+  local function log_has_debugpy_ready_marker()
+    if not d.log or d.log == "" or vim.fn.filereadable(d.log) ~= 1 then
+      return false
+    end
+
+    local ok, lines = pcall(vim.fn.readfile, d.log, "", 200)
+    if not ok then
+      return false
+    end
+
+    local text = table.concat(lines, "\n")
+    return text:find("[human_debug] debugpy listening", 1, true) ~= nil
+  end
+
+  local function port_is_listening(callback)
+    vim.system({ "ss", "-ltn", "( sport = :" .. tostring(port) .. " )" }, { text = true }, function(result)
+      local output = (result.stdout or "") .. (result.stderr or "")
+      callback(result.code == 0 and output:find(":" .. tostring(port), 1, true) ~= nil)
+    end)
+  end
+
   local function wait_for_port_then_attach(start_ms)
-    local socket = vim.uv.new_tcp()
-
-    socket:connect(host, port, function(err)
-      socket:close()
-
-      if not err then
-        vim.schedule(attach)
-        return
-      end
-
+    local function retry_or_timeout()
       if (vim.uv.now() - start_ms) >= attach_timeout_ms then
         vim.schedule(function()
+          docker_debug_status.dap_state = "attach timeout"
           vim.notify(
             "DAP: timed out waiting for " .. host .. ":" .. port .. "; see " .. (d.log or "/tmp/exocortex-docker-debug.log"),
             vim.log.levels.ERROR
@@ -4565,6 +4916,24 @@ local function run_docker_debug_attach(cfg)
       vim.defer_fn(function()
         wait_for_port_then_attach(start_ms)
       end, 500)
+    end
+
+    if d.log and d.log ~= "" then
+      if log_has_debugpy_ready_marker() then
+        vim.defer_fn(attach, 500)
+        return
+      end
+
+      retry_or_timeout()
+      return
+    end
+
+    port_is_listening(function(is_listening)
+      if is_listening then
+        vim.schedule(attach)
+      else
+        retry_or_timeout()
+      end
     end)
   end
 
@@ -4574,6 +4943,11 @@ local function run_docker_debug_attach(cfg)
     if not cmd:find("^/") then
       cmd = "./" .. cmd:gsub("^%./", "")
     end
+
+    pcall(vim.fn.writefile, {}, log_file)
+    docker_debug_status.dap_state = "starting debug script"
+    open_human_debug_status(log_file)
+    start_human_triton_auto_attach_watcher(log_file)
 
     local job_key = cwd .. "\n" .. run
     local existing_job = docker_debug_jobs[job_key]
@@ -4599,6 +4973,7 @@ local function run_docker_debug_attach(cfg)
     end
 
     docker_debug_jobs[job_key] = job_id
+    docker_debug_status.dap_state = "waiting for debugpy on " .. host .. ":" .. tostring(port)
     vim.notify("DAP: started " .. run .. "; log: " .. log_file, vim.log.levels.INFO, { title = name })
     vim.defer_fn(function()
       wait_for_port_then_attach(vim.uv.now())
@@ -4622,6 +4997,102 @@ vim.api.nvim_create_user_command("DebugDockerAttach", function()
   })
 end, {
   desc = "Attach debugpy to the human-deepstream Docker container",
+})
+
+attach_human_triton_model = function(cfg, opts)
+  opts = opts or {}
+  cfg = cfg or read_exocortex_config()
+  local d = cfg.debug or {}
+  local base = cfg._dir or vim.fn.getcwd()
+  local cwd = d.cwd and resolve_config_path(base, d.cwd) or base
+  local local_root = d.local_root and resolve_config_path(base, d.local_root) or cwd
+  local remote_root = d.remote_root or "/workspace"
+  local host = d.triton_host or d.host or "127.0.0.1"
+  local port = tonumber(d.triton_port or d.model_port) or 5679
+  local adapter_name = "human_triton_model_debugpy_" .. tostring(port)
+  local previous_session = opts.previous_session or dap.session()
+
+  dap.adapters[adapter_name] = {
+    type = "server",
+    host = host,
+    port = port,
+    options = {
+      initialize_timeout_sec = 120,
+    },
+  }
+
+  dap.listeners.after.event_initialized.human_triton_restore_main_session = function(session)
+    if session and session.config and session.config.name == "Attach: human Triton model.py" then
+      dap.listeners.after.event_initialized.human_triton_restore_main_session = nil
+      if previous_session then
+        vim.schedule(function()
+          pcall(dap.set_session, previous_session)
+        end)
+      end
+    end
+  end
+
+  local function run_attach()
+    if not opts.quiet then
+      vim.notify(
+        "DAP: attaching to Triton model.py on " .. host .. ":" .. tostring(port),
+        vim.log.levels.INFO,
+        { title = "Attach: human Triton model.py" }
+      )
+    else
+      docker_debug_status.dap_state = "auto-attaching Triton model.py on " .. host .. ":" .. tostring(port)
+    end
+
+    dap.run({
+    type = adapter_name,
+    request = "attach",
+    name = "Attach: human Triton model.py",
+    redirectOutput = true,
+    pathMappings = {
+      { localRoot = local_root, remoteRoot = remote_root },
+    },
+    justMyCode = false,
+  })
+  end
+
+  local function wait_for_triton_port(start_ms)
+    local timeout_ms = tonumber(d.triton_attach_timeout_ms) or 30000
+    vim.system({ "ss", "-ltn", "( sport = :" .. tostring(port) .. " )" }, { text = true }, function(result)
+      local output = (result.stdout or "") .. (result.stderr or "")
+      if result.code == 0 and output:find(":" .. tostring(port), 1, true) then
+        vim.schedule(run_attach)
+        return
+      end
+
+      if (vim.uv.now() - start_ms) >= timeout_ms then
+        vim.schedule(function()
+          local message = "DAP: timed out waiting for Triton model.py debugpy on " .. host .. ":" .. tostring(port)
+          if opts.quiet then
+            docker_debug_status.dap_state = "Triton auto-attach timeout"
+          else
+            vim.notify(message, vim.log.levels.ERROR, { title = "Attach: human Triton model.py" })
+          end
+        end)
+        return
+      end
+
+      vim.defer_fn(function()
+        wait_for_triton_port(start_ms)
+      end, 500)
+    end)
+  end
+
+  if opts.wait_for_port then
+    wait_for_triton_port(vim.uv.now())
+  else
+    run_attach()
+  end
+end
+
+vim.api.nvim_create_user_command("DebugHumanTritonModel", function()
+  attach_human_triton_model(read_exocortex_config())
+end, {
+  desc = "Attach debugpy to the human Triton Python backend model.py process",
 })
 
 local function current_python_project_root(file)
