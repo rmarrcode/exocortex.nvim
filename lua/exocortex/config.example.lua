@@ -93,6 +93,7 @@ return {
       watches = "<leader>dw",
       console = "<leader>dC",
       inspect = "<leader>de",
+      current_function = "<leader>df",
       toggle_values = "<leader>dV",
       view_mask = "<leader>dm",
       debug_nav_up = "<PageUp>",

@@ -139,25 +139,29 @@ local function build_prompt(parent_id, prompt, proposal_root, intent)
   local parts = {
     "You are running in an isolated proposal worktree.",
     "The project root for this run is: " .. (proposal_root or "<current working directory>"),
-    "Use relative paths, or absolute paths under that proposal root only.",
     "Never edit the original checkout path from terminal history or prior context.",
   }
 
   if intent == PROMPT_INTENT_READ then
     table.insert(parts, "Submission mode: READABLE RESPONSE.")
     table.insert(parts, "Do not create, edit, delete, rename, format, or otherwise modify files.")
+    table.insert(parts, "Use relative paths, or absolute paths under that proposal root only.")
     table.insert(parts, "You may inspect files and run read-only commands, but your final output should be a Markdown response meant to be read.")
     table.insert(parts, "If code changes would be useful, describe them instead of implementing them.")
   elseif intent == PROMPT_INTENT_AGENT then
     table.insert(parts, "Submission mode: AGENT WORKTREE RUN.")
     table.insert(parts, "You may inspect files, run shell commands, execute helper scripts, run tests, and edit files inside the proposal worktree.")
     table.insert(parts, "Treat the proposal worktree as the sandbox; do not touch the live checkout path.")
+    table.insert(parts, "Use relative paths for project files, or absolute paths under the proposal root.")
+    table.insert(parts, "For command execution only, you may use external absolute paths to tools, interpreters, virtualenvs, caches, or package managers when the user asks for them or the environment requires them.")
+    table.insert(parts, "External tool/venv paths may be executed or have dependencies installed into them, but do not edit source/config files outside the proposal worktree.")
     table.insert(parts, "Prefer direct one-off shell commands over creating helper scripts, bootstrap scripts, or disposable files.")
     table.insert(parts, "Do not add or rewrite install scripts, wrappers, or dependency bootstrap code unless the user explicitly asks for a persistent change.")
     table.insert(parts, "When you finish, summarize the commands you ran. Only include code changes if they were directly necessary to complete the requested command run. Keep the final response concise and reviewable.")
   else
     table.insert(parts, "Submission mode: DIFF PROPOSAL.")
     table.insert(parts, "Make the requested code/config changes in the proposal worktree.")
+    table.insert(parts, "Use relative paths, or absolute paths under that proposal root only.")
     table.insert(parts, "The resulting file modifications are the primary output and will be reviewed as diffs.")
     table.insert(parts, "The user will review and explicitly accept proposed hunks later.")
   end
@@ -824,11 +828,23 @@ end
 
 local open_same_file_right
 
+local function print_current_file_path()
+  local path = vim.api.nvim_buf_get_name(0)
+
+  if path == "" then
+    vim.notify("Current buffer has no file path", vim.log.levels.WARN)
+    return
+  end
+
+  print(vim.fn.fnamemodify(path, ":p"))
+end
+
 local function set_file_keymaps(buf)
   if vim.api.nvim_buf_is_valid(buf) and vim.bo[buf].buftype == "" and not vim.bo[buf].filetype:match("^exocortex") then
     local keys = config_loader.keys("editor")
     keymaps.set("n", keys.open_same_file_right, open_same_file_right, { buffer = buf, silent = true, nowait = true, desc = "Open same file to the right" })
     keymaps.set("n", keys.function_to_top, function() review.function_to_top(vim.api.nvim_get_current_win()) end, { buffer = buf, silent = true, nowait = true, desc = "Put function at top" })
+    keymaps.set("n", "<C-t>", print_current_file_path, { buffer = buf, silent = true, nowait = true, desc = "Print full file path" })
   end
 end
 

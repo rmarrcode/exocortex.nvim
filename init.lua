@@ -288,6 +288,7 @@ local colors = {
   orange = vscode_dark.base09,
   red = vscode_dark.base08,
   selection = "#264f78",
+  active_border = "#6a9955",
   tab_active = "#0e639c",
   tab_visible = "#21344a",
   tab_inactive = "#2a2d2e",
@@ -323,6 +324,9 @@ local function apply_vscode_dark_highlights()
   vim.api.nvim_set_hl(0, "WinBar", { fg = "#ffffff", bg = colors.winbar, bold = true })
   vim.api.nvim_set_hl(0, "WinBarNC", { fg = colors.fg, bg = colors.winbar_nc })
   vim.api.nvim_set_hl(0, "WinSeparator", { fg = colors.gutter, bg = colors.bg })
+  vim.api.nvim_set_hl(0, "ActiveWindowBorder", { fg = colors.active_border, bg = colors.bg })
+  vim.api.nvim_set_hl(0, "ActiveWindowStatusLine", { fg = colors.fg, bg = "#243326" })
+  vim.api.nvim_set_hl(0, "ActiveWindowWinBar", { fg = "#ffffff", bg = "#263a2a", bold = true })
   vim.api.nvim_set_hl(0, "NvimTreeNormal", { fg = colors.fg, bg = colors.panel })
   vim.api.nvim_set_hl(0, "NvimTreeNormalNC", { fg = colors.fg, bg = colors.panel })
   vim.api.nvim_set_hl(0, "NvimTreeEndOfBuffer", { fg = colors.panel, bg = colors.panel })
@@ -375,6 +379,123 @@ vim.api.nvim_create_autocmd("ColorScheme", {
   group = augroup,
   callback = apply_vscode_dark_highlights,
 })
+
+local active_window_border_keys = {
+  WinSeparator = true,
+  StatusLine = true,
+  WinBar = true,
+}
+
+local function parse_winhighlight(value)
+  local mappings = {}
+  local order = {}
+
+  for entry in tostring(value or ""):gmatch("[^,]+") do
+    local key, group = entry:match("^%s*([^:]+):([^:]+)%s*$")
+    if key and group then
+      key = vim.trim(key)
+      group = vim.trim(group)
+      if not mappings[key] then
+        order[#order + 1] = key
+      end
+      mappings[key] = group
+    end
+  end
+
+  return mappings, order
+end
+
+local function build_winhighlight(mappings, order)
+  local parts = {}
+
+  for _, key in ipairs(order) do
+    if mappings[key] then
+      parts[#parts + 1] = key .. ":" .. mappings[key]
+    end
+  end
+
+  for key, group in pairs(mappings) do
+    if not vim.tbl_contains(order, key) then
+      parts[#parts + 1] = key .. ":" .. group
+    end
+  end
+
+  return table.concat(parts, ",")
+end
+
+local function current_winhighlight(win)
+  local ok, value = pcall(vim.api.nvim_get_option_value, "winhighlight", { win = win })
+  return ok and value or ""
+end
+
+local function set_winhighlight(win, value)
+  pcall(vim.api.nvim_set_option_value, "winhighlight", value, { win = win })
+end
+
+local function restorable_winhighlight(win)
+  local saved = vim.w[win].exocortex_base_winhighlight
+  if saved ~= nil then
+    return saved
+  end
+
+  local current = current_winhighlight(win)
+  local mappings, order = parse_winhighlight(current)
+  for key in pairs(active_window_border_keys) do
+    mappings[key] = nil
+  end
+
+  saved = build_winhighlight(mappings, order)
+  vim.w[win].exocortex_base_winhighlight = saved
+  return saved
+end
+
+local function is_normal_layout_window(win)
+  return vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_config(win).relative == ""
+end
+
+local function restore_window_border(win)
+  local saved = vim.w[win].exocortex_base_winhighlight
+  if saved ~= nil then
+    set_winhighlight(win, saved)
+    vim.w[win].exocortex_base_winhighlight = nil
+  end
+end
+
+local function update_active_window_border()
+  local wins = vim.tbl_filter(is_normal_layout_window, vim.api.nvim_tabpage_list_wins(0))
+  local active_win = vim.api.nvim_get_current_win()
+
+  if #wins <= 1 then
+    for _, win in ipairs(wins) do
+      restore_window_border(win)
+    end
+    return
+  end
+
+  for _, win in ipairs(wins) do
+    if win == active_win then
+      local base = restorable_winhighlight(win)
+      local mappings, order = parse_winhighlight(base)
+
+      mappings.WinSeparator = "ActiveWindowBorder"
+      mappings.StatusLine = "ActiveWindowStatusLine"
+      mappings.WinBar = "ActiveWindowWinBar"
+
+      set_winhighlight(win, build_winhighlight(mappings, order))
+    else
+      restore_window_border(win)
+    end
+  end
+end
+
+vim.api.nvim_create_autocmd({ "WinEnter", "BufWinEnter", "WinNew", "WinClosed", "TabEnter", "VimResized" }, {
+  group = augroup,
+  callback = function()
+    vim.schedule(update_active_window_border)
+  end,
+})
+
+vim.schedule(update_active_window_border)
 
 -- ============================================================================
 -- JSON
@@ -511,7 +632,7 @@ require("nvim-tree").setup({
   renderer = {
     hidden_display = function(hidden_stats)
       if hidden_stats and hidden_stats.limited_dir then
-        return "(showing first 15 entries; more omitted)"
+        return "(showing first 25 entries; more omitted)"
       end
     end,
   },
@@ -528,7 +649,7 @@ require("nvim-tree").setup({
   },
   actions = {
     expand_all = {
-      max_folder_discovery = 15,
+      max_folder_discovery = 25,
     },
   },
   on_attach = function(bufnr)
@@ -539,7 +660,7 @@ require("nvim-tree").setup({
       return { buffer = bufnr, noremap = true, silent = true, nowait = true, desc = "NvimTree: " .. desc }
     end
 
-    local dir_entry_limit = 15
+    local dir_entry_limit = 25
 
     local function is_dir_node(node)
       return node and (node.type == "directory" or (node.fs_stat and node.fs_stat.type == "directory"))
@@ -1808,7 +1929,7 @@ vim.keymap.set("n", "<leader>x", close_current_tab, {
 
 -- This shadows Vim's <C-w> window-command prefix in normal mode. Window
 -- management stays available via <C-h/j/k/l>, <leader>v/<leader>s and
--- :wincmd. Terminal-mode Ctrl-W is untouched (delete-previous-word).
+-- :wincmd. Bottom terminal buffers map Ctrl-W to close their terminal tab.
 vim.keymap.set("n", "<C-w>", close_current_tab, {
   silent = true,
   desc = "Close editor tab",
@@ -2157,7 +2278,7 @@ local function render_terminal_tabs()
   end
 
   table.insert(parts, "%#WinBar#")
-  table.insert(parts, "  Ctrl-1..9 jump  ,tn new  ,th/,tl nav  ,tr rename  ,tx close  :copybot copy")
+  table.insert(parts, "  Ctrl-1..9 jump  F4+Up/Down resize  ,tn new  ,th/,tl nav  ,tr rename  Ctrl-w close  :copybot copy")
 
   return table.concat(parts, "")
 end
@@ -2172,6 +2293,17 @@ end
 local function update_terminal_winbar()
   if terminal_state.win and vim.api.nvim_win_is_valid(terminal_state.win) then
     vim.wo[terminal_state.win].winbar = render_terminal_tabs()
+  end
+end
+
+local function resize_bottom_terminal(delta)
+  local max_height = math.max(4, vim.o.lines - 8)
+  terminal_state.height = math.min(max_height, math.max(4, terminal_state.height + delta))
+
+  if terminal_state.win and vim.api.nvim_win_is_valid(terminal_state.win) then
+    pcall(vim.api.nvim_win_set_height, terminal_state.win, terminal_state.height)
+    configure_terminal_window(terminal_state.win)
+    update_terminal_winbar()
   end
 end
 
@@ -2433,15 +2565,26 @@ local function rename_current_terminal()
   end)
 end
 
--- Deliberately no terminal-mode <C-w> mapping here: in a shell Ctrl-W is
--- delete-previous-word. Normal-mode <C-w> closes the tab; ,tx also works.
 set_terminal_buffer_keymaps = function(buf)
   map_terminal_shortcut(buf, { "<C-t>" }, new_terminal_tab, "New terminal tab")
+  map_terminal_shortcut(buf, { "<C-w>" }, close_current_terminal, "Close terminal tab")
   vim.keymap.set("t", "<Esc>", "<C-\\><C-n>", { buffer = buf, silent = true, desc = "Exit terminal mode" })
 end
 
 vim.keymap.set({ "n", "t" }, "<F4>", toggle_bottom_terminal, {
   desc = "Toggle terminal panel",
+})
+vim.keymap.set({ "n", "t" }, "<F4><Up>", function()
+  resize_bottom_terminal(2)
+end, {
+  silent = true,
+  desc = "Raise terminal panel",
+})
+vim.keymap.set({ "n", "t" }, "<F4><Down>", function()
+  resize_bottom_terminal(-2)
+end, {
+  silent = true,
+  desc = "Lower terminal panel",
 })
 for index = 1, 9 do
   for _, lhs in ipairs(ctrl_digit_lhses(index)) do
@@ -2585,7 +2728,7 @@ local function tensor_shape_from_value(value)
 
   local open = text:find("%[")
   if not open then
-    return nil
+    return "()"
   end
 
   local function trim(s)
@@ -2678,21 +2821,210 @@ local function tensor_shape_from_value(value)
     return nil
   end
 
-  return "shape=(" .. table.concat(shape, ", ") .. ")"
+  return "(" .. table.concat(shape, ", ") .. ")"
 end
 
-local function annotate_tensor_value(value)
+local function tensor_summary_from_value(value)
   local shape = tensor_shape_from_value(value)
   if not shape then
     return nil
   end
 
-  local lines = dapui_format_value(0, value)
-  if type(lines) ~= "table" or #lines == 0 then
+  local dtype = value:match("dtype=([^,%)]*)")
+  local device = value:match("device=([^,%)]*)")
+  local parts = { "torch.Tensor(shape=" .. shape }
+
+  if dtype and dtype ~= "" then
+    parts[#parts + 1] = "dtype=" .. vim.trim(dtype)
+  end
+
+  if device and device ~= "" then
+    parts[#parts + 1] = "device=" .. vim.trim(device)
+  end
+
+  return table.concat(parts, ", ") .. ")"
+end
+
+local function is_debug_dict(variable)
+  local var_type = tostring(variable.type or ""):lower()
+  local value = vim.trim(variable.value or "")
+  return var_type == "dict" or value:match("^dict%s*=") or value:match("^%{.*%}$")
+end
+
+local function is_debug_tensor(variable)
+  local var_type = tostring(variable.type or "")
+  local value = vim.trim(variable.value or "")
+  return var_type:match("Tensor") or value:match("^tensor%(") or value:match("^Tensor%(") or value:match("^torch%.Tensor%(")
+end
+
+local function tensor_summary_for_variable(variable)
+  return tensor_summary_from_value(variable.value or "") or "torch.Tensor"
+end
+
+local function torch_summary_expression(expr)
+  expr = vim.trim(expr):gsub("\n", " ")
+
+  local template = [[(lambda __x: (("torch.Tensor(shape=%%s, dtype=%%s, device=%%s, requires_grad=%%s, numel=%%s)" %% (tuple(__x.shape), __x.dtype, __x.device, getattr(__x, "requires_grad", False), __x.numel())) if (__import__("sys").modules.get("torch") is not None and isinstance(__x, __import__("sys").modules["torch"].Tensor)) else __import__("pprint").pformat(__x, width=120, compact=False)))(%s)]]
+  return template:format(expr)
+end
+
+local function evaluate_tensor_summary(client, variable)
+  if not variable.evaluateName then
+    return tensor_summary_for_variable(variable)
+  end
+
+  local frame_id = client.session and client.session.current_frame and client.session.current_frame.id
+  local ok, response = pcall(client.request.evaluate, {
+    expression = torch_summary_expression(variable.evaluateName),
+    frameId = frame_id,
+    context = "variables",
+  })
+
+  if ok and response and response.result and response.result ~= "" then
+    return response.result
+  end
+
+  return tensor_summary_for_variable(variable)
+end
+
+local function split_top_level_items(text, item_separator)
+  local items = {}
+  local depth = 0
+  local quote = nil
+  local escaped = false
+  local start = 1
+
+  for i = 1, #text do
+    local ch = text:sub(i, i)
+
+    if quote then
+      if escaped then
+        escaped = false
+      elseif ch == "\\" then
+        escaped = true
+      elseif ch == quote then
+        quote = nil
+      end
+    elseif ch == "'" or ch == '"' then
+      quote = ch
+    elseif ch == "{" or ch == "[" or ch == "(" then
+      depth = depth + 1
+    elseif ch == "}" or ch == "]" or ch == ")" then
+      depth = math.max(depth - 1, 0)
+    elseif ch == item_separator and depth == 0 then
+      items[#items + 1] = vim.trim(text:sub(start, i - 1))
+      start = i + 1
+    end
+  end
+
+  local tail = vim.trim(text:sub(start))
+  if tail ~= "" then
+    items[#items + 1] = tail
+  end
+
+  return items
+end
+
+local function find_top_level_separator(text, separator)
+  local depth = 0
+  local quote = nil
+  local escaped = false
+
+  for i = 1, #text do
+    local ch = text:sub(i, i)
+
+    if quote then
+      if escaped then
+        escaped = false
+      elseif ch == "\\" then
+        escaped = true
+      elseif ch == quote then
+        quote = nil
+      end
+    elseif ch == "'" or ch == '"' then
+      quote = ch
+    elseif ch == "{" or ch == "[" or ch == "(" then
+      depth = depth + 1
+    elseif ch == "}" or ch == "]" or ch == ")" then
+      depth = math.max(depth - 1, 0)
+    elseif ch == separator and depth == 0 then
+      return i
+    end
+  end
+
+  return nil
+end
+
+local function summarize_nested_tensors(text)
+  local result = {}
+  local i = 1
+
+  while i <= #text do
+    local start_pos, open_pos = text:find("tensor%(", i)
+    if not start_pos then
+      result[#result + 1] = text:sub(i)
+      break
+    end
+
+    result[#result + 1] = text:sub(i, start_pos - 1)
+
+    local depth = 1
+    local j = open_pos + 1
+    while j <= #text and depth > 0 do
+      local ch = text:sub(j, j)
+      if ch == "(" then
+        depth = depth + 1
+      elseif ch == ")" then
+        depth = depth - 1
+      end
+      j = j + 1
+    end
+
+    local tensor_text = text:sub(start_pos, j - 1)
+    result[#result + 1] = tensor_summary_from_value(tensor_text) or "torch.Tensor(...)"
+    i = j
+  end
+
+  return table.concat(result)
+end
+
+local function format_dict_value(value)
+  if type(value) ~= "string" then
     return nil
   end
 
-  lines[1] = shape .. " " .. lines[1]
+  local text = vim.trim(value)
+  text = vim.trim(text:gsub("^dict%s*=%s*", "", 1))
+  if not (text:sub(1, 1) == "{" and text:sub(-1) == "}") then
+    return nil
+  end
+
+  local inner = vim.trim(text:sub(2, -2))
+  if inner == "" then
+    return { "{}" }
+  end
+
+  local items = split_top_level_items(inner, ",")
+  if #items <= 1 then
+    return nil
+  end
+
+  local lines = { "{" }
+  for idx, item in ipairs(items) do
+    local separator = find_top_level_separator(item, ":")
+    local formatted = summarize_nested_tensors(item)
+
+    if separator then
+      local key = vim.trim(item:sub(1, separator - 1))
+      local item_value = summarize_nested_tensors(vim.trim(item:sub(separator + 1)))
+      formatted = key .. ": " .. item_value
+    end
+
+    local suffix = idx < #items and "," or ""
+    lines[#lines + 1] = "  " .. formatted .. suffix
+  end
+  lines[#lines + 1] = "}"
+
   return lines
 end
 
@@ -2701,7 +3033,12 @@ dapui_util.format_value = function(value_start, value)
     return { "<hidden>" }
   end
 
-  return annotate_tensor_value(value) or dapui_format_value(value_start, value)
+  local tensor_summary = tensor_summary_from_value(value)
+  if tensor_summary then
+    return { tensor_summary }
+  end
+
+  return format_dict_value(value) or dapui_format_value(value_start, value)
 end
 
 
@@ -2810,12 +3147,21 @@ package.preload["dapui.components.variables"] = function()
 
         local has_value = #(variable.value or "") > 0
         local show_value = has_value and (variable.variablesReference == 0 or expanded_children[var_path])
+        local formatted_value_override = nil
+
+        if is_debug_tensor(variable) then
+          show_value = true
+          formatted_value_override = { evaluate_tensor_summary(client, variable) }
+        elseif is_debug_dict(variable) and variable.variablesReference > 0 then
+          show_value = true
+          formatted_value_override = { "{...}" }
+        end
 
         if show_value then
           canvas:write(" = ")
           local value_start = #canvas.lines[canvas:length()]
 
-          for _, line in ipairs(util.format_value(value_start, variable.value)) do
+          for _, line in ipairs(formatted_value_override or util.format_value(value_start, variable.value)) do
             add_var_line(line)
           end
         else
@@ -3046,7 +3392,7 @@ local function set_debug_source(path, label)
   pending_debug_source = path
   focus_debug_source(path)
 
-  local display = vim.fn.fnamemodify(path, ":~:.")
+  local display = path and vim.fn.fnamemodify(path, ":~:.") or "remote attach"
   vim.notify("DAP: debugging " .. display, vim.log.levels.INFO, { title = label or "Debug" })
 end
 
@@ -3212,6 +3558,7 @@ local function debug_hint_keys()
     string.format(" %-18s Watches", debug_key_label(keys.watches)),
     string.format(" %-18s Console", debug_key_label(keys.console)),
     string.format(" %-18s Inspect", debug_key_label(keys.inspect)),
+    string.format(" %-18s Current fn", debug_key_label(keys.current_function)),
     string.format(" %-18s Values", debug_key_label(keys.toggle_values)),
     string.format(" %-18s View mask", debug_key_label(keys.view_mask)),
   }
@@ -3290,6 +3637,9 @@ local function render_debug_hint()
         "  ▶ in " .. (debug_location.func or "?"),
         "    " .. (debug_location.file or "?") .. ":" .. (debug_location.line or 0),
       }
+      if debug_location.exception then
+        table.insert(lines, "  ✗ " .. debug_location.exception)
+      end
       loc_lines = 2
     end
     table.insert(lines, "")
@@ -3333,6 +3683,23 @@ end
 local function set_debug_location(loc)
   debug_location = loc
   render_debug_hint()
+end
+
+local function show_debug_current_function()
+  if not debug_location then
+    vim.notify("DAP: no stopped frame yet", vim.log.levels.WARN)
+    return
+  end
+
+  if debug_location.running then
+    vim.notify("DAP: program is running; pause or hit a breakpoint to see the current function", vim.log.levels.INFO)
+    return
+  end
+
+  local func = debug_location.func or "?"
+  local file = debug_location.file or "?"
+  local line = debug_location.line or 0
+  vim.notify(string.format("DAP: executing %s() at %s:%s", func, file, line), vim.log.levels.INFO, { title = "Debug current function" })
 end
 
 local function open_debug_hint()
@@ -3429,6 +3796,52 @@ local function clear_dap_stopped_marks()
   dap_last_buf = nil
 end
 
+local function compact_debug_text(text, max_len)
+  text = vim.trim((text or ""):gsub("%s+", " "))
+  if text == "" then
+    return nil
+  end
+
+  max_len = max_len or 120
+  if vim.fn.strdisplaywidth(text) <= max_len then
+    return text
+  end
+
+  return vim.fn.strcharpart(text, 0, max_len - 1) .. "…"
+end
+
+local function format_exception_summary(exception_info)
+  if type(exception_info) ~= "table" then
+    return nil
+  end
+
+  local details = type(exception_info.details) == "table" and exception_info.details or {}
+  local type_name = details.typeName or details.fullTypeName or exception_info.exceptionId
+  local message = details.message or exception_info.description
+
+  if type_name and message and type_name ~= "" and message ~= "" then
+    return compact_debug_text(type_name .. ": " .. message, 140)
+  end
+
+  return compact_debug_text(type_name or message or exception_info.exceptionId or exception_info.description, 140)
+end
+
+local function request_exception_info(session, thread_id, callback)
+  if not thread_id then
+    callback(nil)
+    return
+  end
+
+  session:request("exceptionInfo", { threadId = thread_id }, function(err, response)
+    if err then
+      callback(nil)
+      return
+    end
+
+    callback(format_exception_summary(response))
+  end)
+end
+
 -- On any pause (breakpoint, step, exception), jump the cursor to the stopped
 -- line in the nearest editor window so the source is always in focus.
 dap.listeners.after.event_stopped["jump_to_source"] = function(session, body)
@@ -3451,80 +3864,101 @@ dap.listeners.after.event_stopped["jump_to_source"] = function(session, body)
     local path = frame.source.path
     local line = frame.line
 
-    vim.schedule(function()
-      local bufnr = vim.fn.bufadd(path)
-      vim.fn.bufload(bufnr)
+    local function show_stopped_frame(exception_summary)
+      if body.reason == "exception" and not exception_summary then
+        exception_summary = compact_debug_text(body.description or body.text, 140)
+      end
 
-      local target_win = nil
-      local current_win = vim.api.nvim_get_current_win()
-      local current_is_source = is_debug_source_window(current_win)
+      vim.schedule(function()
+        local bufnr = vim.fn.bufadd(path)
+        vim.fn.bufload(bufnr)
 
-      if current_is_source then
-        target_win = current_win
-      else
-        for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
-          if vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_config(win).relative == "" then
-            local wbuf = vim.api.nvim_win_get_buf(win)
-            if vim.bo[wbuf].buftype == "" and vim.bo[wbuf].filetype ~= "NvimTree" then
-              target_win = win
-              break
+        local target_win = nil
+        local current_win = vim.api.nvim_get_current_win()
+        local current_is_source = is_debug_source_window(current_win)
+
+        if current_is_source then
+          target_win = current_win
+        else
+          for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+            if vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_config(win).relative == "" then
+              local wbuf = vim.api.nvim_win_get_buf(win)
+              if vim.bo[wbuf].buftype == "" and vim.bo[wbuf].filetype ~= "NvimTree" then
+                target_win = win
+                break
+              end
             end
           end
         end
-      end
 
-      if not target_win then
-        return
-      end
-
-      vim.api.nvim_win_set_buf(target_win, bufnr)
-      if current_is_source then
-        vim.api.nvim_set_current_win(target_win)
-        vim.api.nvim_win_set_cursor(target_win, { line, 0 })
-        vim.cmd("normal! zz")
-      end
-
-      -- Clear any previous stop markers, then mark the new stopped line.
-      clear_dap_stopped_marks()
-      dap_last_buf = bufnr
-
-      local reason = body.reason or "stopped"
-      local label = reason == "exception" and "  ✗ exception"
-        or reason == "breakpoint"         and "  ◆ breakpoint"
-        or                                    "  ◆ " .. reason
-
-      -- Surface the function we stopped in, both inline and in the hint window,
-      -- so it's obvious the debugger is executing your code (and where).
-      local func = frame.name
-      if func and func ~= "" then
-        label = label .. "  in " .. func .. "()"
-      end
-
-      set_debug_location({
-        func = (func and func ~= "") and func or "?",
-        file = vim.fn.fnamemodify(path, ":t"),
-        line = line,
-        reason = reason,
-      })
-
-      -- Persistent end-of-line label (stays until continue/terminate).
-      vim.api.nvim_buf_set_extmark(bufnr, dap_label_ns, line - 1, 0, {
-        virt_text     = { { label, "DiagnosticWarn" } },
-        virt_text_pos = "eol",
-        priority      = 200,
-      })
-
-      -- Bright flash that fades after 500 ms, leaving the sign's linehl.
-      vim.api.nvim_buf_set_extmark(bufnr, dap_flash_ns, line - 1, 0, {
-        line_hl_group = "DapStoppedFlash",
-        priority      = 210,
-      })
-      vim.defer_fn(function()
-        if vim.api.nvim_buf_is_valid(bufnr) then
-          vim.api.nvim_buf_clear_namespace(bufnr, dap_flash_ns, 0, -1)
+        if not target_win then
+          return
         end
-      end, 500)
-    end)
+
+        vim.api.nvim_win_set_buf(target_win, bufnr)
+        if current_is_source then
+          vim.api.nvim_set_current_win(target_win)
+          vim.api.nvim_win_set_cursor(target_win, { line, 0 })
+          vim.cmd("normal! zz")
+        end
+
+        -- Clear any previous stop markers, then mark the new stopped line.
+        clear_dap_stopped_marks()
+        dap_last_buf = bufnr
+
+        local reason = body.reason or "stopped"
+        local label = reason == "exception" and "  ✗ exception"
+          or reason == "breakpoint"         and "  ◆ breakpoint"
+          or                                    "  ◆ " .. reason
+
+        if exception_summary then
+          label = label .. ": " .. exception_summary
+        end
+
+        -- Surface the function we stopped in, both inline and in the hint window,
+        -- so it's obvious the debugger is executing your code (and where).
+        local func = frame.name
+        if func and func ~= "" then
+          label = label .. "  in " .. func .. "()"
+        end
+
+        set_debug_location({
+          func = (func and func ~= "") and func or "?",
+          file = vim.fn.fnamemodify(path, ":t"),
+          line = line,
+          reason = reason,
+          exception = exception_summary,
+        })
+
+        if exception_summary then
+          vim.notify(exception_summary, vim.log.levels.ERROR, { title = "DAP exception" })
+        end
+
+        -- Persistent end-of-line label (stays until continue/terminate).
+        vim.api.nvim_buf_set_extmark(bufnr, dap_label_ns, line - 1, 0, {
+          virt_text     = { { label, "DiagnosticWarn" } },
+          virt_text_pos = "eol",
+          priority      = 200,
+        })
+
+        -- Bright flash that fades after 500 ms, leaving the sign's linehl.
+        vim.api.nvim_buf_set_extmark(bufnr, dap_flash_ns, line - 1, 0, {
+          line_hl_group = "DapStoppedFlash",
+          priority      = 210,
+        })
+        vim.defer_fn(function()
+          if vim.api.nvim_buf_is_valid(bufnr) then
+            vim.api.nvim_buf_clear_namespace(bufnr, dap_flash_ns, 0, -1)
+          end
+        end, 500)
+      end)
+    end
+
+    if body.reason == "exception" then
+      request_exception_info(session, body.threadId, show_stopped_frame)
+    else
+      show_stopped_frame(nil)
+    end
   end)
 end
 
@@ -3600,13 +4034,6 @@ local function open_debug_output(title, text)
   end, { buffer = buf, silent = true, desc = "Close debug output" })
 end
 
-local function torch_summary_expression(expr)
-  expr = vim.trim(expr):gsub("\n", " ")
-
-  local template = [[(lambda __x: (("torch.Tensor(shape=%%s, dtype=%%s, device=%%s, requires_grad=%%s, numel=%%s)\n%%s" %% (tuple(__x.shape), __x.dtype, __x.device, getattr(__x, "requires_grad", False), __x.numel(), (__x.detach().to("cpu").tolist() if __x.numel() <= 256 else __x.detach().to("cpu").flatten()[:256].tolist()))) if (__import__("sys").modules.get("torch") is not None and isinstance(__x, __import__("sys").modules["torch"].Tensor)) else __import__("pprint").pformat(__x, width=120, compact=False)))(%s)]]
-  return template:format(expr)
-end
-
 inspect_debug_expression = function(expr)
   expr = vim.trim(expr or "")
   if expr == "" then
@@ -3649,7 +4076,7 @@ vim.api.nvim_create_user_command("DapInspectVariable", function(opts)
   vim.ui.input({ prompt = "DAP inspect expression: " }, inspect_debug_expression)
 end, {
   nargs = "*",
-  desc = "Inspect a paused Python variable, copying torch CUDA tensors to CPU for display",
+  desc = "Inspect a paused Python variable with compact torch tensor summaries",
 })
 
 vim.api.nvim_create_user_command("DapToggleVariableValues", function()
@@ -3851,6 +4278,9 @@ dap.adapters.python = function(callback, config)
     type = "executable",
     command = python_path,
     args = { "-m", "debugpy.adapter" },
+    options = {
+      initialize_timeout_sec = 120,
+    },
   })
 end
 
@@ -3866,6 +4296,16 @@ dap.configurations.python = {
     end,
     justMyCode = false,
     console = "integratedTerminal",
+  },
+  {
+    type = "python",
+    request = "attach",
+    name = "Attach: human-deepstream container",
+    connect = { host = "127.0.0.1", port = 5678 },
+    pathMappings = {
+      { localRoot = vim.fn.getcwd(), remoteRoot = "/workspace" },
+    },
+    justMyCode = false,
   },
 }
 
@@ -4001,7 +4441,7 @@ local function read_exocortex_config()
       section = s
       cfg[section] = cfg[section] or {}
     elseif section then
-      local k, v = line:match("^(%w+)%s*=%s*(.+)$")
+      local k, v = line:match("^([%w_]+)%s*=%s*(.+)$")
       if k then cfg[section][k] = vim.trim(v) end
     end
   end
@@ -4058,6 +4498,131 @@ local function run_training_debug_explicit(cfg)
     console = "integratedTerminal",
   })
 end
+
+local docker_debug_jobs = {}
+
+local function run_docker_debug_attach(cfg)
+  local d = cfg.debug or {}
+  local base = cfg._dir or vim.fn.getcwd()
+  local cwd = d.cwd and resolve_config_path(base, d.cwd) or base
+  local host = d.host or "127.0.0.1"
+  local port = tonumber(d.port or d.attach_port) or 5678
+  local local_root = d.local_root and resolve_config_path(base, d.local_root) or cwd
+  local remote_root = d.remote_root or "/workspace"
+  local name = d.name or "Attach: human-deepstream container"
+  local run = d.run or d.script
+  local attach_delay_ms = tonumber(d.attach_delay_ms) or 1500
+  local attach_timeout_ms = tonumber(d.attach_timeout_ms) or 60000
+  local python = d.python and resolve_config_path(base, d.python) or vim.fn.exepath("python3")
+
+  if not python or python == "" or not file_exists(python) then
+    vim.notify("Python interpreter not found: " .. tostring(python), vim.log.levels.ERROR)
+    return
+  end
+
+  if not ensure_debugpy(python) then
+    return
+  end
+
+  pending_debug_source = nil
+  vim.notify("DAP: debugging " .. vim.fn.fnamemodify(local_root, ":~:.") .. " -> " .. remote_root, vim.log.levels.INFO, { title = name })
+
+  local function attach()
+    dap.run({
+      type = "python",
+      request = "attach",
+      name = name,
+      connect = { host = host, port = port },
+      pathMappings = {
+        { localRoot = local_root, remoteRoot = remote_root },
+      },
+      pythonPath = python,
+      justMyCode = false,
+    })
+  end
+
+  local function wait_for_port_then_attach(start_ms)
+    local socket = vim.uv.new_tcp()
+
+    socket:connect(host, port, function(err)
+      socket:close()
+
+      if not err then
+        vim.schedule(attach)
+        return
+      end
+
+      if (vim.uv.now() - start_ms) >= attach_timeout_ms then
+        vim.schedule(function()
+          vim.notify(
+            "DAP: timed out waiting for " .. host .. ":" .. port .. "; see " .. (d.log or "/tmp/exocortex-docker-debug.log"),
+            vim.log.levels.ERROR
+          )
+        end)
+        return
+      end
+
+      vim.defer_fn(function()
+        wait_for_port_then_attach(start_ms)
+      end, 500)
+    end)
+  end
+
+  if run and run ~= "" then
+    local log_file = d.log or "/tmp/exocortex-docker-debug.log"
+    local cmd = run
+    if not cmd:find("^/") then
+      cmd = "./" .. cmd:gsub("^%./", "")
+    end
+
+    local job_key = cwd .. "\n" .. run
+    local existing_job = docker_debug_jobs[job_key]
+    if existing_job and vim.fn.jobwait({ existing_job }, 0)[1] == -1 then
+      vim.notify("DAP: debug script already running; waiting to attach to " .. host .. ":" .. port, vim.log.levels.INFO, { title = name })
+      vim.defer_fn(function()
+        wait_for_port_then_attach(vim.uv.now())
+      end, attach_delay_ms)
+      return
+    end
+
+    local job_id = vim.fn.jobstart({ "sh", "-c", cmd .. " >> " .. vim.fn.shellescape(log_file) .. " 2>&1" }, {
+      cwd = cwd,
+      detach = false,
+      on_exit = function()
+        docker_debug_jobs[job_key] = nil
+      end,
+    })
+
+    if job_id <= 0 then
+      vim.notify("DAP: failed to start debug script: " .. run, vim.log.levels.ERROR)
+      return
+    end
+
+    docker_debug_jobs[job_key] = job_id
+    vim.notify("DAP: started " .. run .. "; log: " .. log_file, vim.log.levels.INFO, { title = name })
+    vim.defer_fn(function()
+      wait_for_port_then_attach(vim.uv.now())
+    end, attach_delay_ms)
+    return
+  end
+
+  attach()
+end
+
+vim.api.nvim_create_user_command("DebugDockerAttach", function()
+  dap.run({
+    type = "python",
+    request = "attach",
+    name = "Attach: human-deepstream container",
+    connect = { host = "127.0.0.1", port = 5678 },
+    pathMappings = {
+      { localRoot = vim.fn.getcwd(), remoteRoot = "/workspace" },
+    },
+    justMyCode = false,
+  })
+end, {
+  desc = "Attach debugpy to the human-deepstream Docker container",
+})
 
 local function current_python_project_root(file)
   local start = vim.fn.fnamemodify(file, ":h")
@@ -4133,6 +4698,11 @@ debug_keymaps.set("n", debug_keys.start_continue, function()
 
   local cfg = read_exocortex_config()
   local d = cfg.debug or {}
+
+  if cfg._dir and d.request == "attach" then
+    run_docker_debug_attach(cfg)
+    return
+  end
 
   if cfg._dir and (d.python or d.cwd or d.program or d.args) then
     run_training_debug_explicit(cfg)
@@ -4217,6 +4787,10 @@ debug_keymaps.set("n", debug_keys.inspect, function()
 end, {
   silent = true,
   desc = "Inspect debug variable",
+})
+debug_keymaps.set("n", debug_keys.current_function, show_debug_current_function, {
+  silent = true,
+  desc = "Show current debug function",
 })
 debug_keymaps.set("n", debug_keys.toggle_values, "<cmd>DapToggleVariableValues<CR>", {
   silent = true,

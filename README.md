@@ -54,7 +54,7 @@ To prompt from the selected node, use operation `keys.graph.prompt_branch`. It i
 
 To prompt from a fresh root, use operation `keys.graph.prompt_root`. It is currently set to `P`.
 
-Inside the prompt editor, submit with `<C-d>` when you want the agent to produce reviewable diffs. Submit with `<C-r>` when you want a read-only Markdown response meant to be read. Submit with `<C-a>` for agent mode, which runs commands in the proposal worktree and should report what it ran without creating throwaway scripts.
+Inside the prompt editor, submit with `<C-d>` when you want the agent to produce reviewable diffs. Submit with `<C-r>` when you want a read-only Markdown response meant to be read. Submit with `<C-a>` for agent mode, which runs commands in the proposal worktree and should report what it ran without creating throwaway scripts. Agent mode may execute external tool or virtualenv paths when needed, but source/config edits should stay inside the proposal worktree.
 
 To choose the session agent, use operation `keys.graph.choose_agent`. It is currently set to `a`.
 
@@ -120,12 +120,20 @@ To open large variables, watches, or console floats, use operations `keys.debug.
 
 To inspect an expression in the current frame, use operation `keys.debug.inspect`. It is currently set to `<leader>de`.
 
+Debugger dictionary values are split across readable lines, and torch tensors are summarized by tensor type, shape, dtype, and device instead of printing every value.
+
+To show the function currently executing in the stopped frame, use operation `keys.debug.current_function`. It is currently set to `<leader>df`.
+
 To toggle inline variable values, use operation `keys.debug.toggle_values`. It is currently set to `<leader>dV`.
 
 To open the debug mask/logit image, use operation `keys.debug.view_mask`. It is currently set to `<leader>dm`.
 
 To toggle breaking on all raised exceptions, use operation `keys.debug.toggle_exception_breakpoints`. It is currently set to `<leader>dE`.
 
+When the debugger stops on an exception, the stopped-line marker and debug hint window include the exception type/message when the adapter provides it.
+
 To run the configured training debug target, use operation `keys.debug.run_training`. It is currently set to `<leader>dr`.
+
+For Docker/debugpy attach, put `request = attach` in the project `exocortex.config` `[debug]` section. Supported keys are `name`, `host`, `port`, `cwd`, `local_root`, `remote_root`, `run`, `attach_delay_ms`, and `log`.
 
 While debug mode is active, cursor navigation in debug panes uses `keys.debug.debug_nav_up`, `keys.debug.debug_nav_down`, `keys.debug.debug_nav_left`, and `keys.debug.debug_nav_right`. They are currently set to `<PageUp>`, `<PageDown>`, `[`, and `]`.
