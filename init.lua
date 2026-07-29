@@ -227,6 +227,9 @@ vim.o.termguicolors = true
 vim.o.mouse = "a"
 vim.o.hidden = true
 vim.opt.clipboard = "unnamedplus"
+if vim.env.SSH_TTY or vim.env.SSH_CONNECTION then
+  vim.g.clipboard = "osc52"
+end
 vim.o.showtabline = 2 -- always show (used for AI node status bar)
 vim.o.tabline = "%!v:lua.ExocortexTabLine()"
 vim.o.splitright = true
@@ -2253,6 +2256,18 @@ local function map_terminal_shortcut(buf, lhses, rhs, desc)
   end
 end
 
+_G.terminal_paste_text = _G.terminal_paste_text or ""
+
+function _G.copy_to_system_clipboard(text)
+  if text == "" then
+    return
+  end
+
+  _G.terminal_paste_text = text
+  vim.fn.setreg("+", text)
+  vim.fn.setreg('"', text)
+end
+
 function _G.yank_terminal_selection()
   vim.cmd([[normal! "zy]])
   local text = vim.fn.getreg("z")
@@ -2260,8 +2275,7 @@ function _G.yank_terminal_selection()
     return
   end
 
-  vim.fn.setreg("+", text)
-  vim.fn.setreg('"', text)
+  _G.copy_to_system_clipboard(text)
   vim.notify("Yanked terminal selection to clipboard", vim.log.levels.INFO)
 
   if vim.bo.buftype == "terminal" then
@@ -2274,14 +2288,10 @@ function _G.paste_clipboard_into_terminal()
   local job_id = vim.b[buf].terminal_job_id
 
   if not job_id then
-    vim.notify("Terminal paste: no terminal job for this buffer", vim.log.levels.WARN)
     return
   end
 
-  local text = vim.fn.getreg("+")
-  if text == "" then
-    text = vim.fn.getreg('"')
-  end
+  local text = _G.terminal_paste_text or ""
   if text == "" then
     return
   end
@@ -2300,7 +2310,13 @@ function _G.apply_terminal_clipboard_keymaps(buf)
   vim.keymap.set("x", "y", _G.yank_terminal_selection, { buffer = buf, silent = true, desc = "Yank terminal selection" })
   vim.keymap.set("x", "Y", _G.yank_terminal_selection, { buffer = buf, silent = true, desc = "Yank terminal selection" })
 
-  for _, lhs in ipairs({ "p", "<C-v>", "<C-S-v>", "<D-v>" }) do
+  vim.keymap.set("n", "p", _G.paste_clipboard_into_terminal, {
+    buffer = buf,
+    silent = true,
+    desc = "Paste clipboard into terminal",
+  })
+
+  for _, lhs in ipairs({ "<C-v>", "<C-S-v>", "<D-v>" }) do
     vim.keymap.set({ "n", "t" }, lhs, _G.paste_clipboard_into_terminal, {
       buffer = buf,
       silent = true,
@@ -2323,8 +2339,7 @@ function _G.handle_terminal_osc52(args)
     return
   end
 
-  vim.fn.setreg("+", decoded)
-  vim.fn.setreg('"', decoded)
+  _G.copy_to_system_clipboard(decoded)
   vim.notify("Copied remote terminal selection to clipboard", vim.log.levels.INFO)
 end
 
@@ -2699,6 +2714,19 @@ vim.api.nvim_create_autocmd("TermRequest", {
   callback = _G.handle_terminal_osc52,
 })
 
+vim.api.nvim_create_autocmd("TextYankPost", {
+  group = augroup,
+  callback = function()
+    local event = vim.v.event or {}
+    local contents = event.regcontents
+    if not contents or vim.tbl_isempty(contents) then
+      return
+    end
+
+    _G.terminal_paste_text = table.concat(contents, "\n")
+  end,
+})
+
 vim.keymap.set({ "n", "t" }, "<F4>", toggle_bottom_terminal, {
   desc = "Toggle terminal panel",
 })
@@ -2814,8 +2842,7 @@ local function copybot_fn()
   capture_terminal_output(buf)
   if vim.fn.filereadable(last_output_file) == 1 then
     local content = table.concat(vim.fn.readfile(last_output_file), "\n")
-    vim.fn.setreg("+", content)
-    vim.fn.setreg('"', content)
+    _G.copy_to_system_clipboard(content)
     vim.notify("Copybot: terminal output copied to clipboard", vim.log.levels.INFO)
   else
     vim.notify("Copybot: no terminal output to copy", vim.log.levels.WARN)
@@ -6085,13 +6112,10 @@ local function paste_register_into_codex_terminal()
   local job_id = vim.b[buf].terminal_job_id
 
   if not job_id then
-    vim.notify("Codex paste: no terminal job for this buffer", vim.log.levels.WARN)
     return
   end
 
-  local text = vim.fn.getreg("\"")
-  text = text:gsub("[\r\n]+$", "")
-
+  local text = _G.terminal_paste_text or ""
   if text == "" then
     return
   end
