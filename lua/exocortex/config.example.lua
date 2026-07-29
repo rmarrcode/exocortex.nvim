@@ -93,6 +93,7 @@ return {
       watches = "<leader>dw",
       console = "<leader>dC",
       inspect = "<leader>de",
+      dataframe = "<leader>dd",
       current_function = "<leader>df",
       toggle_values = "<leader>dV",
       view_mask = "<leader>dm",

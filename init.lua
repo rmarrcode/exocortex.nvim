@@ -173,12 +173,16 @@ lazy.setup({
     config = function()
       local ts = require("nvim-treesitter")
       ts.install({ "bash", "json", "latex", "markdown", "markdown_inline", "yaml" })
+      pcall(vim.treesitter.language.register, "bash", { "sh", "zsh" })
 
       vim.api.nvim_create_autocmd("FileType", {
         group = vim.api.nvim_create_augroup("user-treesitter", { clear = true }),
         pattern = { "bash", "json", "jsonc", "latex", "markdown", "sh", "yaml", "zsh" },
         callback = function()
-          pcall(vim.treesitter.start)
+          local ok = pcall(vim.treesitter.start)
+          if not ok then
+            vim.cmd("syntax enable")
+          end
         end,
       })
     end,
@@ -236,6 +240,25 @@ vim.o.signcolumn = "yes"
 vim.o.virtualedit = "block"
 vim.opt.fillchars:append({ eob = " " })
 vim.g.sh_no_error = 1
+
+vim.filetype.add({
+  extension = {
+    sh = "sh",
+    bash = "bash",
+    zsh = "zsh",
+  },
+  filename = {
+    [".bashrc"] = "bash",
+    [".bash_profile"] = "bash",
+    [".bash_aliases"] = "bash",
+    [".zshrc"] = "zsh",
+    [".envrc"] = "sh",
+  },
+  pattern = {
+    [".*/Dockerfile%..*"] = "dockerfile",
+    [".*%.env%..*"] = "sh",
+  },
+})
 
 vim.keymap.set({ "n", "x", "o" }, "<Space>", "<Nop>", {
   silent = true,
@@ -994,6 +1017,8 @@ require("telescope").setup({
     mappings = {
       i = {
         ["<Esc>"] = require("telescope.actions").close,
+        ["<C-p>"] = require("telescope.actions").close,
+        ["<C-q>"] = require("telescope.actions").close,
         ["<C-g>"] = function(prompt_bufnr)
           local text = require("telescope.actions.state").get_current_line()
           require("telescope.actions").close(prompt_bufnr)
@@ -1004,6 +1029,12 @@ require("telescope").setup({
           require("telescope.actions").close(prompt_bufnr)
           require("telescope.builtin").lsp_dynamic_workspace_symbols({ default_text = text })
         end,
+      },
+      n = {
+        ["<Esc>"] = require("telescope.actions").close,
+        ["q"] = require("telescope.actions").close,
+        ["<C-p>"] = require("telescope.actions").close,
+        ["<C-q>"] = require("telescope.actions").close,
       },
     },
   },
@@ -1091,19 +1122,29 @@ local function project_search()
   end
 
   if vim.fn.executable("rg") == 1 then
-    run_telescope(builtin.find_files, {
+    run_telescope(builtin.find_files, require("telescope.themes").get_dropdown({
       cwd = root,
       find_command = rg_file_command(),
       prompt_title = "Project files: " .. vim.fn.fnamemodify(root, ":~"),
-    })
+      previewer = false,
+      layout_config = {
+        width = 0.82,
+        height = 0.55,
+      },
+    }))
     return
   end
 
-  run_telescope(builtin.find_files, {
+  run_telescope(builtin.find_files, require("telescope.themes").get_dropdown({
     cwd = root,
     hidden = false,
     prompt_title = "Project files: " .. vim.fn.fnamemodify(root, ":~"),
-  })
+    previewer = false,
+    layout_config = {
+      width = 0.82,
+      height = 0.55,
+    },
+  }))
 end
 
 local function project_grep()
@@ -2212,6 +2253,81 @@ local function map_terminal_shortcut(buf, lhses, rhs, desc)
   end
 end
 
+function _G.yank_terminal_selection()
+  vim.cmd([[normal! "zy]])
+  local text = vim.fn.getreg("z")
+  if text == "" then
+    return
+  end
+
+  vim.fn.setreg("+", text)
+  vim.fn.setreg('"', text)
+  vim.notify("Yanked terminal selection to clipboard", vim.log.levels.INFO)
+
+  if vim.bo.buftype == "terminal" then
+    vim.cmd("startinsert")
+  end
+end
+
+function _G.paste_clipboard_into_terminal()
+  local buf = vim.api.nvim_get_current_buf()
+  local job_id = vim.b[buf].terminal_job_id
+
+  if not job_id then
+    vim.notify("Terminal paste: no terminal job for this buffer", vim.log.levels.WARN)
+    return
+  end
+
+  local text = vim.fn.getreg("+")
+  if text == "" then
+    text = vim.fn.getreg('"')
+  end
+  if text == "" then
+    return
+  end
+
+  vim.api.nvim_chan_send(job_id, text)
+  vim.cmd("startinsert")
+end
+
+function _G.apply_terminal_clipboard_keymaps(buf)
+  if not (buf and vim.api.nvim_buf_is_valid(buf) and vim.bo[buf].buftype == "terminal") then
+    return
+  end
+
+  vim.keymap.set("t", "<Esc>", "<C-\\><C-n>", { buffer = buf, silent = true, desc = "Exit terminal mode" })
+  vim.keymap.set("n", "Y", "ggVGy", { buffer = buf, silent = true, desc = "Yank entire terminal buffer" })
+  vim.keymap.set("x", "y", _G.yank_terminal_selection, { buffer = buf, silent = true, desc = "Yank terminal selection" })
+  vim.keymap.set("x", "Y", _G.yank_terminal_selection, { buffer = buf, silent = true, desc = "Yank terminal selection" })
+
+  for _, lhs in ipairs({ "p", "<C-v>", "<C-S-v>", "<D-v>" }) do
+    vim.keymap.set({ "n", "t" }, lhs, _G.paste_clipboard_into_terminal, {
+      buffer = buf,
+      silent = true,
+      desc = "Paste clipboard into terminal",
+    })
+  end
+end
+
+function _G.handle_terminal_osc52(args)
+  local data = args and args.data or {}
+  local sequence = data.sequence or ""
+  local encoded = sequence:match("\027%]52;[^;]*;([A-Za-z0-9+/=]+)")
+
+  if not encoded or encoded == "" then
+    return
+  end
+
+  local ok, decoded = pcall(vim.base64.decode, encoded)
+  if not ok or not decoded or decoded == "" then
+    return
+  end
+
+  vim.fn.setreg("+", decoded)
+  vim.fn.setreg('"', decoded)
+  vim.notify("Copied remote terminal selection to clipboard", vim.log.levels.INFO)
+end
+
 local function is_valid_terminal_buffer(buf)
   return buf
     and vim.api.nvim_buf_is_valid(buf)
@@ -2568,8 +2684,20 @@ end
 set_terminal_buffer_keymaps = function(buf)
   map_terminal_shortcut(buf, { "<C-t>" }, new_terminal_tab, "New terminal tab")
   map_terminal_shortcut(buf, { "<C-w>" }, close_current_terminal, "Close terminal tab")
-  vim.keymap.set("t", "<Esc>", "<C-\\><C-n>", { buffer = buf, silent = true, desc = "Exit terminal mode" })
+  _G.apply_terminal_clipboard_keymaps(buf)
 end
+
+vim.api.nvim_create_autocmd("TermOpen", {
+  group = augroup,
+  callback = function(args)
+    _G.apply_terminal_clipboard_keymaps(args.buf)
+  end,
+})
+
+vim.api.nvim_create_autocmd("TermRequest", {
+  group = augroup,
+  callback = _G.handle_terminal_osc52,
+})
 
 vim.keymap.set({ "n", "t" }, "<F4>", toggle_bottom_terminal, {
   desc = "Toggle terminal panel",
@@ -2857,6 +2985,16 @@ local function is_debug_tensor(variable)
   return var_type:match("Tensor") or value:match("^tensor%(") or value:match("^Tensor%(") or value:match("^torch%.Tensor%(")
 end
 
+function _G.is_debug_dataframe(variable)
+  local var_type = tostring(variable.type or ""):lower()
+  local value = vim.trim(variable.value or "")
+  return var_type:match("dataframe")
+    or var_type:match("series")
+    or value:match("^['\"]DataFrame%s+`") ~= nil
+    or value:match("^['\"]Series%s+`") ~= nil
+    or value:match("%[%d+ rows x %d+ columns%]") ~= nil
+end
+
 local function tensor_summary_for_variable(variable)
   return tensor_summary_from_value(variable.value or "") or "torch.Tensor"
 end
@@ -2866,6 +3004,55 @@ local function torch_summary_expression(expr)
 
   local template = [[(lambda __x: (("torch.Tensor(shape=%%s, dtype=%%s, device=%%s, requires_grad=%%s, numel=%%s)" %% (tuple(__x.shape), __x.dtype, __x.device, getattr(__x, "requires_grad", False), __x.numel())) if (__import__("sys").modules.get("torch") is not None and isinstance(__x, __import__("sys").modules["torch"].Tensor)) else __import__("pprint").pformat(__x, width=120, compact=False)))(%s)]]
   return template:format(expr)
+end
+
+function _G.dataframe_summary_expression(expr)
+  expr = vim.trim(expr):gsub("\n", " ")
+
+  local template = [[(lambda __x, __shape, __clean: ((("DataFrame `%s`\nshape=%%s index=%%s columns=%%s memory=%%s\n%%s") %% (tuple(__x.shape), type(__x.index).__name__, len(__x.columns), (str(int(__x.memory_usage(deep=True).sum())) + " bytes") if hasattr(__x, "memory_usage") else "?", "\n".join([("  %%2d. %%s: dtype=%%s series_shape=%%s cell_shape=%%s non_null=%%s nulls=%%s" %% (__i + 1, __clean(__c), str(__x[__c].dtype), tuple(__x[__c].shape), __shape(__x[__c].dropna().iloc[0]) if hasattr(__x[__c], "dropna") and len(__x[__c].dropna()) else "-", str(int(__x[__c].notna().sum())) if hasattr(__x[__c], "notna") else "?", str(int(__x[__c].isna().sum())) if hasattr(__x[__c], "isna") else "?")) for __i, __c in enumerate(__x.columns)]))) if hasattr(__x, "columns") and hasattr(__x, "dtypes") and hasattr(__x, "shape") else (("Series `%s`\nshape=%%s dtype=%%s name=%%s index=%%s non_null=%%s nulls=%%s memory=%%s") %% (tuple(__x.shape), getattr(__x, "dtype", "?"), getattr(__x, "name", None), type(__x.index).__name__ if hasattr(__x, "index") else "?", str(int(__x.notna().sum())) if hasattr(__x, "notna") else "?", str(int(__x.isna().sum())) if hasattr(__x, "isna") else "?", (str(int(__x.memory_usage(deep=True))) + " bytes") if hasattr(__x, "memory_usage") else "?")) if hasattr(__x, "dtype") and hasattr(__x, "shape") else ("Not a pandas DataFrame/Series: " + type(__x).__module__ + "." + type(__x).__name__)))(%s, lambda __v: str(tuple(__v.shape)) if hasattr(__v, "shape") else (str((len(__v),)) if isinstance(__v, (list, tuple)) else type(__v).__name__), lambda __v: str(__v).replace("\n", "\\n"))]]
+  return template:format(expr, expr, expr)
+end
+
+function _G.decode_debugpy_string_result(value)
+  value = tostring(value or "")
+
+  if #value >= 2 then
+    local quote = value:sub(1, 1)
+    if (quote == "'" or quote == '"') and value:sub(-1) == quote then
+      value = value:sub(2, -2)
+    end
+  end
+
+  local escaped_backslash = string.char(31)
+  value = value
+    :gsub("\\\\", escaped_backslash)
+    :gsub("\\n", "\n")
+    :gsub("\\t", "\t")
+    :gsub("\\r", "\r")
+    :gsub("\\'", "'")
+    :gsub('\\"', '"')
+    :gsub(escaped_backslash, "\\")
+
+  return value
+end
+
+function _G.evaluate_dataframe_summary(client, variable)
+  if not variable.evaluateName then
+    return { "pandas." .. tostring(variable.type or "DataFrame") }
+  end
+
+  local frame_id = client.session and client.session.current_frame and client.session.current_frame.id
+  local ok, response = pcall(client.request.evaluate, {
+    expression = _G.dataframe_summary_expression(variable.evaluateName),
+    frameId = frame_id,
+    context = "variables",
+  })
+
+  if ok and response and response.result and response.result ~= "" then
+    return vim.split(_G.decode_debugpy_string_result(response.result), "\n", { plain = true })
+  end
+
+  return { "pandas." .. tostring(variable.type or "DataFrame") }
 end
 
 local function evaluate_tensor_summary(client, variable)
@@ -3033,6 +3220,11 @@ dapui_util.format_value = function(value_start, value)
     return { "<hidden>" }
   end
 
+  local decoded_dataframe = _G.decode_debugpy_string_result(value)
+  if decoded_dataframe:match("^DataFrame%s+`") or decoded_dataframe:match("^Series%s+`") then
+    return vim.split(decoded_dataframe, "\n", { plain = true })
+  end
+
   local tensor_summary = tensor_summary_from_value(value)
   if tensor_summary then
     return { tensor_summary }
@@ -3152,6 +3344,9 @@ package.preload["dapui.components.variables"] = function()
         if is_debug_tensor(variable) then
           show_value = true
           formatted_value_override = { evaluate_tensor_summary(client, variable) }
+        elseif _G.is_debug_dataframe(variable) then
+          show_value = true
+          formatted_value_override = _G.evaluate_dataframe_summary(client, variable)
         elseif is_debug_dict(variable) and variable.variablesReference > 0 then
           show_value = true
           formatted_value_override = { "{...}" }
@@ -3252,6 +3447,28 @@ local dapui_left_filetypes = {
   dapui_stacks = true,
   dapui_watches = true,
 }
+
+function _G.enable_debug_source_line_numbers(win)
+  if win and vim.api.nvim_win_is_valid(win) then
+    vim.wo[win].number = true
+    vim.wo[win].relativenumber = true
+    vim.wo[win].signcolumn = "yes"
+  end
+end
+
+vim.api.nvim_create_autocmd({ "BufWinEnter", "WinEnter" }, {
+  group = augroup,
+  callback = function(args)
+    local win = vim.api.nvim_get_current_win()
+    local buf = args.buf or vim.api.nvim_win_get_buf(win)
+    local name = vim.api.nvim_buf_get_name(buf)
+    local ft = vim.bo[buf].filetype
+
+    if name:match("^dap%-src://") or (ft ~= "" and not dapui_readable_filetypes[ft] and dap.session()) then
+      _G.enable_debug_source_line_numbers(win)
+    end
+  end,
+})
 
 local function debug_sidebar_width()
   return math.max(1, math.floor(vim.o.columns * 0.25))
@@ -3380,6 +3597,7 @@ local function focus_debug_source(path, line)
   end
 
   vim.api.nvim_win_set_buf(target_win, bufnr)
+  _G.enable_debug_source_line_numbers(target_win)
 
   vim.api.nvim_set_current_win(target_win)
   pcall(vim.api.nvim_win_set_cursor, target_win, { math.max(line or 1, 1), 0 })
@@ -3398,22 +3616,25 @@ end
 -- visible until F11 explicitly closes the debug UI.
 local set_debug_mode_keymaps
 
-local dap_saved_layout = nil
-local dap_restore_nvim_tree = false
-local dap_restore_bottom_terminal = false
+local dap_restore_state = {
+  layout = nil,
+  tree = false,
+  terminal = false,
+  tree_width = nil,
+}
 
-local function nvim_tree_visible()
+local function nvim_tree_win()
   for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
     if vim.api.nvim_win_is_valid(win) then
       local buf = vim.api.nvim_win_get_buf(win)
 
       if vim.bo[buf].filetype == "NvimTree" then
-        return true
+        return win
       end
     end
   end
 
-  return false
+  return nil
 end
 
 local function restore_bottom_terminal_window()
@@ -3437,6 +3658,7 @@ local function restore_bottom_terminal_window()
 
   vim.api.nvim_win_set_buf(win, buf)
   configure_terminal_window(win)
+  pcall(vim.api.nvim_win_set_height, win, terminal_state.height)
   update_terminal_winbar()
 
   if vim.api.nvim_win_is_valid(previous_win) then
@@ -3444,15 +3666,54 @@ local function restore_bottom_terminal_window()
   end
 end
 
-local function hide_debug_distractions()
-  dap_restore_nvim_tree = nvim_tree_visible()
-  dap_restore_bottom_terminal = terminal_state.win and vim.api.nvim_win_is_valid(terminal_state.win) or false
+local function normalize_restored_code_layout()
+  if dap_restore_state.tree_width then
+    local ok, api = pcall(require, "nvim-tree.api")
+    if ok and api.tree and api.tree.resize then
+      pcall(api.tree.resize, { absolute = dap_restore_state.tree_width })
+    else
+      local tree_win = nvim_tree_win()
+      if tree_win then
+        pcall(vim.api.nvim_win_set_width, tree_win, dap_restore_state.tree_width)
+      end
+    end
+  end
 
-  if dap_restore_nvim_tree then
+  if terminal_state.win and vim.api.nvim_win_is_valid(terminal_state.win) then
+    configure_terminal_window(terminal_state.win)
+    pcall(vim.api.nvim_win_set_height, terminal_state.win, terminal_state.height)
+    update_terminal_winbar()
+  end
+
+  vim.cmd("wincmd =")
+
+  if dap_restore_state.tree_width then
+    local tree_win = nvim_tree_win()
+    if tree_win then
+      pcall(vim.api.nvim_win_set_width, tree_win, dap_restore_state.tree_width)
+    end
+  end
+
+  if terminal_state.win and vim.api.nvim_win_is_valid(terminal_state.win) then
+    pcall(vim.api.nvim_win_set_height, terminal_state.win, terminal_state.height)
+  end
+end
+
+local function hide_debug_distractions()
+  local tree_win = nvim_tree_win()
+  dap_restore_state.tree = tree_win ~= nil
+  dap_restore_state.terminal = terminal_state.win and vim.api.nvim_win_is_valid(terminal_state.win) or false
+  dap_restore_state.tree_width = tree_win and vim.api.nvim_win_get_width(tree_win) or nil
+
+  if dap_restore_state.terminal then
+    terminal_state.height = vim.api.nvim_win_get_height(terminal_state.win)
+  end
+
+  if dap_restore_state.tree then
     pcall(vim.cmd, "NvimTreeClose")
   end
 
-  if dap_restore_bottom_terminal then
+  if dap_restore_state.terminal then
     local buf = terminal_state.current and terminal_state.buffers[terminal_state.current]
 
     if buf and capture_terminal_output then
@@ -3495,11 +3756,11 @@ local function collapse_to_one_debug_source_window()
 end
 
 local function restore_debug_distractions()
-  local restore_tree = dap_restore_nvim_tree
-  local restore_terminal = dap_restore_bottom_terminal
+  local restore_tree = dap_restore_state.tree
+  local restore_terminal = dap_restore_state.terminal
 
-  dap_restore_nvim_tree = false
-  dap_restore_bottom_terminal = false
+  dap_restore_state.tree = false
+  dap_restore_state.terminal = false
 
   if restore_tree then
     pcall(vim.cmd, "NvimTreeOpen")
@@ -3508,11 +3769,13 @@ local function restore_debug_distractions()
   if restore_terminal then
     restore_bottom_terminal_window()
   end
+
+  vim.defer_fn(normalize_restored_code_layout, 20)
 end
 
 local function dapui_open_keep_layout()
-  if not dap_saved_layout then
-    dap_saved_layout = vim.fn.winrestcmd()
+  if not dap_restore_state.layout then
+    dap_restore_state.layout = true
     hide_debug_distractions()
     collapse_to_one_debug_source_window()
   end
@@ -3530,20 +3793,23 @@ local function dapui_close_restore_layout()
   dapui.close()
   set_debug_mode_keymaps(false)
 
-  if not dap_saved_layout then
+  if not dap_restore_state.layout then
     restore_debug_distractions()
+    vim.defer_fn(function()
+      dap_restore_state.tree_width = nil
+    end, 80)
     return
   end
 
-  local restore = dap_saved_layout
-  dap_saved_layout = nil
+  dap_restore_state.layout = nil
 
-  -- Defer so dapui windows are fully gone before restoring normal layout.
+  -- Defer so dapui windows are fully gone before recreating normal UI windows.
   vim.schedule(function()
     restore_debug_distractions()
     vim.defer_fn(function()
-      pcall(vim.cmd, restore)
-    end, 20)
+      normalize_restored_code_layout()
+      dap_restore_state.tree_width = nil
+    end, 60)
   end)
 end
 
@@ -3576,7 +3842,7 @@ local function debug_hint_keys()
     string.format(" %-18s Step into", debug_key_label(keys.step_into)),
     string.format(" %-18s Step over", debug_key_label(keys.step_over)),
     string.format(" %-18s Step out", debug_key_label(keys.step_out)),
-    string.format(" %-18s Stop", debug_key_label(keys.stop)),
+    string.format(" %-18s Kill session", debug_key_label(keys.stop)),
     string.format(" %-18s Close UI", debug_key_label(keys.close_ui)),
     string.format(" %-18s Page up", debug_key_label(keys.debug_nav_up)),
     string.format(" %-18s Page down", debug_key_label(keys.debug_nav_down)),
@@ -3587,6 +3853,7 @@ local function debug_hint_keys()
     string.format(" %-18s Watches", debug_key_label(keys.watches)),
     string.format(" %-18s Console", debug_key_label(keys.console)),
     string.format(" %-18s Inspect", debug_key_label(keys.inspect)),
+    string.format(" %-18s DataFrame", debug_key_label(keys.dataframe)),
     string.format(" %-18s Current fn", debug_key_label(keys.current_function)),
     string.format(" %-18s Values", debug_key_label(keys.toggle_values)),
     string.format(" %-18s View mask", debug_key_label(keys.view_mask)),
@@ -3816,6 +4083,7 @@ local dap_label_ns = vim.api.nvim_create_namespace("dap_stopped_label")
 local dap_flash_ns = vim.api.nvim_create_namespace("dap_stopped_flash")
 local dap_last_buf = nil
 local debug_current_frame_id = nil
+_G.debug_current_thread_id = nil
 local docker_debug_status = nil
 
 local function clear_dap_stopped_marks()
@@ -3878,6 +4146,7 @@ dap.listeners.after.event_stopped["jump_to_source"] = function(session, body)
   if not body.threadId then
     return
   end
+  _G.debug_current_thread_id = body.threadId
 
   session:request("stackTrace", { threadId = body.threadId, startFrame = 0, levels = 1 }, function(err, response)
     if err or not response or not response.stackFrames or #response.stackFrames == 0 then
@@ -3901,10 +4170,17 @@ dap.listeners.after.event_stopped["jump_to_source"] = function(session, body)
 
       vim.schedule(function()
         local bufnr = vim.fn.bufadd(path)
+        pcall(function()
+          vim.bo[bufnr].swapfile = false
+        end)
         local loaded_ok = pcall(vim.fn.bufload, bufnr)
         if not loaded_ok then
-          vim.notify("DAP: could not load stopped source buffer: " .. path, vim.log.levels.WARN)
-          return
+          local edit_ok = pcall(vim.cmd, "silent keepalt noswapfile edit " .. vim.fn.fnameescape(path))
+          if not edit_ok then
+            vim.notify("DAP: could not load stopped source buffer: " .. path, vim.log.levels.WARN)
+            return
+          end
+          bufnr = vim.api.nvim_get_current_buf()
         end
         if not vim.api.nvim_buf_is_valid(bufnr) then
           return
@@ -3942,6 +4218,7 @@ dap.listeners.after.event_stopped["jump_to_source"] = function(session, body)
         end
 
         vim.api.nvim_win_set_buf(target_win, bufnr)
+        _G.enable_debug_source_line_numbers(target_win)
         vim.api.nvim_set_current_win(target_win)
         pcall(vim.api.nvim_win_set_cursor, target_win, { safe_line, 0 })
         vim.cmd("normal! zz")
@@ -4012,6 +4289,7 @@ local function on_dap_continue()
   vim.schedule(function()
     clear_dap_stopped_marks()
     debug_current_frame_id = nil
+    _G.debug_current_thread_id = nil
     set_debug_location({ running = true })
   end)
 end
@@ -4050,7 +4328,143 @@ local function close_debugger_ui()
   close_debug_hint()
   clear_dap_stopped_marks()
   debug_current_frame_id = nil
+  _G.debug_current_thread_id = nil
   pending_debug_source = nil
+end
+
+function _G.step_current_debug_thread(step_name)
+  local session = dap.session()
+  if session and _G.debug_current_thread_id and not session.stopped_thread_id then
+    session.stopped_thread_id = _G.debug_current_thread_id
+  end
+
+  if step_name == "into" then
+    dap.step_into({ askForTargets = false })
+  elseif step_name == "over" then
+    dap.step_over()
+  elseif step_name == "out" then
+    dap.step_out()
+  end
+end
+
+function _G.install_human_triton_execute_thread_debug(session, frame_id)
+  if not session or not frame_id or session._human_triton_execute_thread_debug_installed then
+    return
+  end
+
+  session._human_triton_execute_thread_debug_installed = true
+  local expression = [[exec('''
+import debugpy
+if "self" in globals() or "self" in locals():
+    if not getattr(self, "_dap_execute_thread_debug", False):
+        _dap_orig_execute = self.execute
+        def _dap_debug_execute(requests):
+            debugpy.debug_this_thread()
+            return _dap_orig_execute(requests)
+        self.execute = _dap_debug_execute
+        self._dap_execute_thread_debug = True
+elif not getattr(TritonPythonModel, "_dap_execute_thread_debug", False):
+    _dap_orig_execute = TritonPythonModel.execute
+    def _dap_debug_execute(self, requests):
+        debugpy.debug_this_thread()
+        return _dap_orig_execute(self, requests)
+    TritonPythonModel.execute = _dap_debug_execute
+    TritonPythonModel._dap_execute_thread_debug = True
+''')]]
+
+  session:request("evaluate", {
+    expression = expression,
+    frameId = frame_id,
+    context = "repl",
+  }, function(err)
+    vim.schedule(function()
+      if err then
+        session._human_triton_execute_thread_debug_installed = false
+        vim.notify("DAP: failed to trace Triton execute thread: " .. tostring(err.message or err), vim.log.levels.ERROR)
+      else
+        docker_debug_status.dap_state = "Triton execute thread tracing installed"
+        vim.notify("DAP: Triton execute thread tracing installed", vim.log.levels.INFO)
+      end
+    end)
+  end)
+end
+
+dap.listeners.after.event_stopped.human_triton_trace_execute_thread = function(session, body)
+  if not (session and session.config and session.config.name == "Attach: human Triton model.py") then
+    return
+  end
+  if session._human_triton_execute_thread_debug_installed or not (body and body.threadId) then
+    return
+  end
+
+  session:request("stackTrace", { threadId = body.threadId, startFrame = 0, levels = 8 }, function(err, response)
+    if err or not response or not response.stackFrames then
+      return
+    end
+
+    for _, frame in ipairs(response.stackFrames) do
+      local path = frame.source and frame.source.path or ""
+      if path:match("human_detection_segmentation/1/model%.py$") and frame.name == "initialize" then
+        _G.install_human_triton_execute_thread_debug(session, frame.id)
+        return
+      end
+    end
+
+    for _, frame in ipairs(response.stackFrames) do
+      local path = frame.source and frame.source.path or ""
+      if path:match("human_detection_segmentation/1/model%.py$") then
+        _G.install_human_triton_execute_thread_debug(session, frame.id)
+        return
+      end
+    end
+  end)
+end
+
+function _G.ensure_human_triton_model_breakpoint(cfg, line)
+  cfg = cfg or { _dir = vim.fn.getcwd(), debug = { local_root = vim.fn.getcwd(), remote_root = "/workspace" } }
+  line = tonumber(line) or 203
+
+  local d = cfg.debug or {}
+  local base = cfg._dir or vim.fn.getcwd()
+  local function resolve_path(path)
+    if not path or path == "" then
+      return nil
+    end
+    if path:find("^/") then
+      return path
+    end
+    return base .. "/" .. path
+  end
+  local cwd = resolve_path(d.cwd) or base
+  local local_root = resolve_path(d.local_root) or cwd
+  local path = local_root .. "/runtime/branches/human/model_repository/human_detection_segmentation/1/model.py"
+
+  if vim.fn.filereadable(path) ~= 1 then
+    vim.notify("DAP: cannot set Triton breakpoint; file not found: " .. path, vim.log.levels.ERROR)
+    return nil
+  end
+
+  local bufnr = vim.fn.bufadd(path)
+  pcall(function()
+    vim.bo[bufnr].swapfile = false
+  end)
+  local loaded_ok = pcall(vim.fn.bufload, bufnr)
+  if not loaded_ok then
+    vim.cmd("silent keepalt noswapfile edit " .. vim.fn.fnameescape(path))
+    bufnr = vim.api.nvim_get_current_buf()
+  end
+
+  local breakpoints = require("dap.breakpoints")
+  local existing = breakpoints.get(bufnr)[bufnr] or {}
+  for _, bp in ipairs(existing) do
+    if bp.line == line then
+      return bufnr
+    end
+  end
+
+  breakpoints.set({}, bufnr, line)
+  vim.notify("DAP: set Triton model.py breakpoint at line " .. tostring(line), vim.log.levels.INFO)
+  return bufnr
 end
 
 local function open_dap_float(element)
@@ -4145,6 +4559,52 @@ end, {
   desc = "Inspect a paused Python variable with compact torch tensor summaries",
 })
 
+function _G.inspect_debug_dataframe(expr)
+  expr = vim.trim(expr or "")
+  if expr == "" then
+    return
+  end
+
+  local session = dap.session()
+  if not session then
+    vim.notify("DAP: no active debug session", vim.log.levels.WARN)
+    return
+  end
+
+  if not debug_current_frame_id then
+    vim.notify("DAP: pause execution before summarizing a DataFrame", vim.log.levels.WARN)
+    return
+  end
+
+  session:request("evaluate", {
+    expression = _G.dataframe_summary_expression(expr),
+    frameId = debug_current_frame_id,
+    context = "repl",
+  }, function(err, response)
+    vim.schedule(function()
+      if err then
+        vim.notify("DAP DataFrame summary failed: " .. tostring(err.message or err), vim.log.levels.ERROR)
+        return
+      end
+
+      open_debug_output("DAP DataFrame: " .. expr, _G.decode_debugpy_string_result(response and response.result or ""))
+    end)
+  end)
+end
+
+vim.api.nvim_create_user_command("DapInspectDataFrame", function(opts)
+  if opts.args and opts.args ~= "" then
+    _G.inspect_debug_dataframe(opts.args)
+    return
+  end
+
+  local default_expr = vim.fn.expand("<cword>")
+  vim.ui.input({ prompt = "DAP DataFrame expression: ", default = default_expr }, _G.inspect_debug_dataframe)
+end, {
+  nargs = "*",
+  desc = "Summarize a paused pandas DataFrame or Series without printing values",
+})
+
 vim.api.nvim_create_user_command("DapToggleVariableValues", function()
   vim.g.dapui_show_variable_values = not vim.g.dapui_show_variable_values
   pcall(dapui.update_render, {})
@@ -4206,6 +4666,19 @@ local function parse_shell_words(text)
   end
 
   return words
+end
+
+function _G.parse_exocortex_debug_env(text)
+  local env = {}
+
+  for _, item in ipairs(parse_shell_words(text or "")) do
+    local key, value = item:match("^([%w_]+)=(.*)$")
+    if key then
+      env[key] = value
+    end
+  end
+
+  return env
 end
 
 local function normalize_script_path(path)
@@ -4533,6 +5006,8 @@ local function run_training_debug_explicit(cfg)
   local python = d.python and resolve_config_path(base, d.python) or vim.fn.exepath("python3")
   local program = resolve_config_path(cwd, d.program or "train.py")
   local args = d.args and parse_shell_words(d.args) or {}
+  local env = d.env and _G.parse_exocortex_debug_env(d.env) or nil
+  local name = d.name or "Training run"
 
   if not file_exists(python) then
     vim.notify("Python interpreter not found: " .. python, vim.log.levels.ERROR)
@@ -4549,15 +5024,16 @@ local function run_training_debug_explicit(cfg)
   end
 
   ensure_mlflow_ui(cwd, python)
-  set_debug_source(program, "Training run")
+  set_debug_source(program, name)
 
   dap.run({
     type = "python",
     request = "launch",
-    name = "Training run",
+    name = name,
     cwd = cwd,
     program = program,
     args = args,
+    env = env,
     pythonPath = python,
     justMyCode = false,
     subProcess = false,
@@ -4567,6 +5043,7 @@ end
 
 local docker_debug_jobs = {}
 local attach_human_triton_model = nil
+local stop_human_triton_auto_attach_watcher = function() end
 docker_debug_status = {
   buf = nil,
   win = nil,
@@ -4576,7 +5053,126 @@ docker_debug_status = {
   dap_state = "not attached",
   cfg = nil,
   triton_auto_attach_started = false,
+  attach_generation = 0,
+  cleanup_started = false,
+  last_error = nil,
 }
+
+local function is_human_debug_session(session)
+  local name = session and session.config and session.config.name
+  return name == "Attach: human-deepstream container"
+    or name == "Attach: human Triton model.py"
+    or name == "Human offline detector"
+end
+
+function _G.cleanup_local_human_debug_processes()
+  local patterns = {
+    "core-cv-service-sx/scripts/human/run_human_offline.py",
+    "scripts/human/run_human.sh --input output/human_detection",
+  }
+
+  for _, pattern in ipairs(patterns) do
+    vim.system({ "pkill", "-TERM", "-f", pattern }, { text = true })
+  end
+end
+
+local function cleanup_human_debug_processes(reason)
+  if docker_debug_status.cleanup_started then
+    return
+  end
+
+  docker_debug_status.cleanup_started = true
+  docker_debug_status.attach_generation = (docker_debug_status.attach_generation or 0) + 1
+  docker_debug_status.dap_state = "cleaning up: " .. (reason or "debug ended")
+
+  stop_human_triton_auto_attach_watcher()
+  _G.cleanup_local_human_debug_processes()
+
+  for job_key, job_id in pairs(docker_debug_jobs) do
+    if job_id and vim.fn.jobwait({ job_id }, 0)[1] == -1 then
+      pcall(vim.fn.jobstop, job_id)
+    end
+    docker_debug_jobs[job_key] = nil
+  end
+
+  vim.system({
+    "docker",
+    "ps",
+    "-q",
+    "--filter", "label=com.docker.compose.project=human-detection",
+    "--filter", "label=com.docker.compose.service=human-detection-ds9",
+    "--filter", "publish=5678",
+  }, { text = true }, function(result)
+    local ids = {}
+    for id in (result.stdout or ""):gmatch("%S+") do
+      ids[#ids + 1] = id
+    end
+
+    vim.system({
+      "docker",
+      "ps",
+      "-q",
+      "--filter", "ancestor=core-cv-human-detection:local",
+      "--filter", "publish=5679",
+    }, { text = true }, function(result_5679)
+      local seen = {}
+      for _, id in ipairs(ids) do
+        seen[id] = true
+      end
+      for id in (result_5679.stdout or ""):gmatch("%S+") do
+        if not seen[id] then
+          ids[#ids + 1] = id
+          seen[id] = true
+        end
+      end
+
+      if #ids == 0 then
+        vim.schedule(function()
+          docker_debug_status.cleanup_started = false
+        end)
+        return
+      end
+
+      local cmd = { "docker", "stop" }
+      vim.list_extend(cmd, ids)
+      vim.system(cmd, { text = true }, function()
+        vim.schedule(function()
+          docker_debug_status.cleanup_started = false
+          docker_debug_status.dap_state = "debug process killed"
+          vim.notify("DAP: killed human debug container(s)", vim.log.levels.INFO, { title = "Human debug cleanup" })
+        end)
+      end)
+    end)
+  end)
+end
+
+dap.listeners.before.event_terminated.human_debug_kill_process = function(session)
+  if is_human_debug_session(session) then
+    cleanup_human_debug_processes("terminated")
+  end
+end
+
+dap.listeners.before.event_exited.human_debug_kill_process = function(session)
+  if is_human_debug_session(session) then
+    cleanup_human_debug_processes("exited")
+  end
+end
+
+dap.listeners.before.disconnect.human_debug_kill_process = function(session)
+  if is_human_debug_session(session) then
+    cleanup_human_debug_processes("disconnected")
+  end
+end
+
+function _G.hard_stop_debug_session()
+  docker_debug_status.dap_state = "terminating"
+  pcall(dap.terminate, {
+    all = true,
+    hierarchy = true,
+    disconnect_args = { terminateDebuggee = true },
+  })
+  cleanup_human_debug_processes("F10")
+end
 
 local function latest_matching_line(lines, pattern, plain)
   for i = #(lines or {}), 1, -1 do
@@ -4588,8 +5184,93 @@ local function latest_matching_line(lines, pattern, plain)
   return nil
 end
 
+function _G.extract_human_debug_error_info(lines)
+  local text = table.concat(lines or {}, "\n")
+  local patterns = {
+    "ModuleNotFoundError: No module named '[^']+'",
+    "ImportError: [^\n]+",
+    "SyntaxError: [^\n]+",
+    "NameError: [^\n]+",
+    "TypeError: [^\n]+",
+    "ValueError: [^\n]+",
+    "RuntimeError: [^\n]+",
+  }
+
+  for _, pattern in ipairs(patterns) do
+    local match = text:match(pattern)
+    if match then
+      local remote_path, location = text:match("(/workspace/[^%(]+model%.py)%((%d+)%):")
+      if location then
+        local cfg = docker_debug_status.cfg or {}
+        local d = cfg.debug or {}
+        local remote_root = d.remote_root or "/workspace"
+        local local_root = d.local_root and resolve_config_path(cfg._dir or vim.fn.getcwd(), d.local_root)
+          or d.cwd and resolve_config_path(cfg._dir or vim.fn.getcwd(), d.cwd)
+          or vim.fn.getcwd()
+        local local_path = remote_path
+        if remote_path:sub(1, #remote_root) == remote_root then
+          local_path = local_root .. remote_path:sub(#remote_root + 1)
+        end
+
+        return {
+          message = "Triton model.py failed at line " .. location .. ": " .. match,
+          path = local_path,
+          line = tonumber(location),
+        }
+      end
+      return { message = match }
+    end
+  end
+
+  if text:find("Failed to create instance", 1, true) then
+    return { message = latest_matching_line(lines, "Failed to create instance", true) }
+  end
+
+  if text:find("failed to load 'human_detection_segmentation'", 1, true) then
+    return { message = latest_matching_line(lines, "failed to load 'human_detection_segmentation'", true) }
+  end
+
+  if text:find("NVDSINFER_TRITON_ERROR", 1, true) then
+    return { message = "Triton inference failed: NVDSINFER_TRITON_ERROR" }
+  end
+
+  if text:find("Unable to set the pipeline", 1, true) then
+    return { message = "DeepStream pipeline failed to start" }
+  end
+
+  return nil
+end
+
+function _G.extract_human_debug_error(lines)
+  local info = _G.extract_human_debug_error_info(lines)
+  return info and info.message or nil
+end
+
+function _G.notify_human_debug_error_once(error_message)
+  local info = nil
+  if type(error_message) == "table" then
+    info = error_message
+    error_message = info.message
+  end
+
+  if not error_message or error_message == "" or docker_debug_status.last_error == error_message then
+    return
+  end
+
+  docker_debug_status.last_error = error_message
+  if info and info.path then
+    focus_debug_source(info.path, info.line)
+  end
+  vim.notify(error_message, vim.log.levels.ERROR, { title = "Human debug failure" })
+end
+
 local function classify_human_debug_log(lines)
   local text = table.concat(lines or {}, "\n")
+  local error_message = extract_human_debug_error(lines)
+
+  if error_message then
+    return "failed: " .. error_message
+  end
 
   if text:find("Error: unrecognized switch %-u") then
     return "failed: debugpy command line is invalid (-u passed to debugpy)"
@@ -4672,7 +5353,7 @@ local function stop_human_debug_status()
   end
 end
 
-local function stop_human_triton_auto_attach_watcher()
+stop_human_triton_auto_attach_watcher = function()
   if docker_debug_status.triton_timer then
     docker_debug_status.triton_timer:stop()
     docker_debug_status.triton_timer:close()
@@ -4702,7 +5383,7 @@ local function maybe_auto_attach_human_triton(lines)
     attach_human_triton_model(cfg, {
       previous_session = dap.session(),
       quiet = true,
-      wait_for_port = false,
+      wait_for_port = true,
     })
   end)
   return true
@@ -4723,6 +5404,7 @@ local function start_human_triton_auto_attach_watcher(log_file)
 
     local ok, lines = pcall(vim.fn.readfile, log_file, "", 500)
     if ok then
+      notify_human_debug_error_once(_G.extract_human_debug_error_info(lines))
       maybe_auto_attach_human_triton(lines)
     end
   end))
@@ -4776,6 +5458,8 @@ local function open_human_debug_status(log_file)
       end
     end
 
+    notify_human_debug_error_once(_G.extract_human_debug_error_info(lines))
+
     local tail = {}
     local start = math.max(1, #lines - 80)
     for i = start, #lines do
@@ -4794,6 +5478,7 @@ local function open_human_debug_status(log_file)
       latest_context = latest_triton
     end
 
+    local error_message = extract_human_debug_error(lines)
     maybe_auto_attach_human_triton(lines)
 
     local display = {
@@ -4802,9 +5487,16 @@ local function open_human_debug_status(log_file)
       "phase: " .. classify_human_debug_log(lines),
       "latest: " .. latest_context,
       "log: " .. log_file,
+    }
+    if error_message then
+      vim.list_extend(display, {
+        "ERROR: " .. error_message,
+      })
+    end
+    vim.list_extend(display, {
       "",
       "Recent log:",
-    }
+    })
     vim.list_extend(display, tail)
 
     local wrote = pcall(function()
@@ -4829,6 +5521,8 @@ local function run_docker_debug_attach(cfg)
   local d = cfg.debug or {}
   docker_debug_status.cfg = cfg
   docker_debug_status.triton_auto_attach_started = false
+  docker_debug_status.attach_generation = (docker_debug_status.attach_generation or 0) + 1
+  local attach_generation = docker_debug_status.attach_generation
   local base = cfg._dir or vim.fn.getcwd()
   local cwd = d.cwd and resolve_config_path(base, d.cwd) or base
   local host = d.host or "127.0.0.1"
@@ -4863,7 +5557,13 @@ local function run_docker_debug_attach(cfg)
     },
   }
 
+  local attach_started = false
+
   local function attach()
+    if attach_generation ~= docker_debug_status.attach_generation or attach_started then
+      return
+    end
+    attach_started = true
     docker_debug_status.dap_state = "attaching to " .. host .. ":" .. tostring(port)
     dap.run({
       type = adapter_name,
@@ -4890,7 +5590,7 @@ local function run_docker_debug_attach(cfg)
     end
 
     local text = table.concat(lines, "\n")
-    return text:find("[human_debug] debugpy listening", 1, true) ~= nil
+    return text:find("debugpy listening", 1, true) ~= nil
   end
 
   local function port_is_listening(callback)
@@ -4901,9 +5601,20 @@ local function run_docker_debug_attach(cfg)
   end
 
   local function wait_for_port_then_attach(start_ms)
+    if attach_generation ~= docker_debug_status.attach_generation or attach_started then
+      return
+    end
+
     local function retry_or_timeout()
+      if attach_generation ~= docker_debug_status.attach_generation or attach_started then
+        return
+      end
+
       if (vim.uv.now() - start_ms) >= attach_timeout_ms then
         vim.schedule(function()
+          if attach_generation ~= docker_debug_status.attach_generation or attach_started then
+            return
+          end
           docker_debug_status.dap_state = "attach timeout"
           vim.notify(
             "DAP: timed out waiting for " .. host .. ":" .. port .. "; see " .. (d.log or "/tmp/exocortex-docker-debug.log"),
@@ -4920,7 +5631,16 @@ local function run_docker_debug_attach(cfg)
 
     if d.log and d.log ~= "" then
       if log_has_debugpy_ready_marker() then
-        vim.defer_fn(attach, 500)
+        port_is_listening(function(is_listening)
+          if attach_generation ~= docker_debug_status.attach_generation or attach_started then
+            return
+          end
+          if is_listening then
+            vim.defer_fn(attach, 100)
+          else
+            retry_or_timeout()
+          end
+        end)
         return
       end
 
@@ -4959,7 +5679,7 @@ local function run_docker_debug_attach(cfg)
       return
     end
 
-    local job_id = vim.fn.jobstart({ "sh", "-c", cmd .. " >> " .. vim.fn.shellescape(log_file) .. " 2>&1" }, {
+    local job_id = vim.fn.jobstart({ "sh", "-c", "exec " .. cmd .. " >> " .. vim.fn.shellescape(log_file) .. " 2>&1" }, {
       cwd = cwd,
       detach = false,
       on_exit = function()
@@ -5010,7 +5730,6 @@ attach_human_triton_model = function(cfg, opts)
   local host = d.triton_host or d.host or "127.0.0.1"
   local port = tonumber(d.triton_port or d.model_port) or 5679
   local adapter_name = "human_triton_model_debugpy_" .. tostring(port)
-  local previous_session = opts.previous_session or dap.session()
 
   dap.adapters[adapter_name] = {
     type = "server",
@@ -5021,14 +5740,27 @@ attach_human_triton_model = function(cfg, opts)
     },
   }
 
-  dap.listeners.after.event_initialized.human_triton_restore_main_session = function(session)
+  dap.listeners.before.event_initialized.human_triton_ensure_model_breakpoint = function(session)
     if session and session.config and session.config.name == "Attach: human Triton model.py" then
-      dap.listeners.after.event_initialized.human_triton_restore_main_session = nil
-      if previous_session then
-        vim.schedule(function()
-          pcall(dap.set_session, previous_session)
+      _G.ensure_human_triton_model_breakpoint(cfg, 203)
+    end
+  end
+
+  dap.listeners.after.event_initialized.human_triton_activate_session = function(session)
+    if session and session.config and session.config.name == "Attach: human Triton model.py" then
+      dap.listeners.after.event_initialized.human_triton_activate_session = nil
+      dap.listeners.before.event_initialized.human_triton_ensure_model_breakpoint = nil
+      vim.schedule(function()
+        pcall(dap.set_session, session)
+        pcall(function()
+          session:set_breakpoints(require("dap.breakpoints").get(), function()
+            docker_debug_status.dap_state = "attached to Triton model.py; breakpoint 203 synced"
+          end)
         end)
-      end
+        pcall(function()
+          session:set_exception_breakpoints({ "raised", "uncaught", "userUnhandled" })
+        end)
+      end)
     end
   end
 
@@ -5044,15 +5776,15 @@ attach_human_triton_model = function(cfg, opts)
     end
 
     dap.run({
-    type = adapter_name,
-    request = "attach",
-    name = "Attach: human Triton model.py",
-    redirectOutput = true,
-    pathMappings = {
-      { localRoot = local_root, remoteRoot = remote_root },
-    },
-    justMyCode = false,
-  })
+      type = adapter_name,
+      request = "attach",
+      name = "Attach: human Triton model.py",
+      redirectOutput = true,
+      pathMappings = {
+        { localRoot = local_root, remoteRoot = remote_root },
+      },
+      justMyCode = false,
+    })
   end
 
   local function wait_for_triton_port(start_ms)
@@ -5211,21 +5943,27 @@ debug_keymaps.set("n", debug_keys.toggle_breakpoint, toggle_breakpoint_refresh, 
   silent = true,
   desc = "Toggle breakpoint",
 })
-debug_keymaps.set("n", debug_keys.step_into, dap.step_into, {
+debug_keymaps.set("n", debug_keys.step_into, function()
+  _G.step_current_debug_thread("into")
+end, {
   silent = true,
   desc = "Step into",
 })
-debug_keymaps.set("n", debug_keys.step_over, dap.step_over, {
+debug_keymaps.set("n", debug_keys.step_over, function()
+  _G.step_current_debug_thread("over")
+end, {
   silent = true,
   desc = "Step over",
 })
-debug_keymaps.set("n", debug_keys.step_out, dap.step_out, {
+debug_keymaps.set("n", debug_keys.step_out, function()
+  _G.step_current_debug_thread("out")
+end, {
   silent = true,
   desc = "Step out",
 })
-debug_keymaps.set("n", debug_keys.stop, dap.terminate, {
+debug_keymaps.set("n", debug_keys.stop, _G.hard_stop_debug_session, {
   silent = true,
-  desc = "Stop debug session",
+  desc = "Terminate debug session and kill human debug process",
 })
 debug_keymaps.set("n", debug_keys.close_ui, close_debugger_ui, {
   silent = true,
@@ -5258,6 +5996,13 @@ debug_keymaps.set("n", debug_keys.inspect, function()
 end, {
   silent = true,
   desc = "Inspect debug variable",
+})
+debug_keymaps.set("n", debug_keys.dataframe, function()
+  local default_expr = vim.fn.expand("<cword>")
+  vim.ui.input({ prompt = "DAP DataFrame expression: ", default = default_expr }, _G.inspect_debug_dataframe)
+end, {
+  silent = true,
+  desc = "Summarize pandas DataFrame or Series",
 })
 debug_keymaps.set("n", debug_keys.current_function, show_debug_current_function, {
   silent = true,
@@ -5372,6 +6117,40 @@ vim.api.nvim_create_autocmd({ "FileType", "TermOpen" }, {
 -- GIT DIFF REVIEW
 -- ============================================================================
 
+pcall(function()
+  require("diffview").setup({
+    keymaps = {
+      view = {
+        { "n", "<C-q>", require("diffview.config").actions.close, { desc = "Close Diffview" } },
+      },
+      file_panel = {
+        { "n", "<C-q>", require("diffview.config").actions.close, { desc = "Close Diffview" } },
+      },
+      file_history_panel = {
+        { "n", "<C-q>", require("diffview.config").actions.close, { desc = "Close Diffview" } },
+      },
+      option_panel = {
+        { "n", "<C-q>", require("diffview.config").actions.close, { desc = "Close Diffview" } },
+      },
+    },
+  })
+end)
+
+function _G.exocortex_close_diffview_or_tab()
+  local ok, lib = pcall(require, "diffview.lib")
+  if ok and lib.get_current_view and lib.get_current_view() then
+    pcall(vim.cmd, "DiffviewClose")
+    return
+  end
+
+  close_current_tab()
+end
+
+vim.keymap.set({ "n", "t" }, "<C-q>", _G.exocortex_close_diffview_or_tab, {
+  silent = true,
+  desc = "Close Diffview or editor tab",
+})
+
 vim.keymap.set("n", "<leader>go", ":DiffviewOpen<CR>", {
   noremap = true,
   silent = true,
@@ -5388,6 +6167,30 @@ vim.keymap.set("n", "<leader>gq", ":DiffviewClose<CR>", {
   noremap = true,
   silent = true,
   desc = "Close diff view",
+})
+
+function _G.exocortex_diffview_quit_maps()
+  for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+    local ok, buf = pcall(vim.api.nvim_win_get_buf, win)
+    if ok and vim.api.nvim_buf_is_valid(buf) then
+      for _, lhs in ipairs({ "<C-q>", "q" }) do
+        vim.keymap.set("n", lhs, "<cmd>DiffviewClose<CR>", {
+          buffer = buf,
+          silent = true,
+          nowait = true,
+          desc = "Close Diffview",
+        })
+      end
+    end
+  end
+end
+
+vim.api.nvim_create_autocmd("User", {
+  group = vim.api.nvim_create_augroup("user-diffview-close-maps", { clear = true }),
+  pattern = { "DiffviewViewOpened", "DiffviewViewEnter", "DiffviewDiffBufRead", "DiffviewDiffBufWinEnter", "DiffviewViewPostLayout" },
+  callback = function()
+    vim.schedule(_G.exocortex_diffview_quit_maps)
+  end,
 })
 
 -- Codex edits land in the git working tree. Review them with Diffview.
