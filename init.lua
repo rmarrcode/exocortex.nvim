@@ -2309,7 +2309,6 @@ function _G.yank_terminal_selection()
   end
 
   _G.copy_to_system_clipboard(text)
-  vim.notify("Yanked terminal selection to clipboard", vim.log.levels.INFO)
 
   if vim.bo.buftype == "terminal" then
     vim.cmd("startinsert")
@@ -2391,7 +2390,6 @@ function _G.handle_terminal_osc52(args)
   end
 
   _G.copy_to_system_clipboard(decoded)
-  vim.notify("Copied remote terminal selection to clipboard", vim.log.levels.INFO)
 end
 
 local function is_valid_terminal_buffer(buf)
@@ -2881,7 +2879,6 @@ local function copybot_fn()
   if vim.fn.filereadable(last_output_file) == 1 then
     local content = table.concat(vim.fn.readfile(last_output_file), "\n")
     _G.copy_to_system_clipboard(content)
-    vim.notify("Copybot: terminal output copied to clipboard", vim.log.levels.INFO)
   else
     vim.notify("Copybot: no terminal output to copy", vim.log.levels.WARN)
   end
