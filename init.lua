@@ -2,6 +2,13 @@
 
 vim.g.mapleader = ","
 
+-- Select the clipboard provider before plugins can initialize it. Locally,
+-- Neovim auto-detects the desktop clipboard tool. Over SSH, OSC 52 lets the
+-- terminal bridge the remote + register to the local desktop clipboard.
+if vim.env.SSH_TTY or vim.env.SSH_CONNECTION then
+  vim.g.clipboard = "osc52"
+end
+
 -- Notification and command-line message history so errors can be copied.
 local _notify_history = {}
 local _base_notify = vim.notify
@@ -227,9 +234,6 @@ vim.o.termguicolors = true
 vim.o.mouse = "a"
 vim.o.hidden = true
 vim.opt.clipboard = "unnamedplus"
-if vim.env.SSH_TTY or vim.env.SSH_CONNECTION then
-  vim.g.clipboard = "osc52"
-end
 vim.o.showtabline = 2 -- always show (used for AI node status bar)
 vim.o.tabline = "%!v:lua.ExocortexTabLine()"
 vim.o.splitright = true
@@ -243,6 +247,28 @@ vim.o.signcolumn = "yes"
 vim.o.virtualedit = "block"
 vim.opt.fillchars:append({ eob = " " })
 vim.g.sh_no_error = 1
+
+-- Special views such as terminals and sidebars disable line numbers on their
+-- windows. Restore them whenever an ordinary editing buffer uses that window.
+function _G.restore_editor_line_numbers(buf)
+  if not (buf and vim.api.nvim_buf_is_valid(buf) and vim.bo[buf].buftype == "") then
+    return
+  end
+
+  for _, win in ipairs(vim.fn.win_findbuf(buf)) do
+    if vim.api.nvim_win_is_valid(win) then
+      vim.wo[win].number = true
+      vim.wo[win].relativenumber = true
+    end
+  end
+end
+
+vim.api.nvim_create_autocmd({ "BufWinEnter", "WinEnter" }, {
+  group = augroup,
+  callback = function(args)
+    _G.restore_editor_line_numbers(args.buf)
+  end,
+})
 
 vim.filetype.add({
   extension = {
@@ -2256,16 +2282,23 @@ local function map_terminal_shortcut(buf, lhses, rhs, desc)
   end
 end
 
-_G.terminal_paste_text = _G.terminal_paste_text or ""
-
 function _G.copy_to_system_clipboard(text)
   if text == "" then
     return
   end
 
-  _G.terminal_paste_text = text
   vim.fn.setreg("+", text)
   vim.fn.setreg('"', text)
+end
+
+function _G.read_system_clipboard()
+  local ok, text = pcall(vim.fn.getreg, "+")
+  if not ok then
+    vim.notify("Could not read the system clipboard: " .. tostring(text), vim.log.levels.ERROR)
+    return nil
+  end
+
+  return text
 end
 
 function _G.yank_terminal_selection()
@@ -2291,8 +2324,8 @@ function _G.paste_clipboard_into_terminal()
     return
   end
 
-  local text = _G.terminal_paste_text or ""
-  if text == "" then
+  local text = _G.read_system_clipboard()
+  if not text or text == "" then
     return
   end
 
@@ -2328,13 +2361,31 @@ end
 function _G.handle_terminal_osc52(args)
   local data = args and args.data or {}
   local sequence = data.sequence or ""
-  local encoded = sequence:match("\027%]52;[^;]*;([A-Za-z0-9+/=]+)")
+  local selection, payload = sequence:match("\027%]52;([^;]*);([^\007\027]*)")
 
-  if not encoded or encoded == "" then
+  if not selection or not payload then
     return
   end
 
-  local ok, decoded = pcall(vim.base64.decode, encoded)
+  -- A remote Neovim asks its host terminal for OSC 52 contents when `p`
+  -- reads the + register. Reply through that terminal's PTY with the current
+  -- desktop clipboard so SSH works in both directions.
+  if payload == "?" then
+    local buf = args and args.buf
+    local job_id = buf and vim.b[buf].terminal_job_id
+    local text = _G.read_system_clipboard()
+    if job_id and text then
+      local response = string.format("\027]52;%s;%s\027\\", selection, vim.base64.encode(text))
+      vim.api.nvim_chan_send(job_id, response)
+    end
+    return
+  end
+
+  if payload == "" or not payload:match("^[A-Za-z0-9+/=]+$") then
+    return
+  end
+
+  local ok, decoded = pcall(vim.base64.decode, payload)
   if not ok or not decoded or decoded == "" then
     return
   end
@@ -2714,19 +2765,6 @@ vim.api.nvim_create_autocmd("TermRequest", {
   callback = _G.handle_terminal_osc52,
 })
 
-vim.api.nvim_create_autocmd("TextYankPost", {
-  group = augroup,
-  callback = function()
-    local event = vim.v.event or {}
-    local contents = event.regcontents
-    if not contents or vim.tbl_isempty(contents) then
-      return
-    end
-
-    _G.terminal_paste_text = table.concat(contents, "\n")
-  end,
-})
-
 vim.keymap.set({ "n", "t" }, "<F4>", toggle_bottom_terminal, {
   desc = "Toggle terminal panel",
 })
@@ -2868,6 +2906,136 @@ local dapui = require("dapui")
 local dapui_util = require("dapui.util")
 local dapui_format_value = dapui_util.format_value
 local inspect_debug_expression
+
+-- nvim-dap's default dap-src:// loader blocks inside BufReadCmd while it waits
+-- for an adapter response. If a container-only library frame is selected and
+-- the adapter does not answer, that synchronous wait can freeze all of Neovim.
+-- Populate remote sources asynchronously so Ctrl-Q and the rest of the editor
+-- always remain responsive.
+function _G.exocortex_load_dap_source(buf)
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then
+    return
+  end
+
+  local name = vim.api.nvim_buf_get_name(buf)
+  local session_id, source_ref, source_path = name:match("^dap%-src://(%d+)/(%d+)/(.*)$")
+  local session = session_id and require("dap").sessions()[tonumber(session_id)] or nil
+
+  vim.bo[buf].buftype = "nofile"
+  -- Keep the buffer valid until the session is closed. nvim-dap may still be
+  -- waiting for exceptionInfo after it has switched away from this frame.
+  vim.bo[buf].bufhidden = "hide"
+  vim.bo[buf].swapfile = false
+  vim.bo[buf].modifiable = true
+  -- nvim-dap positions the cursor immediately after BufReadCmd returns. Give
+  -- container-only frames enough temporary lines for that jump while their
+  -- actual source is fetched asynchronously.
+  local placeholder = vim.fn["repeat"]({ "" }, 20000)
+  placeholder[1] = "Loading remote debug source..."
+  placeholder[2] = source_path or name
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, placeholder)
+  vim.bo[buf].modified = false
+
+  if not (session and source_ref) then
+    vim.bo[buf].modifiable = false
+    return
+  end
+
+  session:request("source", {
+    source = { sourceReference = tonumber(source_ref) },
+    sourceReference = tonumber(source_ref),
+  }, function(err, response)
+    vim.schedule(function()
+      if not vim.api.nvim_buf_is_valid(buf) then
+        return
+      end
+
+      local lines
+      if err or not (response and response.content) then
+        lines = {
+          "Remote debug source is unavailable.",
+          source_path or name,
+          "",
+          tostring(err and (err.message or err) or "The debug adapter returned no source."),
+        }
+      else
+        lines = vim.split(response.content, "\n", { plain = true })
+      end
+
+      vim.bo[buf].modifiable = true
+      vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+      vim.bo[buf].modified = false
+      vim.bo[buf].modifiable = false
+
+      if source_path and source_path ~= "" then
+        local ok, filetype = pcall(vim.filetype.match, { buf = buf, filename = source_path })
+        if ok and filetype then
+          vim.bo[buf].filetype = filetype
+        end
+      end
+    end)
+  end)
+end
+
+require("dap._cmds").source = _G.exocortex_load_dap_source
+
+-- nvim-dap requests exceptionInfo asynchronously. A session can close and
+-- delete its generated source buffer before that response arrives; upstream
+-- then calls vim.diagnostic.set with the stale buffer id. Keep the upstream
+-- behavior, but validate the buffer immediately before publishing diagnostics.
+function _G.exocortex_show_exception_info(self, thread_id, bufnr, frame)
+  if not self.capabilities.supportsExceptionInfoRequest
+      or not vim.api.nvim_buf_is_valid(bufnr) then
+    return
+  end
+
+  local err, response = self:request("exceptionInfo", { threadId = thread_id })
+  if err then
+    vim.notify("Error getting exception info: " .. tostring(err), vim.log.levels.ERROR)
+  end
+  if not response or not vim.api.nvim_buf_is_valid(bufnr) then
+    return
+  end
+
+  local msg_parts = {}
+  local details = response.details or {}
+  local exception_type = details.typeName
+  local of_type = exception_type and (" of type " .. exception_type) or ""
+  msg_parts[#msg_parts + 1] = "Thread stopped due to exception"
+    .. of_type .. " (" .. tostring(response.breakMode) .. ")"
+  if response.description then
+    msg_parts[#msg_parts + 1] = "Description: " .. response.description
+  end
+  if details.stackTrace then
+    msg_parts[#msg_parts + 1] = "Stack trace:"
+    msg_parts[#msg_parts + 1] = details.stackTrace
+  end
+  if details.innerException then
+    msg_parts[#msg_parts + 1] = "Inner Exceptions:"
+    for _, inner in pairs(details.innerException) do
+      msg_parts[#msg_parts + 1] = vim.inspect(inner)
+    end
+  end
+
+  if not vim.api.nvim_buf_is_valid(bufnr) then
+    return
+  end
+  local line_count = vim.api.nvim_buf_line_count(bufnr)
+  local lnum = math.max(0, math.min((tonumber(frame.line) or 1) - 1, line_count - 1))
+  pcall(vim.diagnostic.set, self.ns, bufnr, {
+    {
+      bufnr = bufnr,
+      lnum = lnum,
+      end_lnum = frame.endLine and math.min(frame.endLine - 1, line_count - 1) or nil,
+      col = frame.column and math.max(frame.column - 1, 0) or 0,
+      end_col = frame.endColumn,
+      severity = vim.diagnostic.severity.ERROR,
+      message = table.concat(msg_parts, "\n"),
+      source = "nvim-dap",
+    },
+  })
+end
+require("dap.session")._show_exception_info = _G.exocortex_show_exception_info
 
 vim.g.dapui_show_variable_values = true
 
@@ -3801,6 +3969,8 @@ local function restore_debug_distractions()
 end
 
 local function dapui_open_keep_layout()
+  _G.exocortex_debug_active = true
+
   if not dap_restore_state.layout then
     dap_restore_state.layout = true
     hide_debug_distractions()
@@ -3869,6 +4039,7 @@ local function debug_hint_keys()
     string.format(" %-18s Step into", debug_key_label(keys.step_into)),
     string.format(" %-18s Step over", debug_key_label(keys.step_over)),
     string.format(" %-18s Step out", debug_key_label(keys.step_out)),
+    string.format(" %-18s Exit debugger", debug_key_label(keys.exit)),
     string.format(" %-18s Kill session", debug_key_label(keys.stop)),
     string.format(" %-18s Close UI", debug_key_label(keys.close_ui)),
     string.format(" %-18s Page up", debug_key_label(keys.debug_nav_up)),
@@ -3899,6 +4070,11 @@ set_debug_mode_keymaps = function(enabled)
 
   local keys = require("exocortex.config_loader").keys("debug")
   local maps = {
+    { keys.exit, function()
+      if _G.exit_debugger then
+        _G.exit_debugger()
+      end
+    end },
     { keys.debug_nav_left, "<Left>" },
     { keys.debug_nav_right, "<Right>" },
   }
@@ -3922,7 +4098,11 @@ set_debug_mode_keymaps = function(enabled)
         debug_mode_saved_keymaps[lhs] = existing
       end
 
-      vim.keymap.set("n", lhs, rhs, { silent = true, nowait = true, desc = "Debug navigation" })
+      vim.keymap.set("n", lhs, rhs, {
+        silent = true,
+        nowait = true,
+        desc = type(rhs) == "function" and "Exit debugger" or "Debug navigation",
+      })
     end
     return
   end
@@ -4449,7 +4629,7 @@ end
 
 function _G.ensure_human_triton_model_breakpoint(cfg, line)
   cfg = cfg or { _dir = vim.fn.getcwd(), debug = { local_root = vim.fn.getcwd(), remote_root = "/workspace" } }
-  line = tonumber(line) or 203
+  line = tonumber(line) or 189
 
   local d = cfg.debug or {}
   local base = cfg._dir or vim.fn.getcwd()
@@ -4491,6 +4671,48 @@ function _G.ensure_human_triton_model_breakpoint(cfg, line)
 
   breakpoints.set({}, bufnr, line)
   vim.notify("DAP: set Triton model.py breakpoint at line " .. tostring(line), vim.log.levels.INFO)
+  return bufnr
+end
+
+function _G.ensure_human_deepstream_entrypoint_breakpoint(cfg, line, relative_path, display_name)
+  cfg = cfg or { _dir = vim.fn.getcwd(), debug = { local_root = vim.fn.getcwd() } }
+  line = tonumber(line) or 34
+  relative_path = relative_path or "src/core_cv_service_sx/branches/human/entrypoint.py"
+  display_name = display_name or "DeepStream entrypoint.py"
+
+  local d = cfg.debug or {}
+  local base = cfg._dir or vim.fn.getcwd()
+  local local_root = d.local_root or d.cwd or base
+  if not local_root:find("^/") then
+    local_root = base .. "/" .. local_root
+  end
+  local path = local_root .. "/" .. relative_path
+
+  if vim.fn.filereadable(path) ~= 1 then
+    vim.notify("DAP: cannot set " .. display_name .. " breakpoint; file not found: " .. path, vim.log.levels.ERROR)
+    return nil
+  end
+
+  local bufnr = vim.fn.bufadd(path)
+  pcall(function()
+    vim.bo[bufnr].swapfile = false
+  end)
+  local loaded_ok = pcall(vim.fn.bufload, bufnr)
+  if not loaded_ok then
+    vim.cmd("silent keepalt noswapfile edit " .. vim.fn.fnameescape(path))
+    bufnr = vim.api.nvim_get_current_buf()
+  end
+
+  local breakpoints = require("dap.breakpoints")
+  local existing = breakpoints.get(bufnr)[bufnr] or {}
+  for _, bp in ipairs(existing) do
+    if bp.line == line then
+      return bufnr
+    end
+  end
+
+  breakpoints.set({}, bufnr, line)
+  vim.notify("DAP: set " .. display_name .. " breakpoint at line " .. tostring(line), vim.log.levels.INFO)
   return bufnr
 end
 
@@ -4989,18 +5211,40 @@ end, {
   desc = "View debug mask image (/tmp/dbg/mask.png)",
 })
 
+_G.exocortex_project_debug_config_overrides = {
+  ["/home/ryan-marr/Documents/core-cv-service-sx-env/core-cv-service-sx"] = "debug/exocortex.config",
+}
+
 local function read_exocortex_config()
+  local buffer_path = vim.fn.expand("%:p")
+  local start_path = buffer_path ~= "" and vim.fn.fnamemodify(buffer_path, ":h") or vim.fn.getcwd()
   local path = vim.fs.find("exocortex.config", {
     upward = true,
-    path = vim.fn.expand("%:p:h"),
+    path = start_path,
   })[1]
 
   if not path then return {} end
 
+  local git_dir = vim.fs.find(".git", {
+    upward = true,
+    path = start_path,
+  })[1]
+  local project_root = git_dir and vim.fn.fnamemodify(git_dir, ":h") or nil
+  local override = project_root and _G.exocortex_project_debug_config_overrides[project_root] or nil
+  if override then
+    local override_path = project_root .. "/" .. override
+    if vim.fn.filereadable(override_path) == 1 then
+      path = override_path
+    end
+  end
+
   local file = io.open(path, "r")
   if not file then return {} end
 
-  local cfg, section = { _dir = vim.fn.fnamemodify(path, ":h") }, nil
+  local cfg, section = {
+    _dir = vim.fn.fnamemodify(path, ":h"),
+    _path = path,
+  }, nil
   for line in file:lines() do
     local s = line:match("^%[(.-)%]$")
     if s then
@@ -5191,14 +5435,60 @@ dap.listeners.before.disconnect.human_debug_kill_process = function(session)
   end
 end
 
-function _G.hard_stop_debug_session()
+function _G.hard_stop_debug_session(reason)
   docker_debug_status.dap_state = "terminating"
   pcall(dap.terminate, {
     all = true,
     hierarchy = true,
     disconnect_args = { terminateDebuggee = true },
   })
-  cleanup_human_debug_processes("F10")
+  cleanup_human_debug_processes(reason or "F10")
+end
+
+function _G.exit_debugger()
+  _G.exocortex_debug_active = false
+
+  for _, timer_name in ipairs({ "timer", "triton_timer" }) do
+    local timer = docker_debug_status[timer_name]
+    if timer then
+      pcall(timer.stop, timer)
+      pcall(timer.close, timer)
+      docker_debug_status[timer_name] = nil
+    end
+  end
+
+  local status_win = docker_debug_status.win
+  docker_debug_status.win = nil
+  if status_win and vim.api.nvim_win_is_valid(status_win) then
+    pcall(vim.api.nvim_win_close, status_win, true)
+  end
+
+  local status_buf = docker_debug_status.buf
+  docker_debug_status.buf = nil
+  if status_buf and vim.api.nvim_buf_is_valid(status_buf) then
+    pcall(vim.api.nvim_buf_delete, status_buf, { force = true })
+  end
+
+  close_debugger_ui()
+  _G.hard_stop_debug_session("Ctrl-Q")
+
+  -- Closing the adapter sockets immediately prevents late stop/source events
+  -- from reopening debug panes while the container is shutting down.
+  local sessions = vim.tbl_values(dap.sessions())
+  for _, session in ipairs(sessions) do
+    pcall(session.close, session)
+  end
+  pcall(dap.set_session, nil)
+
+  vim.schedule(function()
+    for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+      if vim.api.nvim_buf_is_valid(buf)
+          and vim.api.nvim_buf_get_name(buf):match("^dap%-src://") then
+        pcall(vim.api.nvim_buf_delete, buf, { force = true })
+      end
+    end
+    vim.notify("Exited debugger", vim.log.levels.INFO, { title = "DAP" })
+  end)
 end
 
 local function latest_matching_line(lines, pattern, plain)
@@ -5571,6 +5861,15 @@ local function run_docker_debug_attach(cfg)
     return
   end
 
+  _G.exocortex_debug_active = true
+  set_debug_mode_keymaps(true)
+  _G.ensure_human_deepstream_entrypoint_breakpoint(cfg, 34)
+  _G.ensure_human_deepstream_entrypoint_breakpoint(
+    cfg,
+    20,
+    "src/core_cv_service_sx/branches/human/video_encoder.py",
+    "video_encoder.py"
+  )
   pending_debug_source = nil
   vim.notify("DAP: debugging " .. vim.fn.fnamemodify(local_root, ":~:.") .. " -> " .. remote_root, vim.log.levels.INFO, { title = name })
 
@@ -5766,10 +6065,13 @@ attach_human_triton_model = function(cfg, opts)
       initialize_timeout_sec = 120,
     },
   }
+  -- Set this before nvim-dap sends configurationDone. Applying it from an
+  -- event listener is too late when Triton immediately runs a failing request.
+  dap.defaults[adapter_name].exception_breakpoints = {}
 
   dap.listeners.before.event_initialized.human_triton_ensure_model_breakpoint = function(session)
     if session and session.config and session.config.name == "Attach: human Triton model.py" then
-      _G.ensure_human_triton_model_breakpoint(cfg, 203)
+      _G.ensure_human_triton_model_breakpoint(cfg, 189)
     end
   end
 
@@ -5781,11 +6083,16 @@ attach_human_triton_model = function(cfg, opts)
         pcall(dap.set_session, session)
         pcall(function()
           session:set_breakpoints(require("dap.breakpoints").get(), function()
-            docker_debug_status.dap_state = "attached to Triton model.py; breakpoint 203 synced"
+            docker_debug_status.dap_state = "attached to Triton model.py; breakpoint 189 synced"
           end)
         end)
+        -- Triton reports backend exceptions through its own response/log path.
+        -- Debugpy classifies those worker-thread failures as "uncaught" even
+        -- though Triton handles them, which selects container-only pandas/torch
+        -- frames. Keep this session focused on explicit model.py breakpoints;
+        -- the status watcher maps logged backend failures back to model.py.
         pcall(function()
-          session:set_exception_breakpoints({ "raised", "uncaught", "userUnhandled" })
+          session:set_exception_breakpoints({})
         end)
       end)
     end
@@ -6108,20 +6415,7 @@ require("codex").setup({
 })
 
 local function paste_register_into_codex_terminal()
-  local buf = vim.api.nvim_get_current_buf()
-  local job_id = vim.b[buf].terminal_job_id
-
-  if not job_id then
-    return
-  end
-
-  local text = _G.terminal_paste_text or ""
-  if text == "" then
-    return
-  end
-
-  vim.api.nvim_chan_send(job_id, text)
-  vim.cmd("startinsert")
+  _G.paste_clipboard_into_terminal()
 end
 
 vim.api.nvim_create_autocmd({ "FileType", "TermOpen" }, {
@@ -6161,6 +6455,11 @@ pcall(function()
 end)
 
 function _G.exocortex_close_diffview_or_tab()
+  if _G.exocortex_debug_active and _G.exit_debugger then
+    _G.exit_debugger()
+    return
+  end
+
   local ok, lib = pcall(require, "diffview.lib")
   if ok and lib.get_current_view and lib.get_current_view() then
     pcall(vim.cmd, "DiffviewClose")

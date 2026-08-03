@@ -112,7 +112,9 @@ To step into, over, or out, use operations `keys.debug.step_into`, `keys.debug.s
 
 To stop the debug session, use operation `keys.debug.stop`. It is currently set to `<F10>` and `<leader>dx`.
 
-To close the debug UI while preserving normal layout, use operation `keys.debug.close_ui`. It is currently set to `<F11>`.
+To terminate every debug session, stop the human debug processes, close the debug UI, and restore the normal editor layout, use operation `keys.debug.exit`. It is currently set to `<C-q>`.
+
+To close the debug UI without terminating the debug process, use operation `keys.debug.close_ui`. It is currently set to `<F11>`.
 
 To show the debug UI, use operation `keys.debug.show_ui`. It is currently set to `<leader>du`.
 
