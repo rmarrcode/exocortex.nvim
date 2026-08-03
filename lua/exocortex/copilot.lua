@@ -6,9 +6,9 @@ M.model = nil
 
 local MODELS = {
   { id = nil, label = "Default (recommended)  Let Copilot choose the best autocomplete model" },
-  { id = "gpt-5.5", label = "gpt-5.5               Strongest general-purpose completion model" },
-  { id = "gpt-5.4", label = "gpt-5.4               Balanced completion model" },
-  { id = "gpt-5.4-mini", label = "gpt-5.4-mini          Fast, lower-latency completion model" },
+  { id = "gpt-5.6-sol", label = "gpt-5.6-sol           Strongest general-purpose completion model" },
+  { id = "gpt-5.6-terra", label = "gpt-5.6-terra         Balanced completion model" },
+  { id = "gpt-5.6-luna", label = "gpt-5.6-luna          Fast, lower-latency completion model" },
 }
 
 local function current_model()

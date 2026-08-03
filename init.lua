@@ -184,7 +184,11 @@ lazy.setup({
 
       vim.api.nvim_create_autocmd("FileType", {
         group = vim.api.nvim_create_augroup("user-treesitter", { clear = true }),
-        pattern = { "bash", "json", "jsonc", "latex", "markdown", "sh", "yaml", "zsh" },
+        -- Shell syntax is deliberately handled by Neovim's built-in runtime
+        -- files below.  Tree-sitter can make an entire shell buffer look wrong
+        -- after an incomplete quote, heredoc, or other real-world shell edge
+        -- case.
+        pattern = { "json", "jsonc", "latex", "markdown", "yaml" },
         callback = function()
           local ok = pcall(vim.treesitter.start)
           if not ok then
@@ -655,6 +659,12 @@ vim.api.nvim_create_autocmd("FileType", {
   group = augroup,
   pattern = { "sh", "bash", "zsh" },
   callback = function(args)
+    -- Prefer the mature Vim shell syntax rules over Tree-sitter here.  They
+    -- recover gracefully from partially written or non-standard shell code.
+    pcall(vim.treesitter.stop, args.buf)
+    vim.cmd("syntax enable")
+    vim.bo[args.buf].syntax = vim.bo[args.buf].filetype
+
     vim.bo[args.buf].shiftwidth = 2
     vim.bo[args.buf].tabstop = 2
     vim.bo[args.buf].softtabstop = 2

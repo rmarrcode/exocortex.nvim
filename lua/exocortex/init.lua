@@ -486,20 +486,20 @@ end
 -- split back out by each adapter's cmd() function.
 local AGENT_MODELS = {
   claude = {
-    { id = nil,                  label = "Default (recommended)  Sonnet 4.6 · Efficient for routine tasks" },
-    { id = "claude-sonnet-4-6",  label = "Sonnet                Sonnet 4.6 · Efficient for routine tasks" },
-    { id = "claude-opus-4-8",    label = "Opus                  Opus 4.8 · Best for everyday, complex tasks" },
-    { id = "claude-haiku-4-5",   label = "Haiku                 Haiku 4.5 · Fastest for quick answers" },
+    { id = nil,                label = "Default (recommended)  Sonnet 5 · Best combination of speed and intelligence" },
+    { id = "claude-sonnet-5",  label = "Sonnet                Sonnet 5 · Best combination of speed and intelligence" },
+    { id = "claude-opus-5",    label = "Opus                  Opus 5 · Complex agentic coding and enterprise work" },
+    { id = "claude-haiku-4-5", label = "Haiku                 Haiku 4.5 · Fastest for quick answers" },
   },
   codex = {
-    { id = "gpt-5.5",      label = "gpt-5.5 (default)   Frontier model for complex coding, research, and real-world work" },
-    { id = "gpt-5.4",      label = "gpt-5.4             Strong model for everyday coding" },
-    { id = "gpt-5.4-mini", label = "gpt-5.4-mini        Small, fast, and cost-efficient model for simpler coding tasks" },
+    { id = "gpt-5.6-sol",   label = "gpt-5.6-sol (default)  Flagship model for complex reasoning and coding" },
+    { id = "gpt-5.6-terra", label = "gpt-5.6-terra          Balances intelligence and cost" },
+    { id = "gpt-5.6-luna",  label = "gpt-5.6-luna           Cost-sensitive, high-volume workloads" },
   },
   antigravity = {
-    { id = "gpt-5.5",      label = "gpt-5.5 (default)   Frontier model for complex coding, research, and real-world work" },
-    { id = "gpt-5.4",      label = "gpt-5.4             Strong model for everyday coding" },
-    { id = "gpt-5.4-mini", label = "gpt-5.4-mini        Small, fast, and cost-efficient model for simpler coding tasks" },
+    { id = "gpt-5.6-sol",   label = "gpt-5.6-sol (default)  Flagship model for complex reasoning and coding" },
+    { id = "gpt-5.6-terra", label = "gpt-5.6-terra          Balances intelligence and cost" },
+    { id = "gpt-5.6-luna",  label = "gpt-5.6-luna           Cost-sensitive, high-volume workloads" },
   },
   aider = {
     { id = nil,                label = "(default)" },
