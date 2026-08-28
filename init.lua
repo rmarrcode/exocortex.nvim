@@ -3,10 +3,41 @@
 vim.g.mapleader = ","
 
 -- Select the clipboard provider before plugins can initialize it. Locally,
--- Neovim auto-detects the desktop clipboard tool. Over SSH, OSC 52 lets the
--- terminal bridge the remote + register to the local desktop clipboard.
+-- Neovim auto-detects the desktop clipboard tool. Over SSH, use OSC 52 only
+-- for copies: clipboard reads are not widely supported and otherwise block
+-- for up to ten seconds waiting for a terminal response.
 if vim.env.SSH_TTY or vim.env.SSH_CONNECTION then
-  vim.g.clipboard = "osc52"
+  local osc52 = require("vim.ui.clipboard.osc52")
+  local clipboard_cache = {
+    ["+"] = { { "" }, "v" },
+    ["*"] = { { "" }, "v" },
+  }
+
+  local function copy_with_osc52(reg)
+    local copy = osc52.copy(reg)
+    return function(lines, regtype)
+      clipboard_cache[reg] = { vim.deepcopy(lines), regtype }
+      copy(lines)
+    end
+  end
+
+  local function paste_from_cache(reg)
+    return function()
+      return vim.deepcopy(clipboard_cache[reg])
+    end
+  end
+
+  vim.g.clipboard = {
+    name = "OSC 52 write-only",
+    copy = {
+      ["+"] = copy_with_osc52("+"),
+      ["*"] = copy_with_osc52("*"),
+    },
+    paste = {
+      ["+"] = paste_from_cache("+"),
+      ["*"] = paste_from_cache("*"),
+    },
+  }
 end
 
 -- Notification and command-line message history so errors can be copied.
